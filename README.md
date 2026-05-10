@@ -1,20 +1,43 @@
 # Mem-Fusion
 
-**Local persistent memory for Claude Code. Vector recall + durable rules + working context, fused into one layer that learns across sessions.**
+**Memory fusion for Claude Code — across sessions, across cognitive layers, and across machines.**
 
-Out of the box, Claude Code has only a context window — every session starts blank, decisions evaporate, preferences must be re-stated, and resolved errors recur. Mem-Fusion fixes that by giving Claude long-term, semantically-searchable memory that survives across sessions, runs entirely on your Mac, and learns silently in the background.
+Out of the box, Claude Code has only a context window. Every session starts blank. Decisions evaporate. Preferences must be re-stated. Resolved errors recur. Worse: when you build a useful AI workflow on one machine, it's stranded there — your other Macs, your team, your future self all start over.
 
-After install:
+Mem-Fusion fuses memory across three axes:
 
-- **Decisions, preferences, errors, and context are stored automatically** — you don't manage memory; it manages itself.
-- **Every prompt is matched against your memory store** and relevant hits are silently injected into Claude's context.
-- **`/remember <thing>`** pins something important with a single command.
-- **Cross-session continuity** — a decision you made last Tuesday surfaces in today's session, automatically.
-- **No data leaves your Mac.** Qdrant + Ollama + a Python MCP server, all localhost.
+- **Across sessions** — Tuesday's decision surfaces in Friday's session, automatically.
+- **Across cognitive layers** — episodic, semantic, procedural, and working memory fused into one substrate via 8 memory tools and 4 automatic hooks.
+- **Across machines** *(when you enable the Constellation extension — shipping in v0.3.0)* — personal memory streams from peer machines fuse into curated group memory, governed by an apprenticeship loop that learns your judgment over time.
+
+Same substrate, three axes of fusion. Standalone fuses two of them; turn on Constellation to add the third.
 
 ---
 
-## Install
+## Why this matters
+
+Every team using AI in 2026 has the same hidden bug: **the AI is learning, but only for one person at a time.**
+
+When your sharpest engineer figures out how to debug a tricky issue, their AI knows. Your AI doesn't. When your most AI-fluent PM develops the right instinct for a recurring tradeoff, no colleague's agent benefits. When that person leaves, their AI capability leaves with them.
+
+AI memory is currently a personal asset — trapped per-individual, per-machine, per-tool. Teams using AI heavily are getting more productive, but the productivity stays individual. Every conversation produces learning; almost none of it propagates. **The gap between a team's best AI user and its median isn't closing — it's widening**, because AI fluency compounds inside one head but doesn't transfer.
+
+Mem-Fusion makes AI memory a *team* asset. Same memory layer runs locally on every team member's machine. Lessons fuse into a shared, human-curated group memory store. Your best engineer's workflow can be invoked by a colleague who has never seen it. Knowledge survives role changes and turnover. Compliance stays intact because every cross-person memory passes through an apprenticeship-loop curator — the human decides what propagates.
+
+The next decade's productivity divide won't be "people who use AI vs. people who don't." It'll be **organizations whose AI memory compounds vs. organizations whose AI memory resets every Monday.** Mem-Fusion is the substrate for the first kind.
+
+---
+
+## Two scopes of one mission
+
+| Scope | Axes active | What it delivers | Status |
+|---|---|---|---|
+| **Personal memory** *(standalone, default)* | Sessions + cognitive layers | Your AI remembers across sessions on this machine | ✅ Available now (v0.1.0) |
+| **Group memory** *(Constellation extension)* | + across machines | Peers' learnings fuse into shared, curated memory | 🚧 Shipping in v0.3.0 |
+
+---
+
+## Install (personal memory, today)
 
 The install is AI-native: there's no shell installer to run yourself. Instead, you paste a setup prompt into Claude Code and Claude does the install for you, asking your approval at each step.
 
@@ -64,7 +87,7 @@ Importance is 1 (trivial) → 5 (user-curated, highest priority).
 
 ---
 
-## How it works (in 30 seconds)
+## How fusion works (per node)
 
 ```
    ┌──────────────────────────────────────────────────────┐
@@ -89,9 +112,11 @@ Importance is 1 (trivial) → 5 (user-curated, highest priority).
               SessionStart · UserPromptSubmit · Stop · PostToolUse:Write
 ```
 
-Three layers, fused: in-context working memory ↔ MCP server (8 tools) ↔ Qdrant (vector / episodic / semantic) + markdown files (procedural / operating-principle).
+Three storage layers fused into one substrate: in-context working memory ↔ MCP server (8 tools) ↔ Qdrant (vector / episodic / semantic) + markdown files (procedural / operating-principle).
 
 The hooks make memory **invisible by default** — you don't have to explicitly recall or store; the system does it. Manual `/remember` for high-importance items remains available.
+
+When you enable Constellation (v0.3.0), the same per-node substrate fuses *horizontally* with peer nodes through a curator-mediated propagation layer. The vertical and temporal fusion stays exactly as it works today; the third axis just turns on.
 
 ---
 
@@ -132,7 +157,17 @@ a memory, verify it still exists in the current code.
 
 - **No telemetry, no phone-home, no cloud.** Everything is localhost-only.
 - **No Linux/Windows support.** macOS launchd is required by the current architecture.
-- **No multi-machine sync.** That's a sibling project ([Constellation](#related)) — a federated multi-node architecture that uses Mem-Fusion as the per-node memory layer.
+- **No group memory yet** — that's the v0.3.0 Constellation bundle. Single-machine memory today; multi-machine memory soon.
+
+---
+
+## Roadmap
+
+| Version | What | Status |
+|---|---|---|
+| **v0.1.0** | Personal memory (sessions + cognitive layers) | ✅ Shipped 2026-05-08 |
+| **v0.2.0** | Extension loader infrastructure — enables third-party tools to add MCP endpoints without forking Mem-Fusion | 🚧 Design locked; see [CHANGELOG](CHANGELOG.md) |
+| **v0.3.0** | Constellation bundled extension — group memory across peers; curator + apprenticeship loop | 📋 Design phase |
 
 ---
 
@@ -149,12 +184,6 @@ rm -rf ~/.claude/skills/remember
 ```
 
 Full uninstall instructions are at the bottom of [`INSTALL.md`](INSTALL.md).
-
----
-
-## Related
-
-- **Constellation** — federated multi-node coordination architecture for distributed AI agents. Each node runs a full Mem-Fusion stack; Constellation handles cross-node coordination. *(Coming soon.)*
 
 ---
 

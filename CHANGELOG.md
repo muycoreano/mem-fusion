@@ -54,7 +54,7 @@ The grandfather clause means v0.1.0 users' CLAUDE.md snippets continue to work. 
 
 - **Mem-Fusion tool rename to `memory/<tool>`** — symmetrical with extensions, but breaking for v0.1.0 users. Not worth the migration cost at our adoption level until there's a strong reason.
 
-- **Multi-node coordination** — explicitly out of scope for Mem-Fusion. Distributed agent coordination lives in a sibling project (Constellation), which uses Mem-Fusion as the per-node memory layer via the v0.2.0 extension API. Mem-Fusion stays single-machine; Constellation handles federation.
+- **Group memory across machines** — moved out of v0.2.0 and into v0.3.0. The v0.3.0 release will bundle the **Constellation extension** at `extensions/constellation/` inside this repo, enabling group memory through curated peer-to-peer fusion. Constellation is not a sibling project; it's a bundled extension that activates the horizontal fusion axis. v0.2.0 ships only the loader infrastructure that Constellation will load through.
 
 ---
 

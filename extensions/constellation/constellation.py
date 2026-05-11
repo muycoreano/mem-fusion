@@ -57,6 +57,29 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def scroll_all(qdrant, collection: str, scroll_filter, payload_keys, page_size: int = 256):
+    """Yield every Qdrant point matching `scroll_filter`, paginating internally.
+
+    Cursor-based pagination is inherently do-while: the first request has no
+    offset, and we only know if there's a next page from the response. This
+    helper isolates that pattern so callers can read a plain `for p in
+    scroll_all(...)` instead of managing a cursor loop themselves.
+    """
+    next_offset = None
+    while True:
+        points, next_offset = qdrant.scroll(
+            collection_name=collection,
+            scroll_filter=scroll_filter,
+            limit=page_size,
+            with_payload=payload_keys,
+            with_vectors=False,
+            offset=next_offset,
+        )
+        yield from points
+        if not next_offset:
+            return
+
+
 def point_to_record(p) -> dict:
     """Convert a Qdrant PointStruct into the canonical memory_record shape."""
     pl = p.payload or {}
@@ -188,6 +211,10 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             })
         elif self.path.startswith("/memory/get"):
             self._handle_memory_get()
+        elif self.path.startswith("/peers/self"):
+            self._handle_peers_self()
+        elif self.path.startswith("/peers"):
+            self._handle_peers_list()
         else:
             self._send_json(404, {"error": "not found", "path": self.path})
 
@@ -230,22 +257,23 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             })
 
         # Validate memory_record shape
-        required = ("content", "vector", "content_hash", "type", "importance", "original_timestamp")
+        required = ("content", "vector", "content_hash",
+                    "type", "importance", "original_timestamp")
         for k in required:
             if k not in record:
                 return self._send_json(400, {"error": f"memory_record missing field: {k}"})
 
-        # Verify content_hash matches recomputed (integrity gate — catches paraphrasing)
-        expected_hash = content_hash(record["content"])
-        if expected_hash != record["content_hash"]:
+        # Verify content_hash matches recomputed (integrity gate — catches paraphrasing / transit corruption)
+        expected_chash = content_hash(record["content"])
+        if expected_chash != record["content_hash"]:
             return self._send_json(400, {
                 "error":              "content_hash mismatch",
-                "expected":           expected_hash,
+                "expected":           expected_chash,
                 "received":           record["content_hash"],
                 "note":               "content was modified somewhere in transit",
             })
 
-        # Validate vector
+        # Validate vector shape
         vec = record["vector"]
         if not isinstance(vec, list) or len(vec) != VECTOR_SIZE:
             return self._send_json(400, {
@@ -359,6 +387,80 @@ class ConstellationHandler(BaseHTTPRequestHandler):
                 "count":    len(points),
                 "memories": [point_to_record(p) for p in points],
             })
+
+    # ── /peers — directory of nodes that have submitted to a group ────────
+    def _handle_peers_list(self):
+        """Aggregate origin_node stats from canonical Qdrant for this group.
+
+        Peers are inferred from submission activity (origin_node on canonicals).
+        v0.3.0 has no registration step — if a node has never PUT, it isn't
+        listed. Adequate for the trust-as-membership model: only nodes that
+        have actually interacted with the orchestrator are visible.
+        """
+        cfg = self.daemon_state["config"]
+        qdrant = self.daemon_state["qdrant"]
+        log = self.daemon_state["log"]
+
+        params = parse_qs(urlparse(self.path).query)
+        group_name = (params.get("group_name") or [None])[0]
+        if not group_name:
+            return self._send_json(400, {"error": "missing query param: group_name"})
+
+        orchestrated = [m["group_name"] for m in cfg["memberships"] if m["role"] == "orchestrator"]
+        if group_name not in orchestrated:
+            return self._send_json(403, {
+                "error":        f"this node does not orchestrate {group_name!r}",
+                "orchestrated": orchestrated,
+            })
+
+        # Aggregate by origin_node across all canonicals in this group.
+        # NOTE: for v0.3.0 scale we read every row. At larger scale, a
+        # dedicated peers payload + secondary index would be needed.
+        group_filter = Filter(must=[
+            FieldCondition(key="group_name", match=MatchValue(value=group_name))
+        ])
+        peers: dict = {}
+        for p in scroll_all(qdrant, cfg["canonical_collection"], group_filter,
+                            payload_keys=["origin_node", "received_at"]):
+            origin = (p.payload or {}).get("origin_node") or ""
+            ts     = (p.payload or {}).get("received_at") or ""
+            if not origin:
+                continue
+            entry = peers.setdefault(origin, {
+                "node_name":         origin,
+                "submission_count":  0,
+                "first_seen":        ts,
+                "last_seen":         ts,
+            })
+            entry["submission_count"] += 1
+            if ts and ts < entry["first_seen"]:
+                entry["first_seen"] = ts
+            if ts and ts > entry["last_seen"]:
+                entry["last_seen"] = ts
+
+        peer_list = sorted(peers.values(), key=lambda e: e["last_seen"], reverse=True)
+        log.info("GET /peers: group=%s count=%d", group_name, len(peer_list))
+        return self._send_json(200, {
+            "group_name":   group_name,
+            "orchestrator": cfg["node_name"],
+            "count":        len(peer_list),
+            "peers":        peer_list,
+        })
+
+    # ── /peers/self — this node's identity and group memberships ─────────
+    def _handle_peers_self(self):
+        cfg = self.daemon_state["config"]
+        log = self.daemon_state["log"]
+        log.info("GET /peers/self")
+        return self._send_json(200, {
+            "node_name":      cfg["node_name"],
+            "listen_address": cfg["listen_address"],
+            "version":        VERSION,
+            "memberships": [
+                {"group_name": m["group_name"], "role": m["role"]}
+                for m in cfg["memberships"]
+            ],
+        })
 
 
 # ── Main ───────────────────────────────────────────────────────────────────

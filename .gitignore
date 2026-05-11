@@ -10,6 +10,12 @@
 .env
 .env.local
 
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
 # Runtime cruft left by dev tooling when scripts don't cd into the peer install dir.
 # Tracked as a known issue; to be fixed by patching start-peer.sh / setup-peer.sh.
 dev/.qdrant-initialized

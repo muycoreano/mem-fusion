@@ -166,8 +166,8 @@ a memory, verify it still exists in the current code.
 | Version | What | Status |
 |---|---|---|
 | **v0.1.0** | Personal memory (sessions + cognitive layers) | ✅ Shipped 2026-05-08 |
-| **v0.2.0** | Extension loader infrastructure — enables third-party tools to add MCP endpoints without forking Mem-Fusion | 🚧 Design locked; see [CHANGELOG](CHANGELOG.md) |
-| **v0.3.0** | Constellation bundled extension — group memory across peers; curator + apprenticeship loop | 📋 Design phase |
+| **v0.3.0** | Bundled Constellation daemon — group memory across peers via federated per-group Qdrant collections + `export_record` tool for faithful memory promotion | 🚧 In progress; see [CHANGELOG](CHANGELOG.md) for design and scope |
+| **v0.4.0+** | Human review queue (apprenticeship loop), multi-group membership, hierarchical orchestrators, per-peer cryptographic identity, native OS notifications | 📋 Design sketched; not yet scoped for implementation |
 
 ---
 

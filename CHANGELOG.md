@@ -7,54 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased] — planned for v0.2.0
+## [Unreleased] — planned for v0.3.0
 
-Design locked; implementation not yet started. v0.2.0 is purely additive — **no breaking changes** to v0.1.0 tool names, hooks, or storage format. v0.1.0 users will upgrade by re-pasting the updated `INSTALL.md` prompt into Claude Code; the upgrade detects the existing v0.1.0 install and patches it in place.
+Design locked; implementation in progress. v0.3.0 is the next release after v0.1.0 — purely additive (no breaking changes to existing tool names, hooks, or storage format). v0.1.0 users will upgrade by re-pasting the updated `INSTALL.md` prompt into Claude Code; the upgrade detects the existing v0.1.0 install and patches it in place. The Constellation daemon installs as an opt-in companion.
 
 ### Added
 
-- **Extension loader** — `mcp_server.py` scans `~/.local/share/mem-fusion/extensions/` at startup and loads any Python module that follows the extension convention. Each extension declares `NAMESPACE = "<prefix>"`, a `TOOLS` list of MCP `Tool` objects, and an `async def dispatch(name, args)` handler. Enables third-party tooling (e.g., Constellation) to add tools without forking Mem-Fusion. ~30 LOC of loader code, no framework dependency.
-
-- **Namespace prefix discipline** — every extension tool must be named `<namespace>/<tool>`. The loader rejects extensions that:
-  - declare tools without the namespace prefix,
-  - declare a namespace already claimed by another extension,
-  - declare tools that collide with Mem-Fusion's top-level tools.
-  Top-level naming is grandfathered for Mem-Fusion's own 8 tools — see *Naming model* below.
-
-- **Install manifest** — `~/.local/share/mem-fusion/install_manifest.json` records which services Mem-Fusion installed (owned) vs. which it consumed from the user's environment (shared, e.g., a pre-existing Ollama). Used by upgrade and uninstall logic to manage only what we own.
+- **Group memory via bundled Constellation daemon** — a separate, persistent HTTP MCP daemon shipped in this repo at `extensions/constellation/`. Enables federated group memory across multiple Mem-Fusion nodes. Each group has one orchestrating node + N member nodes. Memory submitted to a group's orchestrator is auto-accepted into that group's canonical store. Sovereign per-group Qdrant collections (not replicated databases; selective propagation between independent stores).
+- **`export_record(id)` tool in Mem-Fusion** — returns a stored memory's full Qdrant record including its 768-dim vector. Enables faithful promotion of a local memory into a group canonical without re-embedding (vector copied verbatim).
+- **Constellation MCP tool surface** (4 tools, all under the `constellation/` namespace): `memory/put`, `memory/get`, `peers`, `peers/self`. Content_hash integrity verified at destination; per-group dedup; provenance chain preserved.
+- **Two-daemon architecture** — Mem-Fusion stays stdio (per-Claude-session subprocess, localhost-only). Constellation runs as a persistent HTTP MCP daemon under launchd (`com.branchapp.memfusion.constellation`). Disjoint Qdrant collections; Constellation has no privileged access to Mem-Fusion's local memory.
+- **Claude bridge pattern (CLAUDE.md instruction)** — Claude is instructed to perform a three-call sequence on user "remember X" requests: `store_memory` (local) → `export_record` (extract full record) → `constellation/memory/put` (promote to group canonical). Auto-promotion is the v0.3.0 default; private retention is deferred to v0.4.
 
 ### Changed
 
-- **Qdrant port 6333 pre-flight: hard bail** — port-in-use is now an installer error, not a warning. Mem-Fusion requires exclusive use of Qdrant for its stateful collection; sharing isn't safe. Clear error tells the user to stop the conflicting service. (Multi-Qdrant support is not on the roadmap; per-collection isolation handles the use cases we've encountered.)
-
-- **Ollama port 11434 pre-flight: smart reuse** — if port 11434 is taken by an existing Ollama instance, the installer:
-  1. Verifies it's actually Ollama (queries `/api/tags`),
-  2. Checks `nomic-embed-text` is loaded; pulls it if missing,
-  3. Verifies a 768-dim embedding round-trip,
-  4. Consumes that Ollama without installing a duplicate launchd plist.
-
-  If port 11434 is taken by something other than Ollama, hard bail. Sharing is safe because Ollama is stateless and the model is identical across consumers.
+- **Qdrant port 6333 pre-flight: hard bail** — port-in-use is now an installer error, not a warning. Mem-Fusion requires exclusive use of Qdrant for its stateful collection. Constellation uses the same Qdrant instance with a separate collection.
+- **Ollama port 11434 pre-flight: smart reuse** — if port 11434 is taken by an existing Ollama instance, the installer verifies it's actually Ollama, ensures `nomic-embed-text` is loaded (pulls if missing), confirms a 768-dim embedding round-trip, and consumes that Ollama without installing a duplicate launchd plist. Hard bail if the port is taken by something other than Ollama.
 
 ### Fixed
 
-- **`init_collection.py` ignored `QDRANT_URL` env var** — v0.1.0 had `QDRANT_URL = "http://127.0.0.1:6333"` hardcoded, so setting the env var had no effect. The script silently talked to whatever Qdrant was on the default port and reported success. Now respects `os.getenv("QDRANT_URL", "http://127.0.0.1:6333")` symmetrically with `MEMFUSION_COLLECTION`. Latent in v0.1.0; only surfaced when running init against a non-default port (e.g., a dev / test peer). Discovered while building Constellation's dev tooling.
+- **`init_collection.py` ignored `QDRANT_URL` env var** — v0.1.0 had `QDRANT_URL = "http://127.0.0.1:6333"` hardcoded, so setting the env var had no effect. Now respects `os.getenv("QDRANT_URL", "http://127.0.0.1:6333")` symmetrically with `MEMFUSION_COLLECTION`. Latent in v0.1.0; surfaced when running init against a non-default Qdrant port (e.g., a dev / test peer).
 
-### Naming model (locked in v0.2.0)
+### Architecture notes
 
-| Tools | Convention | Examples |
-|---|---|---|
-| Mem-Fusion (the host) | Flat, no prefix — grandfathered | `store_memory`, `search_memory`, `memory_stats`, etc. |
-| Any extension | Under its own namespace prefix | `constellation/submit_candidate`, `linear-bridge/sync_issue` |
+- **Object model**: two entities — node and group. "Orchestrating" is a per-group role, not a node type. A node can be a non-orchestrating member of one group and the orchestrating node of another. v0.3.0 ships with single-group-per-node configurations; data structures preserve multi-group futures.
+- **Routing rules** (load-bearing invariants): direct send only (no relays), membership equals authorization, no transitive routing, no automatic cross-group propagation.
+- **Replication model**: each group's canonical Qdrant collection is sovereign. Different orchestrators have different canonical contents — not replicas of each other. Selective propagation through deliberate `memory/put` calls; no expectation of eventual convergence across the network.
+- **Forward compatibility**: schemas accommodate v0.4+ features (multi-group membership, hierarchy via orchestrator-as-member-of-parent-group, cross-group propagation) without code support; v0.4 implementation can extend without breaking v0.3.0 wire formats.
 
-The grandfather clause means v0.1.0 users' CLAUDE.md snippets continue to work. A future major version may re-prefix Mem-Fusion's own tools under `memory/`, but that's not on the v0.2 roadmap.
+### Considered and deferred (v0.4+)
 
-### Considered and deferred
-
-- **Migrate to FastMCP** — its `import_server(prefix=...)` composition would replace the hand-rolled loader. Deferred: FastMCP is converging with the official MCP SDK but isn't yet a de facto standard; the ~30-LOC DIY loader is small, well-understood, and easily replaced later. We'll re-evaluate when extension count grows past ~3 or when FastMCP adoption broadens.
-
-- **Mem-Fusion tool rename to `memory/<tool>`** — symmetrical with extensions, but breaking for v0.1.0 users. Not worth the migration cost at our adoption level until there's a strong reason.
-
-- **Group memory across machines** — moved out of v0.2.0 and into v0.3.0. The v0.3.0 release will bundle the **Constellation extension** at `extensions/constellation/` inside this repo, enabling group memory through curated peer-to-peer fusion. Constellation is not a sibling project; it's a bundled extension that activates the horizontal fusion axis. v0.2.0 ships only the loader infrastructure that Constellation will load through.
+- **Human review queue / curator / apprenticeship loop** — v0.3.0 auto-accepts all valid memory submissions. Per-orchestrator human review with classifier-mediated escalation is v0.4.
+- **Multi-group membership per node** — v0.3.0 supports one group per node. Multi-membership and the hierarchical orchestrator pattern land in v0.4.
+- **Cross-group memory propagation** — the architecture supports orchestrator-as-member-of-parent-group, but v0.3.0 doesn't implement the cross-group routing logic.
+- **Per-peer cryptographic identity** — v0.3.0 uses a shared swarm key per group. mTLS / per-node Ed25519 keypair authentication is v0.4.
+- **Native OS notifications** (macOS Notification Center, etc.) — v0.3.0 uses Claude-native channels only (SessionStart hooks, MCP tools). System notifications can come later when the curator review flow lands.
+- **Private memory flag at promotion time** — v0.3.0 auto-promotes all user-initiated `store_memory` calls. Per-memory "stay local" flags are v0.4.
+- **In-process extension loader for Mem-Fusion** — was considered for the "Constellation as in-process extension" model. Resolved: Constellation runs as a separate daemon, so the in-process loader isn't needed for v0.3.0. May land in a later version if other in-process extensions emerge.
+- **FastMCP migration** — the official MCP SDK is sufficient; FastMCP composition primitives are interesting but not yet load-bearing.
 
 ---
 
@@ -95,10 +85,10 @@ Three layers fused via automatic hooks:
 ### Known limitations
 
 - macOS only (launchd hard-required by current architecture)
-- Single-machine deployment (multi-node coordination is a separate sibling project)
+- Single-machine deployment (multi-node coordination is bundled in v0.3.0 via Constellation)
 - Hooks tied to Claude Code's specific hook event names (SessionStart, UserPromptSubmit, Stop, PostToolUse)
 
-### Known issues (to be fixed in v0.2.0)
+### Known issues (to be fixed in v0.3.0)
 
 - `init_collection.py` ignores the `QDRANT_URL` env var; silently talks to `http://127.0.0.1:6333` regardless. Only surfaces when running init against a non-default port. See [Unreleased] § Fixed.
 

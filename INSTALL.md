@@ -17,7 +17,7 @@ It's all local — no data leaves your Mac. Stack:
 
 - **Qdrant 1.13.4** — local vector database (port 6333)
 - **Ollama 0.20.5** + `nomic-embed-text` — local 768-dim embeddings (port 11434)
-- **Python 3.12 MCP server** — exposes 8 memory tools to Claude Code via stdio
+- **Python 3.12 MCP server** — exposes 9 memory tools to Claude Code via stdio
 - **4 hooks** — SessionStart, UserPromptSubmit, Stop, PostToolUse:Write
 - **`/remember` skill**
 
@@ -160,7 +160,7 @@ Save the following to `~/.local/share/mem-fusion/mcp_server.py` **verbatim**:
 #!/usr/bin/env python3
 """
 Mem-Fusion MCP Server — stdio transport
-Provides 8 tools for storing and retrieving memories from Qdrant.
+Provides 9 tools for storing and retrieving memories from Qdrant.
 """
 import asyncio
 import hashlib
@@ -356,6 +356,14 @@ async def list_tools():
         Tool(name="memory_stats",
              description="Total count, breakdown by type/project, last update timestamp.",
              inputSchema={"type": "object", "properties": {}, "required": []}),
+        Tool(name="export_record",
+             description=("Return a stored memory's full Qdrant record by ID, including its "
+                          "768-dim vector. Used by Constellation and other extensions that need "
+                          "faithful memory propagation across machines (vector copied verbatim, "
+                          "not re-embedded)."),
+             inputSchema={"type": "object", "properties": {
+                 "id": {"type": "string", "description": "Memory ID from a prior store/search result"},
+             }, "required": ["id"]}),
     ]
 
 
@@ -378,6 +386,7 @@ async def dispatch(name, args):
     if name == "delete_memory":     return await tool_delete(args)
     if name == "get_related":       return await tool_get_related(args)
     if name == "memory_stats":      return await tool_stats(args)
+    if name == "export_record":     return await tool_export_record(args)
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -551,6 +560,34 @@ async def tool_stats(args):
 
     return {"total_memories": total, "by_type": by_type, "last_stored": last_stored,
             "collection": COLLECTION, "qdrant_url": QDRANT_URL, "ollama_url": OLLAMA_URL}
+
+
+async def tool_export_record(args):
+    """Return the full Qdrant record (including vector) for a stored memory by ID.
+
+    Enables Constellation and other extensions to extract a complete memory
+    record for faithful propagation to a group canonical — the vector is
+    copied verbatim rather than re-embedded across the boundary.
+    """
+    memory_id = args["id"]
+    points = qdrant.retrieve(collection_name=COLLECTION, ids=[memory_id],
+                              with_vectors=True, with_payload=True)
+    if not points:
+        return {"error": f"Memory {memory_id} not found"}
+    p = points[0]
+    return {
+        "id":           str(p.id),
+        "vector":       p.vector,
+        "content":      p.payload.get("content", ""),
+        "content_hash": p.payload.get("content_hash", ""),
+        "type":         p.payload.get("type", ""),
+        "tags":         p.payload.get("tags", []),
+        "project":      p.payload.get("project", ""),
+        "importance":   p.payload.get("importance", 3),
+        "session_id":   p.payload.get("session_id", ""),
+        "timestamp":    p.payload.get("timestamp", ""),
+        "source":       p.payload.get("source", ""),
+    }
 
 
 async def main():
@@ -1295,7 +1332,7 @@ Trivial facts, transient state, things derivable from code or `git log`.
 
 ### Available tools
 `store_memory` · `search_memory` · `search_recent` · `upsert_memory` ·
-`find_or_create` · `delete_memory` · `get_related` · `memory_stats`
+`find_or_create` · `delete_memory` · `get_related` · `memory_stats` · `export_record`
 
 ### Verification rule
 Memories are point-in-time observations. Before recommending a file/function/flag named in

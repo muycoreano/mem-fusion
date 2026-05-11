@@ -7,7 +7,7 @@ Out of the box, Claude Code has only a context window. Every session starts blan
 Mem-Fusion fuses memory across three axes:
 
 - **Across sessions** — Tuesday's decision surfaces in Friday's session, automatically.
-- **Across cognitive layers** — episodic, semantic, procedural, and working memory fused into one substrate via 8 memory tools and 4 automatic hooks.
+- **Across cognitive layers** — episodic, semantic, procedural, and working memory fused into one substrate via 9 memory tools and 4 automatic hooks.
 - **Across machines** *(when you enable the Constellation extension — shipping in v0.3.0)* — personal memory streams from peer machines fuse into curated group memory, governed by an apprenticeship loop that learns your judgment over time.
 
 Same substrate, three axes of fusion. Standalone fuses two of them; turn on Constellation to add the third.
@@ -59,13 +59,15 @@ That's it. Claude will install Qdrant, Ollama, the embedding model, the MCP serv
 |---|---|
 | **Qdrant 1.13.4** | Local vector database (port 6333) |
 | **Ollama 0.20.5 + `nomic-embed-text`** | Local 768-dim embeddings (port 11434) |
-| **Mem-Fusion MCP server** | Exposes 8 memory tools to Claude Code via stdio |
+| **Mem-Fusion MCP server** | Exposes 9 memory tools to Claude Code via stdio |
 | **4 Claude Code hooks** | SessionStart, UserPromptSubmit, Stop, PostToolUse:Write — all automatic |
 | **`/remember` skill** | One-command pinning for high-importance memory |
 
-The eight MCP tools:
+The nine MCP tools:
 
-`store_memory` · `search_memory` · `search_recent` · `upsert_memory` · `find_or_create` · `delete_memory` · `get_related` · `memory_stats`
+`store_memory` · `search_memory` · `search_recent` · `upsert_memory` · `find_or_create` · `delete_memory` · `get_related` · `memory_stats` · `export_record`
+
+(`export_record` returns a stored memory's full Qdrant record including its vector — used by the Constellation extension to faithfully propagate memory across machines without re-embedding.)
 
 ---
 

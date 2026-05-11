@@ -1,0 +1,25 @@
+{
+  "_comment_top": "Constellation daemon config template. Copy to config.json and edit.",
+
+  "node_name": "alice-mac",
+
+  "listen_address": "127.0.0.1:7433",
+  "_comment_listen": "Where the Constellation HTTP MCP daemon binds. For local-only (Claude on this machine), use 127.0.0.1. For cross-machine peers, bind to a LAN/WAN-reachable interface. Default port: 7433.",
+
+  "qdrant_url": "http://127.0.0.1:6333",
+  "_comment_qdrant": "Mem-Fusion's existing Qdrant. Constellation uses its own collection on the same Qdrant instance.",
+
+  "canonical_collection": "mem_fusion_canonical_memories",
+
+  "state_dir": "~/.local/share/mem-fusion/constellation",
+
+  "memberships": [
+    {
+      "group_name": "engineering@branch",
+      "role": "orchestrator",
+      "swarm_key": "REPLACE_WITH_GENERATED_32_BYTE_HEX",
+      "_comment_role": "orchestrator | peer. v0.3.0 supports exactly one membership; v0.4 will support multiple.",
+      "_comment_swarm_key": "Shared secret per group. Members hold this key; orchestrator verifies it on every request. Generate with: openssl rand -hex 32"
+    }
+  ]
+}

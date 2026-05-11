@@ -43,7 +43,20 @@ from qdrant_client.models import (
 )
 
 
-# ── Protocol constants ─────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────
+VERSION          = "0.3.0-alpha"
+DAEMON_NAME      = "constellation"
+VECTOR_SIZE      = 768  # nomic-embed-text dim; must match Mem-Fusion's local store
+SCROLL_PAGE_SIZE = 256
+
+# HTTP status codes used in this file (named to avoid bare numeric literals in handlers)
+HTTP_OK          = 200
+HTTP_BAD_REQUEST = 400
+HTTP_FORBIDDEN   = 403
+HTTP_NOT_FOUND   = 404
+
+
+# ── Protocol helpers ───────────────────────────────────────────────────────
 def content_hash(text: str) -> str:
     """Identical hash function used by Mem-Fusion's mcp_server.py.
 
@@ -57,27 +70,29 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def scroll_all(qdrant, collection: str, scroll_filter, payload_keys, page_size: int = 256):
+def scroll_all(qdrant, collection: str, scroll_filter, payload_keys, page_size: int = SCROLL_PAGE_SIZE):
     """Yield every Qdrant point matching `scroll_filter`, paginating internally.
 
     Cursor-based pagination is inherently do-while: the first request has no
-    offset, and we only know if there's a next page from the response. This
-    helper isolates that pattern so callers can read a plain `for p in
-    scroll_all(...)` instead of managing a cursor loop themselves.
+    offset, and we only know if there's a next page from the response.
+    Bootstrap the first page explicitly so the main loop's header carries
+    the termination condition (`while next_offset is not None`).
     """
-    next_offset = None
-    while True:
-        points, next_offset = qdrant.scroll(
+    def _page(offset):
+        return qdrant.scroll(
             collection_name=collection,
             scroll_filter=scroll_filter,
             limit=page_size,
             with_payload=payload_keys,
             with_vectors=False,
-            offset=next_offset,
+            offset=offset,
         )
+
+    points, next_offset = _page(None)
+    yield from points
+    while next_offset is not None:
+        points, next_offset = _page(next_offset)
         yield from points
-        if not next_offset:
-            return
 
 
 def point_to_record(p) -> dict:
@@ -101,12 +116,6 @@ def point_to_record(p) -> dict:
     }
 
 
-# ── Constants ──────────────────────────────────────────────────────────────
-VERSION       = "0.3.0-alpha"
-DAEMON_NAME   = "constellation"
-VECTOR_SIZE   = 768  # nomic-embed-text dim; must match Mem-Fusion's local store
-
-
 # ── Config loading ─────────────────────────────────────────────────────────
 def load_config(path: Path) -> dict:
     """Load and validate the daemon's config. Raises ValueError on invalid schema."""
@@ -119,11 +128,12 @@ def load_config(path: Path) -> dict:
         raise ValueError("config missing or invalid 'memberships' (must be a list)")
 
     for i, m in enumerate(cfg["memberships"]):
-        for k in ("group_name", "role", "swarm_key"):
+        for k in ("group_name", "role"):
             if k not in m:
                 raise ValueError(f"memberships[{i}] missing field: {k}")
         if m["role"] not in ("orchestrator", "peer"):
             raise ValueError(f"memberships[{i}].role must be 'orchestrator' or 'peer', got {m['role']!r}")
+        # swarm_key is reserved for v0.4+ auth; accepted but not validated/required here.
 
     # v0.3.0 scope check: enforce single membership
     if len(cfg["memberships"]) > 1:
@@ -199,7 +209,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             cfg = self.daemon_state["config"]
-            self._send_json(200, {
+            self._send_json(HTTP_OK, {
                 "ok":          True,
                 "daemon":      DAEMON_NAME,
                 "version":     VERSION,
@@ -216,13 +226,13 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/peers"):
             self._handle_peers_list()
         else:
-            self._send_json(404, {"error": "not found", "path": self.path})
+            self._send_json(HTTP_NOT_FOUND, {"error": "not found", "path": self.path})
 
     def do_POST(self):
         if self.path == "/memory/put":
             self._handle_memory_put()
         else:
-            self._send_json(404, {"error": "not found", "path": self.path})
+            self._send_json(HTTP_NOT_FOUND, {"error": "not found", "path": self.path})
 
     # ── /memory/put — promote a memory into a group's canonical store ─────
     def _handle_memory_put(self):
@@ -233,25 +243,25 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         # Parse body
         length = int(self.headers.get("Content-Length", 0))
         if length <= 0:
-            return self._send_json(400, {"error": "empty body"})
+            return self._send_json(HTTP_BAD_REQUEST, {"error": "empty body"})
         try:
             body = json.loads(self.rfile.read(length))
         except json.JSONDecodeError as e:
-            return self._send_json(400, {"error": f"invalid JSON: {e}"})
+            return self._send_json(HTTP_BAD_REQUEST, {"error": f"invalid JSON: {e}"})
 
         # Validate top-level
         for k in ("group_name", "memory_record", "provenance"):
             if k not in body:
-                return self._send_json(400, {"error": f"missing top-level field: {k}"})
+                return self._send_json(HTTP_BAD_REQUEST, {"error": f"missing top-level field: {k}"})
 
         group_name = body["group_name"]
         record     = body["memory_record"]
         provenance = body["provenance"]
 
-        # Membership: must be a group we orchestrate
+# Membership: must be a group we orchestrate
         orchestrated = [m["group_name"] for m in cfg["memberships"] if m["role"] == "orchestrator"]
         if group_name not in orchestrated:
-            return self._send_json(403, {
+            return self._send_json(HTTP_FORBIDDEN, {
                 "error":            f"this node does not orchestrate {group_name!r}",
                 "orchestrated":     orchestrated,
             })
@@ -261,12 +271,12 @@ class ConstellationHandler(BaseHTTPRequestHandler):
                     "type", "importance", "original_timestamp")
         for k in required:
             if k not in record:
-                return self._send_json(400, {"error": f"memory_record missing field: {k}"})
+                return self._send_json(HTTP_BAD_REQUEST, {"error": f"memory_record missing field: {k}"})
 
         # Verify content_hash matches recomputed (integrity gate — catches paraphrasing / transit corruption)
         expected_chash = content_hash(record["content"])
         if expected_chash != record["content_hash"]:
-            return self._send_json(400, {
+            return self._send_json(HTTP_BAD_REQUEST, {
                 "error":              "content_hash mismatch",
                 "expected":           expected_chash,
                 "received":           record["content_hash"],
@@ -276,7 +286,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         # Validate vector shape
         vec = record["vector"]
         if not isinstance(vec, list) or len(vec) != VECTOR_SIZE:
-            return self._send_json(400, {
+            return self._send_json(HTTP_BAD_REQUEST, {
                 "error":              f"vector must be {VECTOR_SIZE}-dim list",
                 "received_length":    len(vec) if isinstance(vec, list) else None,
                 "received_type":      type(vec).__name__,
@@ -295,7 +305,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             existing_id = str(existing[0].id)
             log.info("PUT duplicate: group=%s hash=%s existing=%s",
                      group_name, record["content_hash"], existing_id)
-            return self._send_json(200, {
+            return self._send_json(HTTP_OK, {
                 "status":        "duplicate",
                 "canonical_id":  existing_id,
             })
@@ -329,7 +339,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
                  group_name, canonical_id,
                  provenance.get("origin_node", "?"), provenance.get("origin_local_id", "?")[:8])
 
-        return self._send_json(200, {
+        return self._send_json(HTTP_OK, {
             "status":        "stored",
             "canonical_id":  canonical_id,
             "received_at":   received_at,
@@ -347,12 +357,12 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         limit      = int((params.get("limit") or ["10"])[0])
 
         if not group_name:
-            return self._send_json(400, {"error": "missing query param: group_name"})
+            return self._send_json(HTTP_BAD_REQUEST, {"error": "missing query param: group_name"})
 
-        # Membership: must be a group we orchestrate
+# Membership: must be a group we orchestrate
         orchestrated = [m["group_name"] for m in cfg["memberships"] if m["role"] == "orchestrator"]
         if group_name not in orchestrated:
-            return self._send_json(403, {
+            return self._send_json(HTTP_FORBIDDEN, {
                 "error":         f"this node does not orchestrate {group_name!r}",
                 "orchestrated":  orchestrated,
             })
@@ -364,15 +374,15 @@ class ConstellationHandler(BaseHTTPRequestHandler):
                 ids=[memory_id], with_vectors=True, with_payload=True,
             )
             if not points:
-                return self._send_json(404, {"error": f"memory {memory_id} not found"})
+                return self._send_json(HTTP_NOT_FOUND, {"error": f"memory {memory_id} not found"})
             # Verify it belongs to the requested group
             p = points[0]
             if p.payload.get("group_name") != group_name:
-                return self._send_json(404, {
+                return self._send_json(HTTP_NOT_FOUND, {
                     "error":     f"memory {memory_id} not in group {group_name!r}",
                 })
             log.info("GET by-id: group=%s id=%s", group_name, memory_id)
-            return self._send_json(200, {"count": 1, "memories": [point_to_record(p)]})
+            return self._send_json(HTTP_OK, {"count": 1, "memories": [point_to_record(p)]})
         else:
             # Scroll recent records in this group
             points, _ = qdrant.scroll(
@@ -383,7 +393,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
                 limit=limit, with_payload=True, with_vectors=True,
             )
             log.info("GET scroll: group=%s count=%d", group_name, len(points))
-            return self._send_json(200, {
+            return self._send_json(HTTP_OK, {
                 "count":    len(points),
                 "memories": [point_to_record(p) for p in points],
             })
@@ -404,11 +414,11 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         params = parse_qs(urlparse(self.path).query)
         group_name = (params.get("group_name") or [None])[0]
         if not group_name:
-            return self._send_json(400, {"error": "missing query param: group_name"})
+            return self._send_json(HTTP_BAD_REQUEST, {"error": "missing query param: group_name"})
 
         orchestrated = [m["group_name"] for m in cfg["memberships"] if m["role"] == "orchestrator"]
         if group_name not in orchestrated:
-            return self._send_json(403, {
+            return self._send_json(HTTP_FORBIDDEN, {
                 "error":        f"this node does not orchestrate {group_name!r}",
                 "orchestrated": orchestrated,
             })
@@ -440,7 +450,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
 
         peer_list = sorted(peers.values(), key=lambda e: e["last_seen"], reverse=True)
         log.info("GET /peers: group=%s count=%d", group_name, len(peer_list))
-        return self._send_json(200, {
+        return self._send_json(HTTP_OK, {
             "group_name":   group_name,
             "orchestrator": cfg["node_name"],
             "count":        len(peer_list),
@@ -452,7 +462,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         cfg = self.daemon_state["config"]
         log = self.daemon_state["log"]
         log.info("GET /peers/self")
-        return self._send_json(200, {
+        return self._send_json(HTTP_OK, {
             "node_name":      cfg["node_name"],
             "listen_address": cfg["listen_address"],
             "version":        VERSION,

@@ -25,15 +25,57 @@ Usage:
   python constellation.py --config /path/to/config.json
 """
 import argparse
+import hashlib
 import json
 import logging
 import signal
 import sys
+import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PayloadSchemaType
+from qdrant_client.models import (
+    Distance, FieldCondition, Filter, MatchValue,
+    PayloadSchemaType, PointStruct, VectorParams,
+)
+
+
+# ── Protocol constants ─────────────────────────────────────────────────────
+def content_hash(text: str) -> str:
+    """Identical hash function used by Mem-Fusion's mcp_server.py.
+
+    MUST be byte-identical across Mem-Fusion and Constellation for cross-store
+    dedup and integrity verification to work.
+    """
+    return hashlib.sha256(text.strip().lower().encode()).hexdigest()[:16]
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def point_to_record(p) -> dict:
+    """Convert a Qdrant PointStruct into the canonical memory_record shape."""
+    pl = p.payload or {}
+    return {
+        "canonical_id":         str(p.id),
+        "vector":               list(p.vector) if p.vector is not None else None,
+        "content":              pl.get("content", ""),
+        "content_hash":         pl.get("content_hash", ""),
+        "type":                 pl.get("type", ""),
+        "tags":                 pl.get("tags", []),
+        "importance":           pl.get("importance", 3),
+        "original_timestamp":   pl.get("original_timestamp", ""),
+        "group_name":           pl.get("group_name", ""),
+        "origin_node":          pl.get("origin_node", ""),
+        "origin_local_id":      pl.get("origin_local_id", ""),
+        "submitted_at":         pl.get("submitted_at", ""),
+        "received_at":          pl.get("received_at", ""),
+        "submission_kind":      pl.get("submission_kind", ""),
+    }
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -143,17 +185,180 @@ class ConstellationHandler(BaseHTTPRequestHandler):
                     {"group_name": m["group_name"], "role": m["role"]}
                     for m in cfg["memberships"]
                 ],
-                "scope":       "WP2 scaffold — MCP tools not yet implemented",
             })
+        elif self.path.startswith("/memory/get"):
+            self._handle_memory_get()
         else:
             self._send_json(404, {"error": "not found", "path": self.path})
 
     def do_POST(self):
-        # WP3 will implement MCP-over-HTTP here
-        self._send_json(501, {
-            "error": "not yet implemented",
-            "note":  "MCP tools (memory/put, memory/get, peers, peers/self) land in WP3",
+        if self.path == "/memory/put":
+            self._handle_memory_put()
+        else:
+            self._send_json(404, {"error": "not found", "path": self.path})
+
+    # ── /memory/put — promote a memory into a group's canonical store ─────
+    def _handle_memory_put(self):
+        cfg = self.daemon_state["config"]
+        qdrant = self.daemon_state["qdrant"]
+        log = self.daemon_state["log"]
+
+        # Parse body
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            return self._send_json(400, {"error": "empty body"})
+        try:
+            body = json.loads(self.rfile.read(length))
+        except json.JSONDecodeError as e:
+            return self._send_json(400, {"error": f"invalid JSON: {e}"})
+
+        # Validate top-level
+        for k in ("group_name", "memory_record", "provenance"):
+            if k not in body:
+                return self._send_json(400, {"error": f"missing top-level field: {k}"})
+
+        group_name = body["group_name"]
+        record     = body["memory_record"]
+        provenance = body["provenance"]
+
+        # Membership: must be a group we orchestrate
+        orchestrated = [m["group_name"] for m in cfg["memberships"] if m["role"] == "orchestrator"]
+        if group_name not in orchestrated:
+            return self._send_json(403, {
+                "error":            f"this node does not orchestrate {group_name!r}",
+                "orchestrated":     orchestrated,
+            })
+
+        # Validate memory_record shape
+        required = ("content", "vector", "content_hash", "type", "importance", "original_timestamp")
+        for k in required:
+            if k not in record:
+                return self._send_json(400, {"error": f"memory_record missing field: {k}"})
+
+        # Verify content_hash matches recomputed (integrity gate — catches paraphrasing)
+        expected_hash = content_hash(record["content"])
+        if expected_hash != record["content_hash"]:
+            return self._send_json(400, {
+                "error":              "content_hash mismatch",
+                "expected":           expected_hash,
+                "received":           record["content_hash"],
+                "note":               "content was modified somewhere in transit",
+            })
+
+        # Validate vector
+        vec = record["vector"]
+        if not isinstance(vec, list) or len(vec) != VECTOR_SIZE:
+            return self._send_json(400, {
+                "error":              f"vector must be {VECTOR_SIZE}-dim list",
+                "received_length":    len(vec) if isinstance(vec, list) else None,
+                "received_type":      type(vec).__name__,
+            })
+
+        # Dedup by content_hash + group_name
+        existing, _ = qdrant.scroll(
+            collection_name=cfg["canonical_collection"],
+            scroll_filter=Filter(must=[
+                FieldCondition(key="content_hash", match=MatchValue(value=record["content_hash"])),
+                FieldCondition(key="group_name", match=MatchValue(value=group_name)),
+            ]),
+            limit=1, with_payload=False,
+        )
+        if existing:
+            existing_id = str(existing[0].id)
+            log.info("PUT duplicate: group=%s hash=%s existing=%s",
+                     group_name, record["content_hash"], existing_id)
+            return self._send_json(200, {
+                "status":        "duplicate",
+                "canonical_id":  existing_id,
+            })
+
+        # Insert
+        canonical_id = str(uuid.uuid4())
+        received_at  = iso_now()
+        payload = {
+            # Memory content (verbatim from source)
+            "content":            record["content"],
+            "content_hash":       record["content_hash"],
+            "type":               record["type"],
+            "tags":               record.get("tags", []),
+            "importance":         record["importance"],
+            "original_timestamp": record["original_timestamp"],
+            # Group identity
+            "group_name":         group_name,
+            # Provenance
+            "origin_node":        provenance.get("origin_node", ""),
+            "origin_local_id":    provenance.get("origin_local_id", ""),
+            "submitted_at":       provenance.get("submitted_at", ""),
+            "submission_kind":    provenance.get("submission_kind", ""),
+            "received_at":        received_at,
+            "received_by":        cfg["node_name"],
+        }
+        qdrant.upsert(
+            collection_name=cfg["canonical_collection"],
+            points=[PointStruct(id=canonical_id, vector=vec, payload=payload)],
+        )
+        log.info("PUT stored: group=%s id=%s origin=%s/%s",
+                 group_name, canonical_id,
+                 provenance.get("origin_node", "?"), provenance.get("origin_local_id", "?")[:8])
+
+        return self._send_json(200, {
+            "status":        "stored",
+            "canonical_id":  canonical_id,
+            "received_at":   received_at,
         })
+
+    # ── /memory/get — fetch from canonical store ─────────────────────────
+    def _handle_memory_get(self):
+        cfg = self.daemon_state["config"]
+        qdrant = self.daemon_state["qdrant"]
+        log = self.daemon_state["log"]
+
+        params = parse_qs(urlparse(self.path).query)
+        group_name = (params.get("group_name") or [None])[0]
+        memory_id  = (params.get("id") or [None])[0]
+        limit      = int((params.get("limit") or ["10"])[0])
+
+        if not group_name:
+            return self._send_json(400, {"error": "missing query param: group_name"})
+
+        # Membership: must be a group we orchestrate
+        orchestrated = [m["group_name"] for m in cfg["memberships"] if m["role"] == "orchestrator"]
+        if group_name not in orchestrated:
+            return self._send_json(403, {
+                "error":         f"this node does not orchestrate {group_name!r}",
+                "orchestrated":  orchestrated,
+            })
+
+        if memory_id:
+            # Fetch by ID
+            points = qdrant.retrieve(
+                collection_name=cfg["canonical_collection"],
+                ids=[memory_id], with_vectors=True, with_payload=True,
+            )
+            if not points:
+                return self._send_json(404, {"error": f"memory {memory_id} not found"})
+            # Verify it belongs to the requested group
+            p = points[0]
+            if p.payload.get("group_name") != group_name:
+                return self._send_json(404, {
+                    "error":     f"memory {memory_id} not in group {group_name!r}",
+                })
+            log.info("GET by-id: group=%s id=%s", group_name, memory_id)
+            return self._send_json(200, {"count": 1, "memories": [point_to_record(p)]})
+        else:
+            # Scroll recent records in this group
+            points, _ = qdrant.scroll(
+                collection_name=cfg["canonical_collection"],
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="group_name", match=MatchValue(value=group_name))
+                ]),
+                limit=limit, with_payload=True, with_vectors=True,
+            )
+            log.info("GET scroll: group=%s count=%d", group_name, len(points))
+            return self._send_json(200, {
+                "count":    len(points),
+                "memories": [point_to_record(p) for p in points],
+            })
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -204,13 +409,13 @@ def main():
     for m in cfg["memberships"]:
         log.info("  membership:  %s (role=%s)", m["group_name"], m["role"])
 
-    # Initialize canonical Qdrant collection
-    init_canonical_collection(cfg["qdrant_url"], cfg["canonical_collection"], log)
+    # Initialize canonical Qdrant collection (and capture the client for handlers)
+    qdrant = init_canonical_collection(cfg["qdrant_url"], cfg["canonical_collection"], log)
 
     # Bind HTTP listener
     host, port_str = cfg["listen_address"].split(":")
     port = int(port_str)
-    ConstellationHandler.daemon_state = {"config": cfg, "log": log}
+    ConstellationHandler.daemon_state = {"config": cfg, "log": log, "qdrant": qdrant}
 
     # SO_REUSEADDR — allow rebinding after a quick restart even if the prior
     # socket is in TIME_WAIT. Standard practice for long-lived daemons.

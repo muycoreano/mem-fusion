@@ -169,7 +169,7 @@ a memory, verify it still exists in the current code.
 |---|---|---|
 | **v0.1.0** | Personal memory (sessions + cognitive layers) | ✅ Shipped 2026-05-08 |
 | **v0.3.0** | Bundled Constellation daemon — group memory across peers via federated per-group Qdrant collections + `export_record` tool for faithful memory promotion | 🚧 In progress; see [CHANGELOG](CHANGELOG.md) for design and scope |
-| **v0.4.0+** | Human review queue (apprenticeship loop), multi-group membership, hierarchical orchestrators, per-peer cryptographic identity, native OS notifications | 📋 Design sketched; not yet scoped for implementation |
+| **post-MVP** | Deferred capabilities — no commitment to specific release timing: push notifications between peers, swarm-key / Bearer auth, human review queue, multi-group membership, hierarchical orchestrators, per-peer cryptographic identity, native OS notifications | 📋 Will be scoped as real usage surfaces specific needs |
 
 ---
 

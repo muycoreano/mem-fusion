@@ -17,7 +17,7 @@ Design locked; implementation in progress. v0.3.0 is the next release after v0.1
 - **`export_record(id)` tool in Mem-Fusion** — returns a stored memory's full Qdrant record including its 768-dim vector. Enables faithful promotion of a local memory into a group canonical without re-embedding (vector copied verbatim).
 - **Constellation MCP tool surface** (4 tools, all under the `constellation/` namespace): `memory/put`, `memory/get`, `peers`, `peers/self`. Content_hash integrity verified at destination; per-group dedup; provenance chain preserved.
 - **Two-daemon architecture** — Mem-Fusion stays stdio (per-Claude-session subprocess, localhost-only). Constellation runs as a persistent HTTP MCP daemon under launchd (`com.branchapp.memfusion.constellation`). Disjoint Qdrant collections; Constellation has no privileged access to Mem-Fusion's local memory.
-- **Claude bridge pattern (CLAUDE.md instruction)** — Claude is instructed to perform a three-call sequence on user "remember X" requests: `store_memory` (local) → `export_record` (extract full record) → `constellation/memory/put` (promote to group canonical). Auto-promotion is the v0.3.0 default; private retention is deferred to v0.4.
+- **Claude bridge pattern (CLAUDE.md instruction)** — Claude is instructed to perform a three-call sequence on user "remember X" requests: `store_memory` (local) → `export_record` (extract full record) → `constellation/memory/put` (promote to group canonical). Auto-promotion is the v0.3.0 default; private retention is deferred to post-MVP.
 
 ### Changed
 
@@ -33,16 +33,16 @@ Design locked; implementation in progress. v0.3.0 is the next release after v0.1
 - **Object model**: two entities — node and group. "Orchestrating" is a per-group role, not a node type. A node can be a non-orchestrating member of one group and the orchestrating node of another. v0.3.0 ships with single-group-per-node configurations; data structures preserve multi-group futures.
 - **Routing rules** (load-bearing invariants): direct send only (no relays), membership equals authorization, no transitive routing, no automatic cross-group propagation.
 - **Replication model**: each group's canonical Qdrant collection is sovereign. Different orchestrators have different canonical contents — not replicas of each other. Selective propagation through deliberate `memory/put` calls; no expectation of eventual convergence across the network.
-- **Forward compatibility**: schemas accommodate v0.4+ features (multi-group membership, hierarchy via orchestrator-as-member-of-parent-group, cross-group propagation) without code support; v0.4 implementation can extend without breaking v0.3.0 wire formats.
+- **Forward compatibility**: schemas accommodate post-MVP features (multi-group membership, hierarchy via orchestrator-as-member-of-parent-group, cross-group propagation) without code support; post-MVP implementation can extend without breaking v0.3.0 wire formats.
 
-### Considered and deferred (v0.4+)
+### Considered and deferred (post-MVP)
 
-- **Human review queue / curator / apprenticeship loop** — v0.3.0 auto-accepts all valid memory submissions. Per-orchestrator human review with classifier-mediated escalation is v0.4.
-- **Multi-group membership per node** — v0.3.0 supports one group per node. Multi-membership and the hierarchical orchestrator pattern land in v0.4.
+- **Human review queue / curator / apprenticeship loop** — v0.3.0 auto-accepts all valid memory submissions. Per-orchestrator human review with classifier-mediated escalation is post-MVP.
+- **Multi-group membership per node** — v0.3.0 supports one group per node. Multi-membership and the hierarchical orchestrator pattern land in post-MVP.
 - **Cross-group memory propagation** — the architecture supports orchestrator-as-member-of-parent-group, but v0.3.0 doesn't implement the cross-group routing logic.
-- **Per-peer cryptographic identity** — v0.3.0 uses a shared swarm key per group. mTLS / per-node Ed25519 keypair authentication is v0.4.
+- **Per-peer cryptographic identity** — v0.3.0 uses a shared swarm key per group. mTLS / per-node Ed25519 keypair authentication is post-MVP.
 - **Native OS notifications** (macOS Notification Center, etc.) — v0.3.0 uses Claude-native channels only (SessionStart hooks, MCP tools). System notifications can come later when the curator review flow lands.
-- **Private memory flag at promotion time** — v0.3.0 auto-promotes all user-initiated `store_memory` calls. Per-memory "stay local" flags are v0.4.
+- **Private memory flag at promotion time** — v0.3.0 auto-promotes all user-initiated `store_memory` calls. Per-memory "stay local" flags are post-MVP.
 - **In-process extension loader for Mem-Fusion** — was considered for the "Constellation as in-process extension" model. Resolved: Constellation runs as a separate daemon, so the in-process loader isn't needed for v0.3.0. May land in a later version if other in-process extensions emerge.
 - **FastMCP migration** — the official MCP SDK is sufficient; FastMCP composition primitives are interesting but not yet load-bearing.
 

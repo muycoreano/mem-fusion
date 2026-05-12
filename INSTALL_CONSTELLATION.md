@@ -192,13 +192,13 @@ def load_config(path: Path) -> dict:
                 raise ValueError(f"memberships[{i}] missing field: {k}")
         if m["role"] not in ("orchestrator", "peer"):
             raise ValueError(f"memberships[{i}].role must be 'orchestrator' or 'peer', got {m['role']!r}")
-        # swarm_key is reserved for v0.4+ auth; accepted but not validated/required here.
+        # swarm_key is reserved for post-MVP auth; accepted but not validated/required here.
 
     # v0.3.0 scope check: enforce single membership
     if len(cfg["memberships"]) > 1:
         raise ValueError(
             "v0.3.0 supports only one membership per node; "
-            "multi-membership is reserved for v0.4+"
+            "multi-membership is reserved for post-MVP"
         )
 
     # Defaults

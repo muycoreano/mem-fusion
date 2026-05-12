@@ -46,7 +46,7 @@ PEERS = {
         "collection": "mem_fusion_peer_b_memories",
         "memories": [
             {
-                "content":    "Constellation v0.3.0 ships with auto-promote as the default; v0.4 will add the human-review apprenticeship loop on top.",
+                "content":    "Constellation v0.3.0 ships with auto-promote as the default; a human-review apprenticeship loop is deferred for a later version.",
                 "type":       "decision",
                 "tags":       ["constellation", "v0.3.0-scope"],
                 "project":    "mem-fusion",

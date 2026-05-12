@@ -568,7 +568,7 @@ def main():
         print(f"  Node:        {cfg['node_name']}")
         print(f"  Memberships: {[m['group_name'] for m in cfg['memberships']]}")
         print(f"  Qdrant:      {cfg['qdrant_url']} ({core.COLLECTION})")
-        print(f"  Log:         {core.LOG_PATH}")
+        print(f"  Log:         {core.ACTIVE_LOG_PATH}")
         print(f"  Try:         curl http://{cfg['listen_address']}/health")
         print(f"  Stop:        Ctrl-C")
 

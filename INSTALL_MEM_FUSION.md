@@ -317,23 +317,32 @@ COLLECTION  = "cowork_memories"
 EMBED_MODEL = "nomic-embed-text"
 VECTOR_SIZE = 768
 
-LOG_PATH    = os.getenv("MEMFUSION_LOG",
-                        str(Path.home() / ".local/share/mem-fusion/logs/mem-fusion.log"))
+LOG_DIR     = os.getenv("MEMFUSION_LOG_DIR",
+                        str(Path.home() / ".local/share/mem-fusion/logs"))
+
+# Set by configure_logging() — the per-startup log file the current process
+# is writing to. Daemons print this on startup so users know where to tail.
+ACTIVE_LOG_PATH: str | None = None
 
 
-# ── Unified logger (shared file, component-prefixed format) ───────────────
+# ── Per-startup logger (one file per daemon run, component-prefixed) ─────
 def configure_logging(component: str) -> logging.Logger:
-    """Configure the unified mem-fusion logger for the calling process.
+    """Configure logging for the calling process.
 
-    All processes (mem-fusion, constellation, core, hooks) write to the same
-    log file with a [component] prefix so debugging is one-file. Each
-    process calls this once at startup with its component name.
+    Each daemon startup writes to its own file:
+      <LOG_DIR>/<component>.<UTC-timestamp>.log
+
+    The [component] prefix in the formatter keeps the file content
+    self-describing even if multiple files are concatenated for cross-daemon
+    debugging. Each process calls this once at startup.
     """
-    Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+    global ACTIVE_LOG_PATH
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+    ACTIVE_LOG_PATH = str(Path(LOG_DIR) / f"{component}.{ts}.log")
     root = logging.getLogger()
-    if not any(isinstance(h, logging.FileHandler) and h.baseFilename == LOG_PATH
-               for h in root.handlers):
-        handler = logging.FileHandler(LOG_PATH)
+    if not any(isinstance(h, logging.FileHandler) for h in root.handlers):
+        handler = logging.FileHandler(ACTIVE_LOG_PATH)
         handler.setFormatter(logging.Formatter(
             f"%(asctime)s %(levelname)-5s [{component:<14}] %(message)s"
         ))

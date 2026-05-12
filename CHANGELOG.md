@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Design locked; implementation in progress. v0.3.0 is the next release after v0.1.0 — purely additive (no breaking changes to existing tool names, hooks, or storage format). v0.1.0 users will upgrade by re-pasting the updated `INSTALL.md` prompt into Claude Code; the upgrade detects the existing v0.1.0 install and patches it in place. The Constellation daemon installs as an opt-in companion.
 
+### Implementation updates since design lock
+
+Implementation has refined several design assumptions captured in the original "Added / Changed / Architecture notes" entries below. The entries here supersede the older bullets where they conflict:
+
+- **Single Qdrant collection model** — Mem-Fusion and Constellation share one collection (`cowork_memories`); federation entries are distinguished by a `source=federation` payload tag carrying `origin_node`, `group_name`, `received_at`. The earlier "disjoint canonical collection" design was dropped because tagging is simpler, makes the cowork-memory → mem-fusion upgrade a no-op (same datastore), and lets `core.search_recent` surface federation entries naturally via the `timestamp = received_at` alias.
+- **Collection name is invariant** — `MEMFUSION_COLLECTION` env var and Constellation's `canonical_collection` config field both removed. The collection is always `cowork_memories` (the deployed cowork-memory name); peer isolation in dev comes from distinct Qdrant ports, not names.
+- **`core.py` shared library** — extracted from `mem_fusion.py`; both daemons proxy to its 9 memory operations. `mem_fusion.py` is now a 133-line stdio MCP wrapper. Qdrant client is a module-level singleton, rebindable for tests that target multiple peer Qdrants in one process.
+- **Mesh topology** — every Constellation peer is symmetric; "orchestrator" is a per-group role assigned to a peer at config time. Supersedes the earlier "designated orchestrator-only node" framing.
+- **Constellation lives at `src/constellation.py`** — the `extensions/constellation/` location described in earlier bullets is obsolete.
+- **Per-startup daemon log files** — each daemon startup creates `<LOG_DIR>/<component>.<UTC-timestamp>.log` (one file per process lifetime, `[<component>]` line prefix preserved for cross-daemon catenation). Default `LOG_DIR` is `~/.local/share/mem-fusion/logs/`; override via `MEMFUSION_LOG_DIR`.
+- **`tests/` directory** — `dev/` renamed to `tests/`; split into `tests/constellation/` (multi-peer federation, requires dev peer Qdrants on `:6433/:6533/:6633`) and `tests/mem_fusion/` (single-node MCP integration with self-managed Qdrant on `:6733`). Peer-management scripts (`setup-peer.sh`, `start-peer.sh`, etc.) sit at `tests/` root.
+- **`tests/mem_fusion/test-mcp-tools.py`** — single self-contained MCP integration test (30 invariants): spins up its own Qdrant in a tempdir, spawns `mem_fusion.py` over stdio JSON-RPC, exercises all 9 tools end-to-end. No peer setup required.
+- **Constellation peer tests use `core.py` for peer-side data access** — previously raw `QdrantClient` calls; now rebind `core.qdrant` per peer and invoke `core.store_memory()`, `core.export_record()`. Tests exercise the production code path.
+
+### Removed since design lock
+
+- **Ollama-offline fallback queue** — failures now surface as `{"error": "ollama_unreachable", ...}` rather than silently queueing. Local Ollama down → Mem-Fusion stops working visibly, by design.
+
 ### Added
 
 - **Group memory via bundled Constellation daemon** — a separate, persistent HTTP MCP daemon shipped in this repo at `extensions/constellation/`. Enables federated group memory across multiple Mem-Fusion nodes. Each group has one orchestrating node + N member nodes. Memory submitted to a group's orchestrator is auto-accepted into that group's canonical store. Sovereign per-group Qdrant collections (not replicated databases; selective propagation between independent stores).

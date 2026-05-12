@@ -47,9 +47,9 @@ log_level: WARN
 EOF
 
 # ── Patched mcp_server.py ─────────────────────────────────────────────────────
-sed -e "s|cowork_memories|$COLLECTION|g" \
-    -e "s|mem_fusion_memories|$COLLECTION|g" \
-    -e "s|http://127.0.0.1:6333|http://127.0.0.1:$PORT|g" \
+# Collection name is invariant (cowork_memories); peer isolation is by Qdrant
+# port. We only patch the port, log dir, and MCP server name.
+sed -e "s|http://127.0.0.1:6333|http://127.0.0.1:$PORT|g" \
     -e "s|\.local/share/mem-fusion|\.local/share/$PEER_NAME|g" \
     -e "s|\.local/share/cowork-memory|\.local/share/$PEER_NAME|g" \
     -e "s|Server(\"mem-fusion\")|Server(\"$PEER_NAME\")|g" \
@@ -71,7 +71,7 @@ done
 curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null \
   || { echo "✗ Qdrant failed to start. See $INSTALL_DIR/logs/qdrant-init.log"; exit 1; }
 
-MEMFUSION_COLLECTION="$COLLECTION" QDRANT_URL="http://127.0.0.1:$PORT" \
+QDRANT_URL="http://127.0.0.1:$PORT" \
   "$PROD_DIR/venv/bin/python" "$(dirname "$0")/lib/init_collection.py"
 
 kill $INIT_PID 2>/dev/null || true
@@ -81,7 +81,6 @@ trap - EXIT
 # ── Register MCP with Claude ──────────────────────────────────────────────────
 claude mcp add "$PEER_NAME" \
   "$PROD_DIR/venv/bin/python" "$INSTALL_DIR/mcp_server.py" \
-  --env "MEMFUSION_COLLECTION=$COLLECTION" \
   --env "QDRANT_URL=http://127.0.0.1:$PORT" 2>&1 | tail -3
 
 echo ""

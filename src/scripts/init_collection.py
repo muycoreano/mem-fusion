@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Initialize a Qdrant collection for a Mem-Fusion-shaped install.
+Initialize the cowork-memories Qdrant collection for a Mem-Fusion install.
 
-Respects env vars (unlike the legacy cowork-memory version):
-  QDRANT_URL              default: http://127.0.0.1:6333
-  MEMFUSION_COLLECTION    default: mem_fusion_memories
+  QDRANT_URL    default: http://127.0.0.1:6333
 
 Safe to re-run — skips creation if the collection already exists; creates
 payload indexes idempotently.
@@ -15,7 +13,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PayloadSchemaType
 
 QDRANT_URL  = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
-COLLECTION  = os.getenv("MEMFUSION_COLLECTION", "mem_fusion_memories")
+COLLECTION  = "cowork_memories"
 VECTOR_SIZE = 768  # nomic-embed-text dimensions
 
 print(f"→ qdrant: {QDRANT_URL}")

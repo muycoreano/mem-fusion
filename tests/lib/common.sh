@@ -30,7 +30,7 @@ fi
 # ── Helpers ───────────────────────────────────────────────────────────────────
 peer_dir()       { echo "$HOME/.local/share/$1"; }
 peer_grpc_port() { echo $(( $(peer_port "$1") + 1 )); }
-peer_collection(){ echo "$(echo "$1" | tr '-' '_')_memories"; }
+peer_collection(){ echo "cowork_memories"; }
 peer_pid_file()  { echo "$(peer_dir "$1")/peer.pid"; }
 
 peer_is_running() {

@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
 """
-WP3 Phase 3a verification: peer connects to orchestrating peer and promotes
-a memory; orchestrator stores it; peer reads it back from the canonical and
-verifies byte-identity (content + vector + content_hash).
+Constellation promotion test: peer promotes a memory via constellation;
+orchestrator stores it; peer reads it back and verifies byte-identity
+(content + vector + content_hash).
 
-Prerequisite: dev/preload-test-memories.py has been run.
+Drives the rewritten stack:
+  - Peer-side data access:        core.export_record (via core.qdrant rebound
+                                  to peer-b's port)
+  - Federation transport:         constellation.py HTTP /memory/put + /memory/get
+  - Orchestrator-side dedup:      constellation.py against its Qdrant on :6433
 
-Setup:
-  - Orchestrator daemon (mem-fusion-dev) runs on port 7533, Qdrant on 6433.
-  - mem-fusion-peer-b plays the role of "Alice's machine" — submitter.
+mem_fusion.py (the stdio MCP for Claude) is *not* exercised here — peer-to-peer
+tests don't involve Claude. See tests/mem_fusion/ for MCP-level tests.
 
-Flow:
-  1. Start daemon (skip if already running)
-  2. Pick one preloaded memory from peer-b's local Qdrant
-  3. Read its full record (content + vector + content_hash) directly from Qdrant
-     (simulates what `mem-fusion/export_record` would return)
-  4. POST to orchestrator's /memory/put
-  5. GET it back from orchestrator's /memory/get by canonical_id
-  6. Verify invariants:
-     - canonical content == source content (byte-identical)
-     - canonical vector == source vector (byte-identical)
-     - canonical content_hash == source content_hash
-     - canonical preserves origin metadata in provenance
-  7. Verify dedup: repeat the PUT, expect status: duplicate
+Prerequisite: tests/constellation/preload-memories.py has been run.
 
 Usage:
-  ~/.local/share/cowork-memory/venv/bin/python dev/test-wp3a-promotion.py
+  ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-promotion.py
 """
-import hashlib
+import asyncio
 import json
+import pathlib
 import subprocess
 import sys
 import time
@@ -38,21 +30,27 @@ from pathlib import Path
 import httpx
 from qdrant_client import QdrantClient
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+import core  # noqa: E402
+
+
 # ── Config ─────────────────────────────────────────────────────────────────
 ORCHESTRATOR_CONFIG = Path.home() / ".local/share/mem-fusion-dev/constellation/config.json"
 DAEMON_URL          = "http://127.0.0.1:7533"
-GROUP_NAME          = "wp2-test-group@dev"  # matches mem-fusion-dev's config
+GROUP_NAME          = "wp2-test-group@dev"
 
 PEER_B_QDRANT_URL   = "http://127.0.0.1:6533"
-PEER_B_COLLECTION   = "mem_fusion_peer_b_memories"
 PEER_B_NAME         = "mem-fusion-peer-b"
 
-DAEMON_SCRIPT       = Path.home() / "dev/mem-fusion/src/constellation.py"
+DAEMON_SCRIPT       = REPO_ROOT / "src/constellation.py"
 VENV_PYTHON         = Path.home() / ".local/share/cowork-memory/venv/bin/python"
 
 
-def content_hash(text: str) -> str:
-    return hashlib.sha256(text.strip().lower().encode()).hexdigest()[:16]
+def use_qdrant(url: str):
+    """Rebind core's module-level Qdrant client (same pattern as constellation.py)."""
+    core.QDRANT_URL = url
+    core.qdrant = QdrantClient(url=url, timeout=10)
 
 
 def iso_now() -> str:
@@ -61,8 +59,7 @@ def iso_now() -> str:
 
 def daemon_running() -> bool:
     try:
-        r = httpx.get(f"{DAEMON_URL}/health", timeout=1.0)
-        return r.status_code == 200
+        return httpx.get(f"{DAEMON_URL}/health", timeout=1.0).status_code == 200
     except Exception:
         return False
 
@@ -89,48 +86,32 @@ def start_daemon() -> subprocess.Popen | None:
     sys.exit(1)
 
 
-def pick_source_memory() -> dict:
-    """Pick a preloaded memory from peer-b's local Qdrant."""
-    client = QdrantClient(url=PEER_B_QDRANT_URL, timeout=10)
-    points, _ = client.scroll(
-        collection_name=PEER_B_COLLECTION,
+async def pick_source_memory() -> dict:
+    """Pick a locally-stored memory from peer-b via core.qdrant (rebound)."""
+    use_qdrant(PEER_B_QDRANT_URL)
+    points, _ = core.qdrant.scroll(
+        collection_name=core.COLLECTION,
         limit=10, with_payload=True, with_vectors=False,
     )
-    preloaded = [p for p in points if p.payload.get("source") == "preload"]
-    if not preloaded:
-        print(f"  ✗ no preloaded memories found in {PEER_B_COLLECTION}", file=sys.stderr)
-        print(f"  Run dev/preload-test-memories.py first.", file=sys.stderr)
+    locals_only = [p for p in points if (p.payload or {}).get("source") == "local"]
+    if not locals_only:
+        print(f"  ✗ no local memories in {core.COLLECTION} on peer-b — run preload first", file=sys.stderr)
         sys.exit(1)
-    chosen = preloaded[0]
+    chosen = locals_only[0]
     print(f"  ✓ picked memory {str(chosen.id)[:8]}…")
     print(f"    content: {chosen.payload['content'][:70]}…")
     return {"id": str(chosen.id), "payload": chosen.payload}
 
 
-def export_full_record(memory_id: str) -> dict:
-    """Simulate what Mem-Fusion's export_record tool returns."""
-    client = QdrantClient(url=PEER_B_QDRANT_URL, timeout=10)
-    points = client.retrieve(
-        collection_name=PEER_B_COLLECTION, ids=[memory_id],
-        with_vectors=True, with_payload=True,
-    )
-    if not points:
-        raise RuntimeError(f"memory {memory_id} not found")
-    p = points[0]
-    return {
-        "id":           str(p.id),
-        "vector":       list(p.vector),
-        "content":      p.payload.get("content", ""),
-        "content_hash": p.payload.get("content_hash", ""),
-        "type":         p.payload.get("type", ""),
-        "tags":         p.payload.get("tags", []),
-        "importance":   p.payload.get("importance", 3),
-        "timestamp":    p.payload.get("timestamp", ""),
-    }
+async def export_full_record(memory_id: str) -> dict:
+    """Use core.export_record — the same path mem_fusion.py exposes via MCP."""
+    r = await core.export_record({"id": memory_id})
+    if "error" in r:
+        raise RuntimeError(r["error"])
+    return r
 
 
 def post_to_daemon(local_record: dict) -> dict:
-    """POST /memory/put with the local record wrapped per the protocol."""
     body = {
         "group_name": GROUP_NAME,
         "memory_record": {
@@ -169,31 +150,12 @@ def check(label: str, condition: bool, detail: str = "") -> bool:
     return condition
 
 
-def main():
-    print("=" * 70)
-    print("WP3 Phase 3a — peer promotes memory to orchestrator, reads it back")
-    print("=" * 70)
+async def run_test():
+    print("\nSTEP 2: pick a local memory from peer-b (via core.qdrant)")
+    src = await pick_source_memory()
 
-    print("\nSTEP 1: ensure daemon is running")
-    daemon_proc = start_daemon()
-    try:
-        run_test()
-    finally:
-        if daemon_proc is not None:
-            print("\n[teardown] stopping daemon")
-            daemon_proc.terminate()
-            try:
-                daemon_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                daemon_proc.kill()
-
-
-def run_test():
-    print("\nSTEP 2: pick a preloaded memory from peer-b")
-    src = pick_source_memory()
-
-    print("\nSTEP 3: export full record (vector + content + hash)")
-    record = export_full_record(src["id"])
+    print("\nSTEP 3: export full record (via core.export_record)")
+    record = await export_full_record(src["id"])
     print(f"  ✓ vector dim: {len(record['vector'])}")
     print(f"  ✓ content_hash: {record['content_hash']}")
 
@@ -223,7 +185,7 @@ def run_test():
         check("canonical content_hash matches source",
               canonical["content_hash"] == record["content_hash"]),
         check("canonical content_hash matches recomputed (integrity)",
-              canonical["content_hash"] == content_hash(canonical["content"])),
+              canonical["content_hash"] == core.content_hash(canonical["content"])),
         check("canonical vector length is 768",
               isinstance(canonical["vector"], list) and len(canonical["vector"]) == 768),
         check("canonical vector matches source byte-identically",
@@ -245,7 +207,7 @@ def run_test():
 
     print(f"\n  {passed}/14 invariants passed")
     if passed != 14:
-        print("\n✗ Phase 3a verification FAILED", file=sys.stderr)
+        print("\n✗ Promotion verification FAILED", file=sys.stderr)
         sys.exit(1)
 
     print("\nSTEP 7: re-PUT same content → expect 'duplicate'")
@@ -257,8 +219,7 @@ def run_test():
         sys.exit(1)
 
     print("\nSTEP 8: negative — content_hash mismatch should be rejected")
-    tampered = dict(record)
-    tampered_record = {**record, "content_hash": "deadbeef" * 2}  # 16 chars wrong hash
+    tampered_record = {**record, "content_hash": "deadbeef" * 2}
     body = {
         "group_name": GROUP_NAME,
         "memory_record": {
@@ -285,8 +246,32 @@ def run_test():
         sys.exit(1)
 
     print("\n" + "=" * 70)
-    print("✓ Phase 3a verification PASSED")
+    print("✓ Promotion verification PASSED")
     print("=" * 70)
+
+
+def main():
+    print("=" * 70)
+    print("Constellation promotion — peer promotes via core+constellation, reads it back")
+    print("=" * 70)
+
+    print("\nSTEP 1: clean orchestrator slate + ensure daemon is running")
+    try:
+        httpx.delete(f"http://127.0.0.1:6433/collections/{core.COLLECTION}", timeout=5)
+        print(f"  ✓ dropped orchestrator collection '{core.COLLECTION}'")
+    except Exception as e:
+        print(f"  (nothing to drop: {e})")
+    daemon_proc = start_daemon()
+    try:
+        asyncio.run(run_test())
+    finally:
+        if daemon_proc is not None:
+            print("\n[teardown] stopping daemon")
+            daemon_proc.terminate()
+            try:
+                daemon_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                daemon_proc.kill()
 
 
 if __name__ == "__main__":

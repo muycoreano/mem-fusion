@@ -1,49 +1,62 @@
 #!/usr/bin/env python3
 """
-Preload test memories into dev peers' local Qdrant collections.
+Preload test memories into dev peers' Qdrant collections via core.store_memory.
 
-Used by WP3 verification (test-wp3a-promotion.py) to populate peer-b and
-peer-c with realistic memory records before exercising the federation flow.
+Goes through the same code path mem-fusion uses in production (core.py), so
+preload is itself a meaningful exercise of the rewritten stack. Each peer's
+Qdrant is on a different port; we rebind core's module-level client per peer.
 
-Idempotent: skips memories that already exist (by content_hash dedup).
+Idempotent: core.store_memory dedupes by content_hash internally.
 
 Usage:
-  ~/.local/share/cowork-memory/venv/bin/python dev/preload-test-memories.py
+  ~/.local/share/cowork-memory/venv/bin/python tests/constellation/preload-memories.py
 """
-import hashlib
+import asyncio
+import json
+import pathlib
 import sys
-import uuid
-from datetime import datetime, timezone
 
 import httpx
 from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    FieldCondition, Filter, MatchValue, PointStruct,
-)
+from qdrant_client.models import Distance, PayloadSchemaType, VectorParams
 
-OLLAMA_URL = "http://127.0.0.1:11434"
-
-
-def content_hash(text: str) -> str:
-    return hashlib.sha256(text.strip().lower().encode()).hexdigest()[:16]
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+import core  # noqa: E402
 
 
-def iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+COLLECTION_INDEXES = {
+    "type":         PayloadSchemaType.KEYWORD,
+    "project":      PayloadSchemaType.KEYWORD,
+    "source":       PayloadSchemaType.KEYWORD,
+    "session_id":   PayloadSchemaType.KEYWORD,
+    "content_hash": PayloadSchemaType.KEYWORD,
+    "tags":         PayloadSchemaType.KEYWORD,
+    "importance":   PayloadSchemaType.INTEGER,
+    "timestamp":    PayloadSchemaType.DATETIME,
+}
 
 
-def embed(text: str) -> list[float]:
-    r = httpx.post(f"{OLLAMA_URL}/api/embeddings",
-                   json={"model": "nomic-embed-text", "prompt": text},
-                   timeout=30.0)
-    r.raise_for_status()
-    return r.json()["embedding"]
+def ensure_collection():
+    """Create `cowork_memories` on core.qdrant if it does not yet exist."""
+    existing = [c.name for c in core.qdrant.get_collections().collections]
+    if core.COLLECTION not in existing:
+        core.qdrant.create_collection(
+            collection_name=core.COLLECTION,
+            vectors_config=VectorParams(size=core.VECTOR_SIZE, distance=Distance.COSINE),
+        )
+        print(f"  (created collection '{core.COLLECTION}')")
+    for field, schema in COLLECTION_INDEXES.items():
+        try:
+            core.qdrant.create_payload_index(core.COLLECTION, field, schema)
+        except Exception as e:
+            if "already exists" not in str(e).lower():
+                print(f"  index {field} FAILED: {e}", file=sys.stderr)
 
 
 PEERS = {
     "mem-fusion-peer-b": {
         "qdrant_url": "http://127.0.0.1:6533",
-        "collection": "mem_fusion_peer_b_memories",
         "memories": [
             {
                 "content":    "Constellation v0.3.0 ships with auto-promote as the default; a human-review apprenticeship loop is deferred for a later version.",
@@ -70,7 +83,6 @@ PEERS = {
     },
     "mem-fusion-peer-c": {
         "qdrant_url": "http://127.0.0.1:6633",
-        "collection": "mem_fusion_peer_c_memories",
         "memories": [
             {
                 "content":    "Each Qdrant collection in the constellation is sovereign; canonicals across different groups do not converge to a shared state.",
@@ -98,68 +110,52 @@ PEERS = {
 }
 
 
-def find_existing(client: QdrantClient, collection: str, chash: str) -> str | None:
-    results, _ = client.scroll(
-        collection_name=collection,
-        scroll_filter=Filter(must=[
-            FieldCondition(key="content_hash", match=MatchValue(value=chash))
-        ]),
-        limit=1, with_payload=False,
-    )
-    return str(results[0].id) if results else None
+def use_qdrant(url: str):
+    """Rebind core's module-level Qdrant client to a target URL.
+
+    Tests run in a single Python process but talk to several Qdrants; this is
+    the same rebinding pattern constellation.py uses at boot.
+    """
+    core.QDRANT_URL = url
+    core.qdrant = QdrantClient(url=url, timeout=10)
 
 
-def preload_peer(peer_name: str, cfg: dict) -> dict:
-    """Preload one peer. Returns dict mapping content → memory_id."""
+async def preload_peer(peer_name: str, cfg: dict) -> dict:
     print(f"\n→ {peer_name}  (Qdrant: {cfg['qdrant_url']})")
-    client = QdrantClient(url=cfg["qdrant_url"], timeout=10)
+    use_qdrant(cfg["qdrant_url"])
+    ensure_collection()
 
     results = {"stored": [], "skipped": []}
     for mem in cfg["memories"]:
-        chash = content_hash(mem["content"])
-        existing_id = find_existing(client, cfg["collection"], chash)
         snippet = mem["content"][:60].replace("\n", " ") + "..."
-
-        if existing_id:
-            print(f"  [skip ] {existing_id[:8]}…  {snippet}")
-            results["skipped"].append({"id": existing_id, "content": mem["content"]})
-            continue
-
-        vec = embed(mem["content"])
-        mem_id = str(uuid.uuid4())
-        client.upsert(
-            collection_name=cfg["collection"],
-            points=[PointStruct(
-                id=mem_id, vector=vec,
-                payload={
-                    "content":      mem["content"],
-                    "type":         mem["type"],
-                    "tags":         mem["tags"],
-                    "project":      mem["project"],
-                    "importance":   mem["importance"],
-                    "session_id":   "",
-                    "content_hash": chash,
-                    "timestamp":    iso_now(),
-                    "source":       "preload",
-                },
-            )],
-        )
-        print(f"  [store] {mem_id[:8]}…  {snippet}")
-        results["stored"].append({"id": mem_id, "content": mem["content"]})
-
+        r = await core.store_memory({
+            "content":    mem["content"],
+            "type":       mem["type"],
+            "tags":       mem["tags"],
+            "project":    mem["project"],
+            "importance": mem["importance"],
+        })
+        if r.get("status") == "stored":
+            print(f"  [store] {r['id'][:8]}…  {snippet}")
+            results["stored"].append({"id": r["id"], "content": mem["content"]})
+        elif r.get("status") == "duplicate":
+            print(f"  [skip ] {r['existing_id'][:8]}…  {snippet}")
+            results["skipped"].append({"id": r["existing_id"], "content": mem["content"]})
+        else:
+            print(f"  [ERR  ] {r}", file=sys.stderr)
+            sys.exit(1)
     return results
 
 
-def main():
+async def main():
     print("=" * 70)
-    print("Preloading test memories into dev peers")
+    print("Preloading test memories into dev peers (via core.store_memory)")
     print("=" * 70)
 
-    # Verify Ollama is reachable
     try:
-        httpx.get(f"{OLLAMA_URL}/api/tags", timeout=2.0).raise_for_status()
+        httpx.get(f"{core.OLLAMA_URL}/api/tags", timeout=2.0).raise_for_status()
     except Exception as e:
-        print(f"✗ Ollama unreachable at {OLLAMA_URL}: {e}", file=sys.stderr)
+        print(f"✗ Ollama unreachable at {core.OLLAMA_URL}: {e}", file=sys.stderr)
         sys.exit(1)
 
     summary = {}
@@ -169,7 +165,7 @@ def main():
         except Exception as e:
             print(f"✗ {peer_name} Qdrant unreachable at {cfg['qdrant_url']}: {e}", file=sys.stderr)
             continue
-        summary[peer_name] = preload_peer(peer_name, cfg)
+        summary[peer_name] = await preload_peer(peer_name, cfg)
 
     print("\n" + "=" * 70)
     print("Summary")
@@ -177,8 +173,6 @@ def main():
     for peer_name, r in summary.items():
         print(f"  {peer_name}:  {len(r['stored'])} stored, {len(r['skipped'])} skipped")
 
-    # Emit a manifest the test script can read
-    import json
     manifest_path = "/tmp/wp3a-preload-manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -186,4 +180,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

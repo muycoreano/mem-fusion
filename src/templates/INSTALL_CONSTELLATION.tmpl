@@ -6,10 +6,10 @@
 
 ## What this builds
 
-A persistent HTTP MCP daemon that federates group memory across multiple Mem-Fusion peers. Constellation runs alongside Mem-Fusion, sharing the same Qdrant instance but using its own canonical collection.
+A persistent HTTP MCP daemon that federates group memory across multiple Mem-Fusion peers. Constellation runs alongside Mem-Fusion, sharing the same Qdrant collection (`cowork_memories`); federation entries are tagged `source=federation` to distinguish them from locally-originated memories.
 
 - **HTTP MCP daemon** on port 7533 (separate from Mem-Fusion's stdio MCP)
-- **Canonical Qdrant collection** (`mem_fusion_canonical_memories`) — disjoint from Mem-Fusion's local memory
+- **Shared Qdrant collection** (`cowork_memories`) — federation entries carry `source=federation`, `origin_node`, `group_name` tags
 - **launchd service** (`com.branchapp.memfusion.constellation`) — KeepAlive, RunAtLoad
 - **4 MCP tools**: `memory/put`, `memory/get`, `peers`, `peers/self`
 
@@ -163,9 +163,6 @@ claude mcp remove constellation
 
 launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist 2>/dev/null
 rm ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist
-
-read -p "Drop the canonical Qdrant collection? [y/N] " yn
-[[ "$yn" == "y" ]] && curl -X DELETE http://127.0.0.1:6333/collections/mem_fusion_canonical_memories
 
 read -p "Delete the Constellation install directory? [y/N] " yn
 [[ "$yn" == "y" ]] && rm -rf ~/.local/share/mem-fusion/constellation ~/.local/share/mem-fusion/constellation.py

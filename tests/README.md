@@ -1,6 +1,24 @@
-# Constellation — Dev Tooling
+# Mem-Fusion — Tests & Dev Tooling
 
 Manual, ephemeral, log-friendly. No launchd. No persistence beyond what you start. Stop a peer, it's gone until you start it again. Reboot the machine, no dev peer comes back automatically.
+
+## Layout
+
+```
+tests/
+├── README.md
+├── lib/common.sh
+├── setup-peer.sh, start-peer.sh, stop-peer.sh, restart-peer.sh,
+│   teardown-peer.sh, status-peers.sh, logs-peer.sh, logs-all.sh
+├── constellation/                  ← multi-peer federation tests (needs dev peers running)
+│   ├── preload-memories.py         ← seeds peer-b and peer-c via core.store_memory
+│   ├── test-promotion.py           ← peer promotes via /memory/put, reads back via /memory/get
+│   └── test-directory.py           ← /peers and /peers/self aggregation
+└── mem_fusion/                     ← single-node MCP tests (self-contained Qdrant on :6733)
+    └── test-mcp-tools.py           ← exercises all 9 MCP tools via stdio JSON-RPC
+```
+
+Constellation tests assume the dev peers are running on `:6433`, `:6533`, `:6633`. The mem_fusion test spins up its own Qdrant in a tempdir and tears it down on exit — no peer setup required.
 
 ## Inner-loop workflow
 

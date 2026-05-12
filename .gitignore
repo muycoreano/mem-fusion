@@ -16,11 +16,10 @@ __pycache__/
 *.pyo
 *.egg-info/
 
-# Runtime cruft left by dev tooling when scripts don't cd into the peer install dir.
-# Tracked as a known issue; to be fixed by patching start-peer.sh / setup-peer.sh.
-dev/.qdrant-initialized
-dev/snapshots/
-dev/qdrant-data/
-dev/queue/
-dev/logs/
-dev/*.pid
+# Runtime cruft left by peer tooling when scripts don't cd into the peer install dir.
+.qdrant-initialized
+tests/snapshots/
+tests/qdrant-data/
+tests/queue/
+tests/logs/
+tests/*.pid

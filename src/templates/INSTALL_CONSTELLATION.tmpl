@@ -1,0 +1,180 @@
+# Constellation — Setup Prompt for Claude Code
+
+> **How to use this file:** Open Claude Code in a terminal on your Mac and paste this entire document as your first message. Claude will read it, run the steps, and verify everything works. **Mem-Fusion must already be installed first** — Constellation reuses Mem-Fusion's Qdrant and Python venv.
+
+---
+
+## What this builds
+
+A persistent HTTP MCP daemon that federates group memory across multiple Mem-Fusion peers. Constellation runs alongside Mem-Fusion, sharing the same Qdrant instance but using its own canonical collection.
+
+- **HTTP MCP daemon** on port 7533 (separate from Mem-Fusion's stdio MCP)
+- **Canonical Qdrant collection** (`mem_fusion_canonical_memories`) — disjoint from Mem-Fusion's local memory
+- **launchd service** (`com.branchapp.memfusion.constellation`) — KeepAlive, RunAtLoad
+- **4 MCP tools**: `memory/put`, `memory/get`, `peers`, `peers/self`
+
+Network exposure: localhost by default. Disk footprint: minimal (<10 MB beyond what Mem-Fusion already uses).
+
+---
+
+## Pre-flight — verify before starting
+
+```bash
+# 1. macOS only
+[[ "$(uname)" == "Darwin" ]] || { echo "This installer is macOS-only"; exit 1; }
+
+# 2. Mem-Fusion already installed
+[[ -f ~/.local/share/mem-fusion/mem_fusion.py ]] || \
+  { echo "Install Mem-Fusion first — see INSTALL_MEM_FUSION.md"; exit 1; }
+[[ -x ~/.local/share/mem-fusion/venv/bin/python ]] || \
+  { echo "Mem-Fusion venv not found; reinstall Mem-Fusion first"; exit 1; }
+
+# 3. Mem-Fusion services running
+curl -s http://127.0.0.1:6333/healthz   >/dev/null || { echo "Qdrant not up — check Mem-Fusion install"; exit 1; }
+curl -s http://127.0.0.1:11434/api/tags >/dev/null || { echo "Ollama not up — check Mem-Fusion install"; exit 1; }
+
+# 4. Port 7533 free
+lsof -nP -iTCP:7533 -sTCP:LISTEN -t >/dev/null 2>&1 && \
+  { echo "Port 7533 already in use — stop the conflicting process first"; exit 1; }
+
+# 5. No prior constellation MCP registered
+claude mcp list 2>/dev/null | grep -q "constellation" && echo "WARN: constellation MCP already registered — will overwrite"
+```
+
+If any check fails, **stop and ask the user** before continuing.
+
+---
+
+## Step 1 — Lay out the Constellation directory
+
+```bash
+mkdir -p ~/.local/share/mem-fusion/constellation/{logs,state}
+```
+
+---
+
+## Step 2 — Install the Constellation daemon
+
+<!-- INCLUDE_EXEC: src/constellation.py AS ~/.local/share/mem-fusion/constellation.py -->
+
+---
+
+## Step 3 — Write the config
+
+The Constellation daemon needs a `config.json` describing this node's identity and group memberships. Edit the values below to match your deployment, then write the file:
+
+<!-- INCLUDE: src/config/constellation.example.json AS ~/.local/share/mem-fusion/constellation/config.json -->
+
+```bash
+echo "Edit ~/.local/share/mem-fusion/constellation/config.json:"
+echo "  - Replace <your-machine-name> with this peer's identifier"
+echo "  - Replace <your-group-name> with the group this node orchestrates"
+```
+
+---
+
+## Step 4 — Install the launchd plist
+
+```bash
+export HOME_LIT="$HOME"
+```
+
+<!-- INCLUDE_TEMPLATED: src/launchd/com.branchapp.memfusion.constellation.plist AS ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist -->
+
+---
+
+## Step 5 — Start the Constellation daemon
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist
+curl -s --retry 12 --retry-delay 1 --retry-connrefused http://127.0.0.1:7533/health >/dev/null \
+  && echo "  Constellation up" \
+  || { echo "Constellation failed to start — check ~/.local/share/mem-fusion/constellation/logs/constellation-error.log"; exit 1; }
+```
+
+---
+
+## Step 6 — Register the Constellation MCP with Claude Code
+
+```bash
+claude mcp add --transport http constellation http://127.0.0.1:7533
+claude mcp list | grep constellation
+```
+
+You should see `constellation: ... - ✓ Connected`.
+
+---
+
+## Step 7 — Smoke test
+
+```bash
+curl -s http://127.0.0.1:7533/health    | python3 -m json.tool
+curl -s http://127.0.0.1:7533/peers/self | python3 -m json.tool
+```
+
+Expect both responses to show your `node_name`, `version`, and `memberships`.
+
+---
+
+## Step 8 — Tell the user what to add to their CLAUDE.md
+
+Print this snippet and instruct the user to paste it into `~/CLAUDE.md`:
+
+```markdown
+## Group Memory (Constellation)
+
+Connected to a local `constellation` MCP server (HTTP, port 7533) that federates
+group memory across machines.
+
+### When to promote a memory to the group canonical
+On user "remember X" (the `/remember` skill flow), after `store_memory` returns
+a local ID, also call:
+1. `mem-fusion/export_record(id=<local_id>)` — returns the full record incl. vector
+2. `constellation/memory/put(group_name=<group>, memory_record=<record>, provenance=<...>)`
+   — promotes to the group canonical
+
+The group canonical is the orchestrator's authoritative copy. Other peers in the
+group can search and retrieve via `constellation/memory/get(group_name=..., query=...)`.
+
+### When NOT to promote
+Personal preferences, machine-specific config, anything the user marked
+local-only. Default for v0.3.0 is auto-promote on explicit `/remember`.
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Daemon won't start | Check `~/.local/share/mem-fusion/constellation/logs/constellation-error.log`. Common cause: `config.json` placeholders (`<your-machine-name>`) not replaced with real values. |
+| `claude mcp list` shows constellation but `Failed to connect` | Verify the daemon is listening: `curl http://127.0.0.1:7533/health`. If not, check the launchd plist loaded: `launchctl list \| grep memfusion.constellation`. |
+| Port 7533 conflict | Stop the other process or pick a different port in `config.json` `listen_address`, then update the launchd plist's `--config` path and `claude mcp add` URL. |
+| `/peers` returns empty | Peers are inferred from `memory/put` activity. Once any peer submits a memory to this orchestrator's group, they'll appear. |
+
+Logs: `~/.local/share/mem-fusion/constellation/logs/{constellation.log,constellation-error.log}`.
+
+---
+
+## Uninstall
+
+```bash
+claude mcp remove constellation
+
+launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist 2>/dev/null
+rm ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist
+
+read -p "Drop the canonical Qdrant collection? [y/N] " yn
+[[ "$yn" == "y" ]] && curl -X DELETE http://127.0.0.1:6333/collections/mem_fusion_canonical_memories
+
+read -p "Delete the Constellation install directory? [y/N] " yn
+[[ "$yn" == "y" ]] && rm -rf ~/.local/share/mem-fusion/constellation ~/.local/share/mem-fusion/constellation.py
+```
+
+---
+
+## After install — final report to the user
+
+When all 7 steps + smoke test pass, tell the user:
+
+> Constellation is live on this peer. **Restart your Claude Code session** so the new MCP server is visible. Paste the CLAUDE.md snippet from Step 8 into your `~/CLAUDE.md` so Claude knows when to promote memories to the group canonical. To test the federation, have another peer install Constellation pointing at the same `group_name`, then say *"remember that we picked Qdrant for v0.3.0"* — the memory will land both locally and in the group canonical, retrievable from the other peer via `constellation/memory/get`.

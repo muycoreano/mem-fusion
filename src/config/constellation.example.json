@@ -1,0 +1,18 @@
+{
+  "node_name": "<your-machine-name>",
+
+  "listen_address": "127.0.0.1:7533",
+
+  "qdrant_url": "http://127.0.0.1:6333",
+
+  "canonical_collection": "mem_fusion_canonical_memories",
+
+  "state_dir": "~/.local/share/mem-fusion/constellation",
+
+  "memberships": [
+    {
+      "group_name": "<your-group-name>",
+      "role": "orchestrator"
+    }
+  ]
+}

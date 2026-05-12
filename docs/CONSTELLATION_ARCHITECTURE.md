@@ -10,7 +10,7 @@
 
 **Constellation enables group memory across multiple Mem-Fusion nodes.** Where Mem-Fusion gives Claude long-term memory across sessions on one machine, Constellation lets that memory federate across machines — sharing curated knowledge between team members' AI agents while preserving each member's personal memory privacy.
 
-Constellation is bundled with Mem-Fusion (lives in the same repo at `extensions/constellation/`) but runs as a **separate daemon process** with its own MCP server, its own storage, and its own network endpoint. The two products serve different purposes:
+Constellation is bundled with Mem-Fusion (lives in the same repo at `src/`) but runs as a **separate daemon process** with its own MCP server, its own storage, and its own network endpoint. The two products serve different purposes:
 
 | | Mem-Fusion | Constellation |
 |---|---|---|
@@ -314,7 +314,7 @@ What v0.3.0 does NOT protect against:
 
 ### Node startup
 
-1. Read config from `~/.local/share/mem-fusion/extensions/constellation/config.json`.
+1. Read config from `~/.local/share/mem-fusion/src/config.json`.
 2. For each `memberships[]` entry: prepare connection info for that group's orchestrating node.
 3. For each `orchestrating[]` entry: bind HTTP listener on configured port, initialize this group's canonical store.
 4. Begin serving MCP-over-HTTP.

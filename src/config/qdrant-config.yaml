@@ -1,0 +1,13 @@
+storage:
+  storage_path: $HOME/.local/share/mem-fusion/qdrant-data
+
+snapshots_config:
+  snapshots_path: $HOME/.local/share/mem-fusion/qdrant-data/snapshots
+
+service:
+  host: 127.0.0.1
+  http_port: 6333
+  grpc_port: 6334
+  enable_cors: false
+
+log_level: WARN

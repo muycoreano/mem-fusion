@@ -59,7 +59,7 @@ Add more peers by appending a line to the `PEER_PORTS` array in `lib/common.sh`.
 
 ## When NOT to use this tooling
 
-- Production install (`~/.local/share/mem-fusion/`) — has its own install/upgrade flow via the Mem-Fusion repo's `INSTALL.md`
+- Production install (`~/.local/share/mem-fusion/`) — has its own install/upgrade flow via the Mem-Fusion repo's `INSTALL_MEM_FUSION.md`
 - Anything you want to survive a reboot — dev peers don't auto-restart
 
 ## Convention for new scripts

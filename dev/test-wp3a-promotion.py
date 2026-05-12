@@ -47,7 +47,7 @@ PEER_B_QDRANT_URL   = "http://127.0.0.1:6533"
 PEER_B_COLLECTION   = "mem_fusion_peer_b_memories"
 PEER_B_NAME         = "mem-fusion-peer-b"
 
-DAEMON_SCRIPT       = Path.home() / "dev/mem-fusion/extensions/constellation/constellation.py"
+DAEMON_SCRIPT       = Path.home() / "dev/mem-fusion/src/constellation.py"
 VENV_PYTHON         = Path.home() / ".local/share/cowork-memory/venv/bin/python"
 
 

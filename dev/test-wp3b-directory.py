@@ -51,7 +51,7 @@ PEERS_CFG = {
     },
 }
 
-DAEMON_SCRIPT = Path.home() / "dev/mem-fusion/extensions/constellation/constellation.py"
+DAEMON_SCRIPT = Path.home() / "dev/mem-fusion/src/constellation.py"
 VENV_PYTHON   = Path.home() / ".local/share/cowork-memory/venv/bin/python"
 
 

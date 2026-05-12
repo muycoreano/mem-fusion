@@ -1,0 +1,303 @@
+# Mem-Fusion — Setup Prompt for Claude Code
+
+> **How to use this file:** Open Claude Code in a terminal on your Mac and paste this entire document as your first message. Claude will read it, run the steps, and verify everything works. You should not need to do anything except answer prompts and approve commands.
+
+---
+
+## What this builds
+
+A local persistent vector memory system that gives your Claude Code CLI long-term, semantically-searchable memory across sessions. After install you'll be able to:
+
+- Have Claude **store** decisions, errors, preferences, and context with `store_memory(...)`
+- Have Claude **recall** them later with `search_memory("...")` — even weeks later, in a brand-new session
+- Get **automatic context priming** — every prompt is searched against your memory store and relevant hits are injected silently
+- Use `/remember <thing>` as a one-liner to pin something important
+
+It's all local — no data leaves your Mac. Stack:
+
+- **Qdrant 1.13.4** — local vector database (port 6333)
+- **Ollama 0.20.5** + `nomic-embed-text` — local 768-dim embeddings (port 11434)
+- **Python 3.12 MCP server** — exposes 9 memory tools to Claude Code via stdio
+- **4 hooks** — SessionStart, UserPromptSubmit, Stop, PostToolUse:Write
+- **`/remember` skill**
+
+Everything is managed by `launchd`. Disk footprint ≈ 200 MB.
+
+---
+
+## Pre-flight — verify before starting
+
+```bash
+# 1. macOS only
+[[ "$(uname)" == "Darwin" ]] || { echo "This installer is macOS-only"; exit 1; }
+
+# 2. Architecture detection
+ARCH="$(uname -m)"   # arm64 (Apple Silicon) or x86_64 (Intel)
+echo "Arch: $ARCH"
+
+# 3. Homebrew present + correct prefix for this arch
+if [[ "$ARCH" == "arm64" ]]; then BREW_PREFIX="/opt/homebrew"; else BREW_PREFIX="/usr/local"; fi
+[[ -x "$BREW_PREFIX/bin/brew" ]] || { echo "Install Homebrew first: https://brew.sh"; exit 1; }
+
+# 4. Claude CLI present
+command -v claude >/dev/null || { echo "Install Claude Code first"; exit 1; }
+
+# 5. Nothing already on the mem-fusion ports
+lsof -nP -iTCP:6333  -sTCP:LISTEN -t >/dev/null 2>&1 && echo "WARN: port 6333 already in use"
+lsof -nP -iTCP:11434 -sTCP:LISTEN -t >/dev/null 2>&1 && echo "INFO: port 11434 (Ollama) already in use — will reuse"
+
+# 6. No prior mem-fusion MCP registered
+claude mcp list 2>/dev/null | grep -q "mem-fusion" && echo "WARN: mem-fusion MCP already registered — will overwrite"
+
+# 7. Backup any existing settings.json before we touch it
+[[ -f ~/.claude/settings.json ]] && cp ~/.claude/settings.json ~/.claude/settings.json.bak.$(date +%Y%m%d-%H%M%S)
+```
+
+If port 6333 is taken or another `mem-fusion` MCP is already registered, **stop and ask the user** before continuing.
+
+---
+
+## Step 1 — Install Homebrew dependencies
+
+```bash
+brew install python@3.12 ollama
+ollama --version    # 0.20+
+python3.12 --version
+```
+
+If `python@3.12` is unavailable, fall back to `python@3.11` and adjust Step 3.
+
+---
+
+## Step 2 — Lay out the install directory
+
+```bash
+mkdir -p ~/.local/share/mem-fusion/{bin,scripts,logs,queue,qdrant-data,snapshots}
+```
+
+---
+
+## Step 3 — Python venv + dependencies
+
+```bash
+python3.12 -m venv ~/.local/share/mem-fusion/venv
+~/.local/share/mem-fusion/venv/bin/pip install --upgrade pip
+~/.local/share/mem-fusion/venv/bin/pip install \
+  mcp==1.6.0 qdrant-client==1.13.1 httpx==0.28.1
+
+cat > ~/.local/share/mem-fusion/requirements.txt <<'EOF'
+mcp==1.6.0
+qdrant-client==1.13.1
+httpx==0.28.1
+EOF
+```
+
+---
+
+## Step 4 — Download the Qdrant binary
+
+```bash
+QDRANT_VER="1.13.4"
+if [[ "$(uname -m)" == "arm64" ]]; then
+  ASSET="qdrant-aarch64-apple-darwin.tar.gz"
+else
+  ASSET="qdrant-x86_64-apple-darwin.tar.gz"
+fi
+curl -L -o /tmp/qdrant.tar.gz \
+  "https://github.com/qdrant/qdrant/releases/download/v${QDRANT_VER}/${ASSET}"
+tar -xzf /tmp/qdrant.tar.gz -C /tmp
+mv /tmp/qdrant ~/.local/share/mem-fusion/bin/qdrant
+chmod +x ~/.local/share/mem-fusion/bin/qdrant
+~/.local/share/mem-fusion/bin/qdrant --version
+```
+
+---
+
+## Step 5 — Install the Qdrant config
+
+<!-- INCLUDE: src/config/qdrant-config.yaml AS ~/.local/share/mem-fusion/qdrant-config.yaml -->
+
+---
+
+## Step 6 — Install the MCP server
+
+<!-- INCLUDE_EXEC: src/mem_fusion.py AS ~/.local/share/mem-fusion/mem_fusion.py -->
+
+---
+
+## Step 7 — Install the collection initializer
+
+<!-- INCLUDE_EXEC: src/scripts/init_collection.py AS ~/.local/share/mem-fusion/scripts/init_collection.py -->
+
+---
+
+## Step 8 — Install the hook scripts
+
+<!-- INCLUDE_EXEC: src/scripts/session_prime.sh AS ~/.local/share/mem-fusion/scripts/session_prime.sh -->
+
+<!-- INCLUDE_EXEC: src/scripts/prompt_memory_inject.sh AS ~/.local/share/mem-fusion/scripts/prompt_memory_inject.sh -->
+
+<!-- INCLUDE_EXEC: src/scripts/capture_file_write.sh AS ~/.local/share/mem-fusion/scripts/capture_file_write.sh -->
+
+<!-- INCLUDE_EXEC: src/scripts/ingest_session.py AS ~/.local/share/mem-fusion/scripts/ingest_session.py -->
+
+---
+
+## Step 9 — Install the launchd plists
+
+Substitute `$HOME` (and `$OLLAMA_BIN` for Ollama) at write time:
+
+```bash
+if [[ "$(uname -m)" == "arm64" ]]; then OLLAMA_BIN="/opt/homebrew/bin/ollama"; else OLLAMA_BIN="/usr/local/bin/ollama"; fi
+export HOME_LIT="$HOME"
+export OLLAMA_BIN
+```
+
+<!-- INCLUDE_TEMPLATED: src/launchd/com.branchapp.memfusion.qdrant.plist AS ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist -->
+
+<!-- INCLUDE_TEMPLATED: src/launchd/com.branchapp.memfusion.ollama.plist AS ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist -->
+
+---
+
+## Step 10 — Start services + pull embedding model + init collection
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist
+launchctl load ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist
+
+curl -s --retry 12 --retry-delay 1 --retry-connrefused http://127.0.0.1:11434/api/tags >/dev/null && echo "  Ollama up"
+curl -s --retry 12 --retry-delay 1 --retry-connrefused http://127.0.0.1:6333/healthz   >/dev/null && echo "  Qdrant up"
+
+ollama pull nomic-embed-text
+
+~/.local/share/mem-fusion/venv/bin/python \
+  ~/.local/share/mem-fusion/scripts/init_collection.py
+```
+
+---
+
+## Step 11 — Register the MCP with Claude Code
+
+```bash
+claude mcp add mem-fusion \
+  ~/.local/share/mem-fusion/venv/bin/python \
+  ~/.local/share/mem-fusion/mem_fusion.py
+
+claude mcp list | grep mem-fusion
+```
+
+You should see `mem-fusion: ... - ✓ Connected`.
+
+---
+
+## Step 12 — Wire the 4 hooks into `~/.claude/settings.json`
+
+<!-- INCLUDE_EXEC: src/scripts/wire_hooks.py AS ~/.local/share/mem-fusion/scripts/wire_hooks.py -->
+
+```bash
+python3 ~/.local/share/mem-fusion/scripts/wire_hooks.py
+```
+
+---
+
+## Step 13 — Install the `/remember` skill
+
+```bash
+mkdir -p ~/.claude/skills/remember
+```
+
+<!-- INCLUDE: src/skills/remember/SKILL.md AS ~/.claude/skills/remember/SKILL.md -->
+
+---
+
+## Step 14 — Smoke test
+
+<!-- INCLUDE_EXEC: src/scripts/smoke-test.sh AS ~/.local/share/mem-fusion/scripts/smoke-test.sh -->
+
+```bash
+~/.local/share/mem-fusion/scripts/smoke-test.sh
+```
+
+Expect `✓ All smoke tests passed`.
+
+---
+
+## Step 15 — Tell the user what to add to their CLAUDE.md
+
+Print this snippet and instruct the user to paste it into `~/CLAUDE.md` (or a project-level `CLAUDE.md`):
+
+```markdown
+## Vector Memory System
+
+Connected to a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on localhost).
+**Check this at session start** by calling `memory_stats()` to confirm the system is live.
+
+### When to search
+- **Session start**: `search_memory(query="<current task or project name>", top_k=8)`
+- **Before architectural decisions**: search for prior decisions on the same topic
+- **When hitting a recurring error**: search for prior resolutions
+- **When unsure about a user preference**: search type="preference"
+
+### When to store
+- **Decision made**: `store_memory(content, type="decision", importance=4, project="<name>")`
+- **Novel error resolved**: `store_memory(..., type="error", importance=3)`
+- **User reveals a preference**: `store_memory(..., type="preference", importance=4)`
+- **Important context learned**: `store_memory(..., type="context", importance=3)`
+- **User explicitly asks to remember**: use `/remember` skill → `importance=5`
+
+### What NOT to store
+Trivial facts, transient state, things derivable from code or `git log`.
+
+### Memory types
+`decision` · `fact` · `preference` · `error` · `code` · `context` · `session`
+
+### Available tools
+`store_memory` · `search_memory` · `search_recent` · `upsert_memory` ·
+`find_or_create` · `delete_memory` · `get_related` · `memory_stats` · `export_record`
+
+### Verification rule
+Memories are point-in-time observations. Before recommending a file/function/flag named in
+a memory, verify it still exists in the current code.
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `claude mcp list` shows mem-fusion but `Failed to connect` | Run the server directly to surface import errors: `~/.local/share/mem-fusion/venv/bin/python ~/.local/share/mem-fusion/mem_fusion.py` (will hang waiting for stdio — Ctrl-C). Check `~/.local/share/mem-fusion/logs/mcp.log`. |
+| Qdrant won't start | Confirm `MALLOC_CONF=background_thread:false` is in the plist `EnvironmentVariables` and `NumberOfFiles=65536` is set. Check `~/.local/share/mem-fusion/logs/qdrant-error.log`. |
+| Search returns 0 results | Verify Ollama is up: `curl http://127.0.0.1:11434/api/tags`. Verify the model is pulled: `ollama list \| grep nomic-embed-text`. |
+| Hooks not firing | Confirm `~/.claude/settings.json` was merged correctly (Step 12). Run scripts manually to surface errors: `~/.local/share/mem-fusion/scripts/session_prime.sh`. |
+| Session ingestion logs "no session file found" | Confirm `~/.claude/sessions/*.jsonl` exists. If Claude Code moved the session path, edit `SESSIONS_DIR` in `ingest_session.py`. |
+
+Logs directory: `~/.local/share/mem-fusion/logs/` — `mcp.log`, `qdrant.log`, `qdrant-error.log`, `ollama.log`, `ingest.log`.
+
+---
+
+## Uninstall
+
+```bash
+claude mcp remove mem-fusion
+
+launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist 2>/dev/null
+launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist 2>/dev/null
+rm ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist \
+   ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist
+
+echo "Edit ~/.claude/settings.json — remove the 4 mem-fusion entries under .hooks, or restore from the pre-flight .bak."
+
+read -p "Delete all stored memories? [y/N] " yn
+[[ "$yn" == "y" ]] && rm -rf ~/.local/share/mem-fusion
+
+rm -rf ~/.claude/skills/remember
+```
+
+---
+
+## After install — final report to the user
+
+When all 15 steps + smoke test pass, tell the user:
+
+> Your Mem-Fusion vector memory system is live. **Restart your Claude Code session** for the hooks to take effect. Then paste the CLAUDE.md snippet from Step 15 into your `~/CLAUDE.md`. Try it out by saying *"remember that I prefer Python virtual envs created with `uv`"* — Claude should call the `/remember` skill and confirm with a memory ID.

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.branchapp.memfusion.qdrant</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${HOME_LIT}/.local/share/mem-fusion/bin/qdrant</string>
+        <string>--config-path</string>
+        <string>${HOME_LIT}/.local/share/mem-fusion/qdrant-config.yaml</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key>
+    <string>${HOME_LIT}/.local/share/mem-fusion/logs/qdrant.log</string>
+    <key>StandardErrorPath</key>
+    <string>${HOME_LIT}/.local/share/mem-fusion/logs/qdrant-error.log</string>
+    <key>SoftResourceLimits</key>
+    <dict><key>NumberOfFiles</key><integer>65536</integer></dict>
+    <key>HardResourceLimits</key>
+    <dict><key>NumberOfFiles</key><integer>65536</integer></dict>
+    <key>WorkingDirectory</key>
+    <string>${HOME_LIT}/.local/share/mem-fusion</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>${HOME_LIT}</string>
+        <key>MALLOC_CONF</key><string>background_thread:false</string>
+    </dict>
+</dict>
+</plist>

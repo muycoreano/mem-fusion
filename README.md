@@ -42,7 +42,7 @@ The next decade's productivity divide won't be "people who use AI vs. people who
 The install is AI-native: there's no shell installer to run yourself. Instead, you paste a setup prompt into Claude Code and Claude does the install for you, asking your approval at each step.
 
 1. Open Claude Code in a terminal on your Mac.
-2. Open [`INSTALL.md`](INSTALL.md) in this repo.
+2. Open [`INSTALL_MEM_FUSION.md`](INSTALL_MEM_FUSION.md) in this repo.
 3. Copy its entire contents.
 4. Paste it as your first message in Claude Code.
 5. Approve the commands as Claude works through the 14 steps.
@@ -124,7 +124,7 @@ When you enable Constellation (v0.3.0), the same per-node substrate fuses *horiz
 
 ## Configure Claude to use it
 
-After running [`INSTALL.md`](INSTALL.md), paste this block into your `~/CLAUDE.md` (or a project-level `CLAUDE.md`) so Claude knows when to call the memory tools:
+After running [`INSTALL_MEM_FUSION.md`](INSTALL_MEM_FUSION.md), paste this block into your `~/CLAUDE.md` (or a project-level `CLAUDE.md`) so Claude knows when to call the memory tools:
 
 ````markdown
 ## Vector Memory System
@@ -185,7 +185,7 @@ rm -rf ~/.claude/skills/remember
 # Then remove the 4 mem-fusion entries from ~/.claude/settings.json (or restore from .bak)
 ```
 
-Full uninstall instructions are at the bottom of [`INSTALL.md`](INSTALL.md).
+Full uninstall instructions are at the bottom of [`INSTALL_MEM_FUSION.md`](INSTALL_MEM_FUSION.md).
 
 ---
 

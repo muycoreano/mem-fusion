@@ -27,10 +27,8 @@ Everything is managed by `launchd`. Disk footprint ≈ 200 MB.
 
 ## Pre-flight — verify before starting
 
-Run these checks first. If any fail, pause and tell the user before proceeding.
-
 ```bash
-# 1. macOS only (this script is Mac-specific)
+# 1. macOS only
 [[ "$(uname)" == "Darwin" ]] || { echo "This installer is macOS-only"; exit 1; }
 
 # 2. Architecture detection
@@ -38,18 +36,14 @@ ARCH="$(uname -m)"   # arm64 (Apple Silicon) or x86_64 (Intel)
 echo "Arch: $ARCH"
 
 # 3. Homebrew present + correct prefix for this arch
-if [[ "$ARCH" == "arm64" ]]; then
-  BREW_PREFIX="/opt/homebrew"
-else
-  BREW_PREFIX="/usr/local"
-fi
+if [[ "$ARCH" == "arm64" ]]; then BREW_PREFIX="/opt/homebrew"; else BREW_PREFIX="/usr/local"; fi
 [[ -x "$BREW_PREFIX/bin/brew" ]] || { echo "Install Homebrew first: https://brew.sh"; exit 1; }
 
 # 4. Claude CLI present
 command -v claude >/dev/null || { echo "Install Claude Code first"; exit 1; }
 
 # 5. Nothing already on the mem-fusion ports
-lsof -nP -iTCP:6333 -sTCP:LISTEN -t >/dev/null 2>&1 && echo "WARN: port 6333 already in use"
+lsof -nP -iTCP:6333  -sTCP:LISTEN -t >/dev/null 2>&1 && echo "WARN: port 6333 already in use"
 lsof -nP -iTCP:11434 -sTCP:LISTEN -t >/dev/null 2>&1 && echo "INFO: port 11434 (Ollama) already in use — will reuse"
 
 # 6. No prior mem-fusion MCP registered
@@ -67,11 +61,11 @@ If port 6333 is taken or another `mem-fusion` MCP is already registered, **stop 
 
 ```bash
 brew install python@3.12 ollama
-ollama --version    # confirm 0.20+
+ollama --version    # 0.20+
 python3.12 --version
 ```
 
-If `python@3.12` is unavailable on the user's brew, fall back to `python@3.11` and adjust the venv command in Step 4 accordingly. The MCP server is compatible with 3.11+.
+If `python@3.12` is unavailable, fall back to `python@3.11` and adjust Step 3.
 
 ---
 
@@ -79,14 +73,28 @@ If `python@3.12` is unavailable on the user's brew, fall back to `python@3.11` a
 
 ```bash
 mkdir -p ~/.local/share/mem-fusion/{bin,scripts,logs,queue,qdrant-data,snapshots}
-cd ~/.local/share/mem-fusion
 ```
 
 ---
 
-## Step 3 — Download the Qdrant binary
+## Step 3 — Python venv + dependencies
 
-Pin to **v1.13.4**. Pick the asset matching the user's arch.
+```bash
+python3.12 -m venv ~/.local/share/mem-fusion/venv
+~/.local/share/mem-fusion/venv/bin/pip install --upgrade pip
+~/.local/share/mem-fusion/venv/bin/pip install \
+  mcp==1.6.0 qdrant-client==1.13.1 httpx==0.28.1
+
+cat > ~/.local/share/mem-fusion/requirements.txt <<'EOF'
+mcp==1.6.0
+qdrant-client==1.13.1
+httpx==0.28.1
+EOF
+```
+
+---
+
+## Step 4 — Download the Qdrant binary
 
 ```bash
 QDRANT_VER="1.13.4"
@@ -100,38 +108,15 @@ curl -L -o /tmp/qdrant.tar.gz \
 tar -xzf /tmp/qdrant.tar.gz -C /tmp
 mv /tmp/qdrant ~/.local/share/mem-fusion/bin/qdrant
 chmod +x ~/.local/share/mem-fusion/bin/qdrant
-~/.local/share/mem-fusion/bin/qdrant --version   # sanity check
-```
-
-If the asset name has changed in newer releases, check `https://github.com/qdrant/qdrant/releases/tag/v1.13.4` and adjust.
-
----
-
-## Step 4 — Python venv + dependencies
-
-```bash
-python3.12 -m venv ~/.local/share/mem-fusion/venv
-~/.local/share/mem-fusion/venv/bin/pip install --upgrade pip
-~/.local/share/mem-fusion/venv/bin/pip install \
-  mcp==1.6.0 qdrant-client==1.13.1 httpx==0.28.1
-```
-
-Save the pinned versions:
-
-```bash
-cat > ~/.local/share/mem-fusion/requirements.txt <<'EOF'
-mcp==1.6.0
-qdrant-client==1.13.1
-httpx==0.28.1
-EOF
+~/.local/share/mem-fusion/bin/qdrant --version
 ```
 
 ---
 
-## Step 5 — Write `qdrant-config.yaml`
+## Step 5 — Install the Qdrant config
 
 ```bash
-cat > ~/.local/share/mem-fusion/qdrant-config.yaml <<EOF
+cat > ~/.local/share/mem-fusion/qdrant-config.yaml <<'8DD30E144A92_EOF'
 storage:
   storage_path: $HOME/.local/share/mem-fusion/qdrant-data
 
@@ -145,18 +130,15 @@ service:
   enable_cors: false
 
 log_level: WARN
-EOF
+8DD30E144A92_EOF
 ```
-
-(Note: `<<EOF` without quotes around the delimiter — `$HOME` *will* expand. That's intentional.)
 
 ---
 
-## Step 6 — Write the MCP server
+## Step 6 — Install the MCP server
 
-Save the following to `~/.local/share/mem-fusion/mcp_server.py` **verbatim**:
-
-```python
+```bash
+cat > ~/.local/share/mem-fusion/mem_fusion.py <<'F01E42F0C765_EOF'
 #!/usr/bin/env python3
 """
 Mem-Fusion MCP Server — stdio transport
@@ -598,34 +580,49 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+F01E42F0C765_EOF
+chmod +x ~/.local/share/mem-fusion/mem_fusion.py
 ```
 
 ---
 
-## Step 7 — Write the collection initializer
+## Step 7 — Install the collection initializer
 
-Save to `~/.local/share/mem-fusion/scripts/init_collection.py`:
-
-```python
+```bash
+cat > ~/.local/share/mem-fusion/scripts/init_collection.py <<'D9B604D06D66_EOF'
 #!/usr/bin/env python3
-"""One-time setup: create the mem_fusion_memories collection with payload indexes."""
+"""
+Initialize a Qdrant collection for a Mem-Fusion-shaped install.
+
+Respects env vars (unlike the legacy cowork-memory version):
+  QDRANT_URL              default: http://127.0.0.1:6333
+  MEMFUSION_COLLECTION    default: mem_fusion_memories
+
+Safe to re-run — skips creation if the collection already exists; creates
+payload indexes idempotently.
+"""
 import os
 import sys
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PayloadSchemaType
 
-QDRANT_URL  = "http://127.0.0.1:6333"
+QDRANT_URL  = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION  = os.getenv("MEMFUSION_COLLECTION", "mem_fusion_memories")
-VECTOR_SIZE = 768
+VECTOR_SIZE = 768  # nomic-embed-text dimensions
 
-client   = QdrantClient(url=QDRANT_URL, timeout=10)
+print(f"→ qdrant: {QDRANT_URL}")
+print(f"→ collection: {COLLECTION}")
+
+client = QdrantClient(url=QDRANT_URL, timeout=10)
+
 existing = [c.name for c in client.get_collections().collections]
-
 if COLLECTION in existing:
     print(f"Collection '{COLLECTION}' already exists — skipping creation.")
 else:
-    client.create_collection(collection_name=COLLECTION,
-        vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE))
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+    )
     print(f"Created collection '{COLLECTION}'.")
 
 indexes = {
@@ -649,17 +646,16 @@ for field, schema in indexes.items():
 
 info = client.get_collection(COLLECTION)
 print(f"\nCollection ready. Vectors: {info.vectors_count or 0}")
+D9B604D06D66_EOF
+chmod +x ~/.local/share/mem-fusion/scripts/init_collection.py
 ```
 
 ---
 
-## Step 8 — Write the 4 hook scripts
-
-All four go in `~/.local/share/mem-fusion/scripts/`. Make each executable with `chmod +x`.
-
-### 8a. `session_prime.sh` — SessionStart hook
+## Step 8 — Install the hook scripts
 
 ```bash
+cat > ~/.local/share/mem-fusion/scripts/session_prime.sh <<'654FC978BF5B_EOF'
 #!/usr/bin/env bash
 # SessionStart hook — emits a brief recent-memory snapshot for context priming.
 VENV="$HOME/.local/share/mem-fusion/venv/bin/python"
@@ -667,7 +663,7 @@ VENV="$HOME/.local/share/mem-fusion/venv/bin/python"
 $VENV - <<PYEOF
 import sys, asyncio
 sys.path.insert(0, "$HOME/.local/share/mem-fusion")
-import mcp_server as srv
+import mem_fusion as srv
 
 async def main():
     recent = await srv.tool_search_recent({"hours": 48, "top_k": 5})
@@ -695,11 +691,12 @@ async def main():
 
 asyncio.run(main())
 PYEOF
+654FC978BF5B_EOF
+chmod +x ~/.local/share/mem-fusion/scripts/session_prime.sh
 ```
 
-### 8b. `prompt_memory_inject.sh` — UserPromptSubmit hook
-
 ```bash
+cat > ~/.local/share/mem-fusion/scripts/prompt_memory_inject.sh <<'43A517C220BA_EOF'
 #!/usr/bin/env bash
 # UserPromptSubmit hook — injects relevant memories above 0.75 score.
 VENV="$HOME/.local/share/mem-fusion/venv/bin/python"
@@ -713,7 +710,7 @@ PROMPT=$(cat)
 $VENV - <<PYEOF
 import sys, asyncio, os
 sys.path.insert(0, "$HOME/.local/share/mem-fusion")
-import mcp_server as srv
+import mem_fusion as srv
 
 PROMPT    = """${PROMPT//\"/\\\"}"""
 SEEN_FILE = """${SEEN_FILE}"""
@@ -753,11 +750,12 @@ async def main():
 
 asyncio.run(main())
 PYEOF
+43A517C220BA_EOF
+chmod +x ~/.local/share/mem-fusion/scripts/prompt_memory_inject.sh
 ```
 
-### 8c. `capture_file_write.sh` — PostToolUse:Write hook
-
 ```bash
+cat > ~/.local/share/mem-fusion/scripts/capture_file_write.sh <<'513F277BB09A_EOF'
 #!/usr/bin/env bash
 # Captures NEW files >100 lines as code memories. Fire-and-forget, backgrounded.
 VENV="$HOME/.local/share/mem-fusion/venv/bin/python"
@@ -776,7 +774,7 @@ PROJECT=$(basename "$(pwd)")
 nohup $VENV - <<PYEOF >> "$LOG" 2>&1 &
 import sys, asyncio
 sys.path.insert(0, "$HOME/.local/share/mem-fusion")
-import mcp_server as srv
+import mem_fusion as srv
 
 async def main():
     path  = """${FILE_PATH}"""
@@ -795,13 +793,12 @@ asyncio.run(main())
 PYEOF
 
 exit 0
+513F277BB09A_EOF
+chmod +x ~/.local/share/mem-fusion/scripts/capture_file_write.sh
 ```
 
-### 8d. `ingest_session.py` — Stop hook (Python, not shell)
-
-Save to `~/.local/share/mem-fusion/scripts/ingest_session.py`:
-
-```python
+```bash
+cat > ~/.local/share/mem-fusion/scripts/ingest_session.py <<'C39D19C30496_EOF'
 #!/usr/bin/env python3
 """Session ingestion — Stop hook. Backgrounded; doesn't block exit."""
 import json, logging, os, re, sys, hashlib
@@ -966,7 +963,7 @@ def store_via_api(memories, importance, project):
             (QUEUE_DIR / f"{ts}-{h}.json").write_text(json.dumps(mem))
         return
 
-    import mcp_server as srv
+    import mem_fusion as srv
     stored = 0
     for mem in memories:
         try:
@@ -1006,26 +1003,24 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
-
-After writing all four:
-
-```bash
-chmod +x ~/.local/share/mem-fusion/scripts/*.sh
+C39D19C30496_EOF
 chmod +x ~/.local/share/mem-fusion/scripts/ingest_session.py
 ```
 
 ---
 
-## Step 9 — Write the launchd plists
+## Step 9 — Install the launchd plists
 
-Detect the user's actual `$HOME` and arch, then write the plists. Plists do **not** expand env vars in path strings, so `$HOME` must be substituted at write time.
-
-### 9a. `~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist`
+Substitute `$HOME` (and `$OLLAMA_BIN` for Ollama) at write time:
 
 ```bash
-HOME_LIT="$HOME"
-cat > ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist <<EOF
+if [[ "$(uname -m)" == "arm64" ]]; then OLLAMA_BIN="/opt/homebrew/bin/ollama"; else OLLAMA_BIN="/usr/local/bin/ollama"; fi
+export HOME_LIT="$HOME"
+export OLLAMA_BIN
+```
+
+```bash
+cat > ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist <<7E47CA3D1B16_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1057,22 +1052,11 @@ cat > ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist <<EOF
     </dict>
 </dict>
 </plist>
-EOF
+7E47CA3D1B16_EOF
 ```
 
-The `MALLOC_CONF=background_thread:false` and `NumberOfFiles=65536` are **required** — Qdrant won't start reliably without them on macOS.
-
-### 9b. `~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist`
-
 ```bash
-HOME_LIT="$HOME"
-if [[ "$(uname -m)" == "arm64" ]]; then
-  OLLAMA_BIN="/opt/homebrew/bin/ollama"
-else
-  OLLAMA_BIN="/usr/local/bin/ollama"
-fi
-
-cat > ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist <<EOF
+cat > ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist <<7438C490D56E_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1096,24 +1080,19 @@ cat > ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist <<EOF
     </dict>
 </dict>
 </plist>
-EOF
+7438C490D56E_EOF
 ```
 
 ---
 
-## Step 10 — Start the services and pull the embedding model
+## Step 10 — Start services + pull embedding model + init collection
 
 ```bash
 launchctl load ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist
 launchctl load ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist
 
-echo "Waiting for Ollama..."
-curl -s --retry 12 --retry-delay 1 --retry-connrefused http://127.0.0.1:11434/api/tags >/dev/null \
-  && echo "  Ollama up" || { echo "Ollama failed to start — check logs"; exit 1; }
-
-echo "Waiting for Qdrant..."
-curl -s --retry 12 --retry-delay 1 --retry-connrefused http://127.0.0.1:6333/healthz >/dev/null \
-  && echo "  Qdrant up" || { echo "Qdrant failed to start — check logs"; exit 1; }
+curl -s --retry 12 --retry-delay 1 --retry-connrefused http://127.0.0.1:11434/api/tags >/dev/null && echo "  Ollama up"
+curl -s --retry 12 --retry-delay 1 --retry-connrefused http://127.0.0.1:6333/healthz   >/dev/null && echo "  Qdrant up"
 
 ollama pull nomic-embed-text
 
@@ -1128,7 +1107,7 @@ ollama pull nomic-embed-text
 ```bash
 claude mcp add mem-fusion \
   ~/.local/share/mem-fusion/venv/bin/python \
-  ~/.local/share/mem-fusion/mcp_server.py
+  ~/.local/share/mem-fusion/mem_fusion.py
 
 claude mcp list | grep mem-fusion
 ```
@@ -1137,10 +1116,11 @@ You should see `mem-fusion: ... - ✓ Connected`.
 
 ---
 
-## Step 12 — Wire up the 4 hooks in `~/.claude/settings.json`
+## Step 12 — Wire the 4 hooks into `~/.claude/settings.json`
 
 ```bash
-python3 - <<'PYEOF'
+cat > ~/.local/share/mem-fusion/scripts/wire_hooks.py <<'DC4EBE1C3B9C_EOF'
+#!/usr/bin/env python3
 import json, os
 from pathlib import Path
 
@@ -1209,7 +1189,12 @@ settings["hooks"] = existing_hooks
 
 settings_path.write_text(json.dumps(settings, indent=2))
 print(f"Hooks merged into {settings_path}")
-PYEOF
+DC4EBE1C3B9C_EOF
+chmod +x ~/.local/share/mem-fusion/scripts/wire_hooks.py
+```
+
+```bash
+python3 ~/.local/share/mem-fusion/scripts/wire_hooks.py
 ```
 
 ---
@@ -1218,7 +1203,10 @@ PYEOF
 
 ```bash
 mkdir -p ~/.claude/skills/remember
-cat > ~/.claude/skills/remember/SKILL.md <<'EOF'
+```
+
+```bash
+cat > ~/.claude/skills/remember/SKILL.md <<'BEA764C561E7_EOF'
 ---
 name: remember
 description: Store a specific piece of information into the persistent vector memory system
@@ -1247,26 +1235,38 @@ what was stored and its ID.
    - `context`    — background context about a project or initiative
 
 3. Call `store_memory` with:
-   - `importance: 5`
+   - `importance: 5`  (always for /remember)
    - Infer `project` from conversation context if not stated
    - Infer `tags` from the content topic
 
 4. Confirm to the user:
    ```
-   Remembered: [brief summary]
+   Remembered: [brief summary of what was stored]
    ID: [memory_id]
    Type: [type] | Project: [project] | Tags: [tags]
    ```
-EOF
+
+## Examples
+
+User: "remember that we always use uv for Python environments on this machine"
+→ store_memory(content="Always use uv for Python environment management on this machine — not pip or venv directly", type="preference", importance=5, tags=["python", "tooling"])
+
+User: "remember why we went with Qdrant"
+→ summarize from context, store as type="decision", importance=5
+
+User: "/remember the API key format is Bearer <token> not Basic"
+→ store_memory(content="API auth format: Bearer <token> (not Basic auth)", type="fact", importance=5)
+BEA764C561E7_EOF
 ```
 
 ---
 
 ## Step 14 — Smoke test
 
-This proves the whole stack works. **Run it before reporting success.**
-
 ```bash
+cat > ~/.local/share/mem-fusion/scripts/smoke-test.sh <<'7760D727B68B_EOF'
+#!/usr/bin/env bash
+set -e
 launchctl list | grep -E "com.branchapp.memfusion" | head
 curl -s http://127.0.0.1:6333/healthz
 curl -s http://127.0.0.1:11434/api/tags | python3 -c "import sys,json; print('Ollama models:', [m['name'] for m in json.load(sys.stdin)['models']])"
@@ -1276,7 +1276,7 @@ claude mcp list | grep mem-fusion
 ~/.local/share/mem-fusion/venv/bin/python - <<'PYEOF'
 import asyncio, sys
 sys.path.insert(0, str(__import__('pathlib').Path.home() / ".local/share/mem-fusion"))
-import mcp_server as srv
+import mem_fusion as srv
 
 async def main():
     r1 = await srv.tool_store({
@@ -1297,13 +1297,21 @@ async def main():
 
 asyncio.run(main())
 PYEOF
+7760D727B68B_EOF
+chmod +x ~/.local/share/mem-fusion/scripts/smoke-test.sh
 ```
+
+```bash
+~/.local/share/mem-fusion/scripts/smoke-test.sh
+```
+
+Expect `✓ All smoke tests passed`.
 
 ---
 
 ## Step 15 — Tell the user what to add to their CLAUDE.md
 
-After install, the user needs to teach **their** Claude how to use the memory tools. Print this snippet and instruct them to paste it into `~/CLAUDE.md` (or a project-level `CLAUDE.md`):
+Print this snippet and instruct the user to paste it into `~/CLAUDE.md` (or a project-level `CLAUDE.md`):
 
 ```markdown
 ## Vector Memory System
@@ -1345,26 +1353,27 @@ a memory, verify it still exists in the current code.
 
 | Symptom | Fix |
 |---|---|
-| `claude mcp list` shows mem-fusion but `Failed to connect` | Check the venv exists and `mcp_server.py` runs without import errors: `~/.local/share/mem-fusion/venv/bin/python ~/.local/share/mem-fusion/mcp_server.py` (should hang waiting for stdio — kill with Ctrl-C). Look at `~/.local/share/mem-fusion/logs/mcp.log`. |
+| `claude mcp list` shows mem-fusion but `Failed to connect` | Run the server directly to surface import errors: `~/.local/share/mem-fusion/venv/bin/python ~/.local/share/mem-fusion/mem_fusion.py` (will hang waiting for stdio — Ctrl-C). Check `~/.local/share/mem-fusion/logs/mcp.log`. |
 | Qdrant won't start | Confirm `MALLOC_CONF=background_thread:false` is in the plist `EnvironmentVariables` and `NumberOfFiles=65536` is set. Check `~/.local/share/mem-fusion/logs/qdrant-error.log`. |
 | Search returns 0 results | Verify Ollama is up: `curl http://127.0.0.1:11434/api/tags`. Verify the model is pulled: `ollama list \| grep nomic-embed-text`. |
-| Hooks not firing | Confirm `~/.claude/settings.json` was merged correctly (Step 12). Run scripts manually to surface any errors: `~/.local/share/mem-fusion/scripts/session_prime.sh`. |
-| Session ingestion logging "no session file found" | Newer Claude Code may have moved session files. Check `~/.claude/sessions/*.jsonl` exists. If the path differs, edit `SESSIONS_DIR` in `ingest_session.py`. |
+| Hooks not firing | Confirm `~/.claude/settings.json` was merged correctly (Step 12). Run scripts manually to surface errors: `~/.local/share/mem-fusion/scripts/session_prime.sh`. |
+| Session ingestion logs "no session file found" | Confirm `~/.claude/sessions/*.jsonl` exists. If Claude Code moved the session path, edit `SESSIONS_DIR` in `ingest_session.py`. |
 
 Logs directory: `~/.local/share/mem-fusion/logs/` — `mcp.log`, `qdrant.log`, `qdrant-error.log`, `ollama.log`, `ingest.log`.
 
 ---
 
-## Uninstall (clean removal)
+## Uninstall
 
 ```bash
 claude mcp remove mem-fusion
 
 launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist 2>/dev/null
 launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist 2>/dev/null
-rm ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist
+rm ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist \
+   ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist
 
-echo "Edit ~/.claude/settings.json — remove the 4 mem-fusion entries from .hooks, or restore from the .bak file made in Pre-flight."
+echo "Edit ~/.claude/settings.json — remove the 4 mem-fusion entries under .hooks, or restore from the pre-flight .bak."
 
 read -p "Delete all stored memories? [y/N] " yn
 [[ "$yn" == "y" ]] && rm -rf ~/.local/share/mem-fusion
@@ -1374,16 +1383,8 @@ rm -rf ~/.claude/skills/remember
 
 ---
 
-## What's intentionally NOT in this install
-
-- **No telemetry / phone-home.** Everything is localhost-only.
-- **No Linux/Windows support.** macOS launchd is hard-required by the architecture; porting is future work.
-- **No automatic upgrade path.** To upgrade, re-run this prompt — `init_collection.py` and the duplicate-hash check make it idempotent.
-
----
-
 ## After install — final report to the user
 
-When all 14 steps + smoke test pass, tell the user:
+When all 15 steps + smoke test pass, tell the user:
 
 > Your Mem-Fusion vector memory system is live. **Restart your Claude Code session** for the hooks to take effect. Then paste the CLAUDE.md snippet from Step 15 into your `~/CLAUDE.md`. Try it out by saying *"remember that I prefer Python virtual envs created with `uv`"* — Claude should call the `/remember` skill and confirm with a memory ID.

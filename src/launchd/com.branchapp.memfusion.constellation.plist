@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.branchapp.memfusion.constellation</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${HOME_LIT}/.local/share/mem-fusion/venv/bin/python</string>
+        <string>${HOME_LIT}/.local/share/mem-fusion/constellation.py</string>
+        <string>--config</string>
+        <string>${HOME_LIT}/.local/share/mem-fusion/constellation/config.json</string>
+        <string>--foreground</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key>
+    <string>${HOME_LIT}/.local/share/mem-fusion/constellation/logs/constellation.log</string>
+    <key>StandardErrorPath</key>
+    <string>${HOME_LIT}/.local/share/mem-fusion/constellation/logs/constellation-error.log</string>
+    <key>WorkingDirectory</key>
+    <string>${HOME_LIT}/.local/share/mem-fusion/constellation</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>${HOME_LIT}</string>
+    </dict>
+</dict>
+</plist>

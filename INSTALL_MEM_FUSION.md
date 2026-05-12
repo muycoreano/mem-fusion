@@ -141,132 +141,24 @@ log_level: WARN
 cat > ~/.local/share/mem-fusion/mem_fusion.py <<'F01E42F0C765_EOF'
 #!/usr/bin/env python3
 """
-Mem-Fusion MCP Server — stdio transport
-Provides 9 tools for storing and retrieving memories from Qdrant.
+Mem-Fusion MCP Server — stdio transport for Claude Code.
+
+Thin proxy over `core.py`. Registers 9 memory tools with the MCP server
+and delegates each one to the corresponding `core` function. No business
+logic lives in this file; it exists to translate between MCP's call/response
+shape and `core`'s plain-Python function shape.
 """
 import asyncio
-import hashlib
 import json
-import logging
-import os
-import sys
-import uuid
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Any
 
-import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    DatetimeRange, Distance, FieldCondition, Filter, MatchValue,
-    PointStruct, Range, VectorParams,
-)
 
-QDRANT_URL   = os.getenv("QDRANT_URL",   "http://127.0.0.1:6333")
-OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://127.0.0.1:11434")
-COLLECTION   = os.getenv("MEMFUSION_COLLECTION", "mem_fusion_memories")
-EMBED_MODEL  = "nomic-embed-text"
-VECTOR_SIZE  = 768
-LOG_PATH     = os.getenv("MEMFUSION_LOG",
-                          str(Path.home() / ".local/share/mem-fusion/logs/mcp.log"))
-
-QUEUE_DIR    = Path.home() / ".local/share/mem-fusion/queue"
-QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("mem-fusion")
-
-qdrant = QdrantClient(url=QDRANT_URL, timeout=10)
+import core
 
 
-def content_hash(text: str) -> str:
-    return hashlib.sha256(text.strip().lower().encode()).hexdigest()[:16]
-
-
-async def embed(text: str) -> list[float] | None:
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.post(f"{OLLAMA_URL}/api/embeddings",
-                                   json={"model": EMBED_MODEL, "prompt": text})
-            r.raise_for_status()
-            return r.json()["embedding"]
-    except Exception as e:
-        log.error("embed failed: %s", e)
-        return None
-
-
-def queue_write(payload: dict) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    h  = content_hash(payload.get("content", ""))
-    fname = QUEUE_DIR / f"{ts}-{h}.json"
-    fname.write_text(json.dumps(payload))
-    log.warning("Queued write to %s (Ollama unavailable)", fname.name)
-    return str(fname)
-
-
-def find_duplicate(chash: str) -> str | None:
-    try:
-        results, _ = qdrant.scroll(
-            collection_name=COLLECTION,
-            scroll_filter=Filter(must=[FieldCondition(key="content_hash", match=MatchValue(value=chash))]),
-            limit=1, with_payload=False,
-        )
-        if results:
-            return str(results[0].id)
-    except Exception as e:
-        log.warning("Duplicate check failed: %s", e)
-    return None
-
-
-def iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def since_to_filter(since: str | None):
-    if not since:
-        return None
-    try:
-        if since.endswith("h"):
-            dt = datetime.now(timezone.utc) - timedelta(hours=float(since[:-1]))
-        elif since.endswith("d"):
-            dt = datetime.now(timezone.utc) - timedelta(days=float(since[:-1]))
-        else:
-            dt = datetime.fromisoformat(since)
-        return FieldCondition(key="timestamp", range=DatetimeRange(gte=dt))
-    except Exception:
-        return None
-
-
-def build_filter(project=None, type_=None, since=None, min_importance=1):
-    conditions = []
-    if project:
-        conditions.append(FieldCondition(key="project", match=MatchValue(value=project)))
-    if type_:
-        conditions.append(FieldCondition(key="type", match=MatchValue(value=type_)))
-    f = since_to_filter(since)
-    if f:
-        conditions.append(f)
-    if min_importance and min_importance > 1:
-        conditions.append(FieldCondition(key="importance", range=Range(gte=min_importance)))
-    return Filter(must=conditions) if conditions else None
-
-
-def format_results(hits):
-    return [{
-        "id":         str(h.id),
-        "score":      round(h.score, 4),
-        "content":    h.payload.get("content", ""),
-        "type":       h.payload.get("type", ""),
-        "project":    h.payload.get("project", ""),
-        "tags":       h.payload.get("tags", []),
-        "importance": h.payload.get("importance", 3),
-        "timestamp":  h.payload.get("timestamp", ""),
-    } for h in hits]
-
+log = core.configure_logging("mem-fusion")
 
 server = Server("mem-fusion")
 
@@ -360,19 +252,196 @@ async def call_tool(name, arguments):
 
 
 async def dispatch(name, args):
-    if name == "store_memory":      return await tool_store(args)
-    if name == "search_memory":     return await tool_search(args)
-    if name == "search_recent":     return await tool_search_recent(args)
-    if name == "upsert_memory":     return await tool_upsert(args)
-    if name == "find_or_create":    return await tool_find_or_create(args)
-    if name == "delete_memory":     return await tool_delete(args)
-    if name == "get_related":       return await tool_get_related(args)
-    if name == "memory_stats":      return await tool_stats(args)
-    if name == "export_record":     return await tool_export_record(args)
+    if name == "store_memory":   return await core.store_memory(args)
+    if name == "search_memory":  return await core.search_memory(args)
+    if name == "search_recent":  return await core.search_recent(args)
+    if name == "upsert_memory":  return await core.upsert_memory(args)
+    if name == "find_or_create": return await core.find_or_create(args)
+    if name == "delete_memory":  return await core.delete_memory(args)
+    if name == "get_related":    return await core.get_related(args)
+    if name == "memory_stats":   return await core.memory_stats(args)
+    if name == "export_record":  return await core.export_record(args)
     raise ValueError(f"Unknown tool: {name}")
 
 
-async def tool_store(args):
+async def main():
+    log.info("Mem-Fusion MCP Server starting")
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+F01E42F0C765_EOF
+chmod +x ~/.local/share/mem-fusion/mem_fusion.py
+```
+
+```bash
+cat > ~/.local/share/mem-fusion/core.py <<'3B2A2906F11A_EOF'
+#!/usr/bin/env python3
+"""
+core.py — the shared memory layer over Qdrant.
+
+Both mem_fusion.py (stdio MCP server, serving Claude) and constellation.py
+(HTTP server, serving peers) are thin proxies on top of these functions.
+This is the only module that talks to Qdrant.
+
+Functions return plain dicts; transport-specific serialization (MCP JSON,
+HTTP JSON, etc.) is the caller's responsibility.
+
+If Ollama is unreachable when embedding is required, returns
+{"error": "ollama_unreachable", "detail": ...}. Callers surface the error.
+No silent queueing.
+"""
+import hashlib
+import logging
+import os
+import uuid
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import httpx
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    DatetimeRange, FieldCondition, Filter, MatchValue, PointStruct, Range,
+)
+
+# ── Constants (shared by mem_fusion.py and constellation.py) ──────────────
+QDRANT_URL  = os.getenv("QDRANT_URL",  "http://127.0.0.1:6333")
+OLLAMA_URL  = os.getenv("OLLAMA_URL",  "http://127.0.0.1:11434")
+COLLECTION  = os.getenv("MEMFUSION_COLLECTION", "mem_fusion_memories")
+EMBED_MODEL = "nomic-embed-text"
+VECTOR_SIZE = 768
+
+LOG_PATH    = os.getenv("MEMFUSION_LOG",
+                        str(Path.home() / ".local/share/mem-fusion/logs/mem-fusion.log"))
+
+
+# ── Unified logger (shared file, component-prefixed format) ───────────────
+def configure_logging(component: str) -> logging.Logger:
+    """Configure the unified mem-fusion logger for the calling process.
+
+    All processes (mem-fusion, constellation, core, hooks) write to the same
+    log file with a [component] prefix so debugging is one-file. Each
+    process calls this once at startup with its component name.
+    """
+    Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    if not any(isinstance(h, logging.FileHandler) and h.baseFilename == LOG_PATH
+               for h in root.handlers):
+        handler = logging.FileHandler(LOG_PATH)
+        handler.setFormatter(logging.Formatter(
+            f"%(asctime)s %(levelname)-5s [{component:<14}] %(message)s"
+        ))
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+    return logging.getLogger(component)
+
+
+# Module-level logger. Each importing process should also call
+# configure_logging(component) to add the file handler exactly once.
+log = logging.getLogger("core")
+
+
+# ── Qdrant client (module-level singleton) ─────────────────────────────────
+qdrant = QdrantClient(url=QDRANT_URL, timeout=10)
+
+
+# ── Hashing + timestamps ──────────────────────────────────────────────────
+def content_hash(text: str) -> str:
+    """The dedup + integrity hash. Must be byte-identical across all daemons."""
+    return hashlib.sha256(text.strip().lower().encode()).hexdigest()[:16]
+
+
+def iso_now() -> str:
+    """Microsecond-precision ISO-8601 UTC timestamp."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ── Embedding (Ollama) ─────────────────────────────────────────────────────
+async def embed(text: str) -> list[float] | None:
+    """Generate a 768-dim vector via local Ollama. Returns None on failure."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.post(f"{OLLAMA_URL}/api/embeddings",
+                                  json={"model": EMBED_MODEL, "prompt": text})
+            r.raise_for_status()
+            return r.json()["embedding"]
+    except Exception as e:
+        log.error("embed failed: %s", e)
+        return None
+
+
+# ── Qdrant filter helpers ─────────────────────────────────────────────────
+def find_duplicate(chash: str) -> str | None:
+    """Return existing point id if a memory with this content_hash exists, else None."""
+    try:
+        results, _ = qdrant.scroll(
+            collection_name=COLLECTION,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="content_hash", match=MatchValue(value=chash))
+            ]),
+            limit=1, with_payload=False,
+        )
+        if results:
+            return str(results[0].id)
+    except Exception as e:
+        log.warning("Duplicate check failed: %s", e)
+    return None
+
+
+def since_to_filter(since: str | None):
+    """Parse 'Nh' / 'Nd' / ISO into a Qdrant DatetimeRange filter on 'timestamp'."""
+    if not since:
+        return None
+    try:
+        if since.endswith("h"):
+            dt = datetime.now(timezone.utc) - timedelta(hours=float(since[:-1]))
+        elif since.endswith("d"):
+            dt = datetime.now(timezone.utc) - timedelta(days=float(since[:-1]))
+        else:
+            dt = datetime.fromisoformat(since)
+        return FieldCondition(key="timestamp", range=DatetimeRange(gte=dt))
+    except Exception:
+        return None
+
+
+def build_filter(project=None, type_=None, since=None, min_importance=1):
+    """Compose a Qdrant Filter from optional fields."""
+    conditions = []
+    if project:
+        conditions.append(FieldCondition(key="project", match=MatchValue(value=project)))
+    if type_:
+        conditions.append(FieldCondition(key="type", match=MatchValue(value=type_)))
+    f = since_to_filter(since)
+    if f:
+        conditions.append(f)
+    if min_importance and min_importance > 1:
+        conditions.append(FieldCondition(key="importance", range=Range(gte=min_importance)))
+    return Filter(must=conditions) if conditions else None
+
+
+def format_results(hits):
+    """Shape Qdrant hits into the wire-friendly result format."""
+    return [{
+        "id":         str(h.id),
+        "score":      round(h.score, 4),
+        "content":    h.payload.get("content", ""),
+        "type":       h.payload.get("type", ""),
+        "project":    h.payload.get("project", ""),
+        "tags":       h.payload.get("tags", []),
+        "importance": h.payload.get("importance", 3),
+        "timestamp":  h.payload.get("timestamp", ""),
+    } for h in hits]
+
+
+# ── Memory operations ─────────────────────────────────────────────────────
+async def store_memory(args: dict) -> dict:
+    """Embed, dedup, insert. Returns one of:
+       {status: "stored", id}            — fresh content stored
+       {status: "duplicate", existing_id} — content_hash already present
+       {error: "ollama_unreachable"}     — embed failed; caller surfaces error
+    """
     content    = args["content"]
     type_      = args["type"]
     tags       = args.get("tags", [])
@@ -387,22 +456,23 @@ async def tool_store(args):
 
     vec = await embed(content)
     if vec is None:
-        queued = queue_write({"content": content, "type": type_, "tags": tags,
-                              "project": project, "importance": importance})
-        return {"status": "queued", "queue_file": queued,
-                "warning": "Ollama unavailable — memory queued for later ingestion"}
+        return {"error": "ollama_unreachable",
+                "detail": "Local Ollama did not respond; cannot embed. Verify Ollama is running."}
 
     point_id = str(uuid.uuid4())
     qdrant.upsert(collection_name=COLLECTION, points=[PointStruct(
         id=point_id, vector=vec,
-        payload={"content": content, "type": type_, "tags": tags, "project": project,
-                 "importance": importance, "session_id": session_id,
-                 "content_hash": chash, "timestamp": iso_now(), "source": "manual"},
+        payload={
+            "content": content, "type": type_, "tags": tags, "project": project,
+            "importance": importance, "session_id": session_id,
+            "content_hash": chash, "timestamp": iso_now(), "source": "local",
+        },
     )])
     return {"status": "stored", "id": point_id}
 
 
-async def tool_search(args):
+async def search_memory(args: dict) -> dict:
+    """Semantic search via cosine similarity on the local collection."""
     query          = args["query"]
     top_k          = min(int(args.get("top_k", 8)), 20)
     project        = args.get("project")
@@ -412,7 +482,8 @@ async def tool_search(args):
 
     vec = await embed(query)
     if vec is None:
-        return {"error": "Ollama unavailable — cannot perform semantic search"}
+        return {"error": "ollama_unreachable",
+                "detail": "Local Ollama did not respond; cannot perform semantic search."}
 
     filt = build_filter(project=project, type_=type_, since=since, min_importance=min_importance)
     hits = qdrant.search(collection_name=COLLECTION, query_vector=vec,
@@ -421,7 +492,8 @@ async def tool_search(args):
     return {"query": query, "count": len(results), "results": results}
 
 
-async def tool_search_recent(args):
+async def search_recent(args: dict) -> dict:
+    """Time-filtered scroll — no vector search needed."""
     hours   = float(args.get("hours", 24))
     project = args.get("project")
     top_k   = min(int(args.get("top_k", 10)), 50)
@@ -432,8 +504,8 @@ async def tool_search_recent(args):
         conditions.append(FieldCondition(key="project", match=MatchValue(value=project)))
 
     points, _ = qdrant.scroll(collection_name=COLLECTION,
-                               scroll_filter=Filter(must=conditions),
-                               limit=top_k, with_payload=True, with_vectors=False)
+                              scroll_filter=Filter(must=conditions),
+                              limit=top_k, with_payload=True, with_vectors=False)
     results = [{
         "id": str(p.id), "content": p.payload.get("content", ""),
         "type": p.payload.get("type", ""), "project": p.payload.get("project", ""),
@@ -443,7 +515,8 @@ async def tool_search_recent(args):
     return {"hours": hours, "count": len(results), "results": results}
 
 
-async def tool_upsert(args):
+async def upsert_memory(args: dict) -> dict:
+    """Update an existing point by id. Re-embeds the new content."""
     memory_id  = args["id"]
     content    = args["content"]
     type_      = args.get("type")
@@ -452,7 +525,8 @@ async def tool_upsert(args):
 
     vec = await embed(content)
     if vec is None:
-        return {"error": "Ollama unavailable — cannot re-embed for upsert"}
+        return {"error": "ollama_unreachable",
+                "detail": "Local Ollama did not respond; cannot re-embed for upsert."}
 
     existing = qdrant.retrieve(collection_name=COLLECTION, ids=[memory_id], with_payload=True)
     if not existing:
@@ -471,7 +545,8 @@ async def tool_upsert(args):
     return {"status": "updated", "id": memory_id}
 
 
-async def tool_find_or_create(args):
+async def find_or_create(args: dict) -> dict:
+    """Search for similar content first; store if no result above 0.82 similarity."""
     content    = args["content"]
     type_      = args["type"]
     tags       = args.get("tags", [])
@@ -480,8 +555,8 @@ async def tool_find_or_create(args):
 
     vec = await embed(content)
     if vec is None:
-        queued = queue_write(args)
-        return {"status": "queued", "queue_file": queued}
+        return {"error": "ollama_unreachable",
+                "detail": "Local Ollama did not respond; cannot embed for find_or_create."}
 
     hits = qdrant.search(collection_name=COLLECTION, query_vector=vec, limit=1, with_payload=True)
     if hits and hits[0].score > 0.82:
@@ -492,25 +567,28 @@ async def tool_find_or_create(args):
     point_id = str(uuid.uuid4())
     qdrant.upsert(collection_name=COLLECTION, points=[PointStruct(
         id=point_id, vector=vec,
-        payload={"content": content, "type": type_, "tags": tags, "project": project,
-                 "importance": importance, "content_hash": chash,
-                 "timestamp": iso_now(), "source": "manual"},
+        payload={
+            "content": content, "type": type_, "tags": tags, "project": project,
+            "importance": importance, "content_hash": chash,
+            "timestamp": iso_now(), "source": "local",
+        },
     )])
     return {"status": "created", "id": point_id}
 
 
-async def tool_delete(args):
+async def delete_memory(args: dict) -> dict:
     memory_id = args["id"]
     qdrant.delete(collection_name=COLLECTION, points_selector=[memory_id])
     return {"status": "deleted", "id": memory_id}
 
 
-async def tool_get_related(args):
+async def get_related(args: dict) -> dict:
+    """Find memories semantically similar to a given memory id."""
     memory_id = args["memory_id"]
     top_k     = min(int(args.get("top_k", 5)), 20)
 
     existing = qdrant.retrieve(collection_name=COLLECTION, ids=[memory_id],
-                                with_vectors=True, with_payload=True)
+                               with_vectors=True, with_payload=True)
     if not existing:
         return {"error": f"Memory {memory_id} not found"}
 
@@ -523,20 +601,22 @@ async def tool_get_related(args):
     return {"reference_id": memory_id, "count": len(hits), "results": format_results(hits)}
 
 
-async def tool_stats(args):
+async def memory_stats(args: dict) -> dict:
     info  = qdrant.get_collection(COLLECTION)
     total = info.points_count or 0
 
     types = ["decision", "fact", "preference", "error", "code", "context", "session"]
     by_type = {}
     for t in types:
-        count_result = qdrant.count(collection_name=COLLECTION,
+        count_result = qdrant.count(
+            collection_name=COLLECTION,
             count_filter=Filter(must=[FieldCondition(key="type", match=MatchValue(value=t))]),
-            exact=False)
+            exact=False,
+        )
         by_type[t] = count_result.count
 
     all_points, _ = qdrant.scroll(collection_name=COLLECTION, limit=10000,
-                                   with_payload=["timestamp"], with_vectors=False)
+                                  with_payload=["timestamp"], with_vectors=False)
     timestamps  = [p.payload.get("timestamp") for p in all_points if p.payload.get("timestamp")]
     last_stored = max(timestamps) if timestamps else "none"
 
@@ -544,16 +624,16 @@ async def tool_stats(args):
             "collection": COLLECTION, "qdrant_url": QDRANT_URL, "ollama_url": OLLAMA_URL}
 
 
-async def tool_export_record(args):
-    """Return the full Qdrant record (including vector) for a stored memory by ID.
+async def export_record(args: dict) -> dict:
+    """Return the full Qdrant record (including vector) for a memory by id.
 
-    Enables Constellation and other extensions to extract a complete memory
-    record for faithful propagation to a group canonical — the vector is
-    copied verbatim rather than re-embedded across the boundary.
+    Enables Constellation and other federation clients to extract a complete
+    record for faithful propagation across nodes — vector copied verbatim
+    rather than re-embedded.
     """
     memory_id = args["id"]
     points = qdrant.retrieve(collection_name=COLLECTION, ids=[memory_id],
-                              with_vectors=True, with_payload=True)
+                             with_vectors=True, with_payload=True)
     if not points:
         return {"error": f"Memory {memory_id} not found"}
     p = points[0]
@@ -572,16 +652,54 @@ async def tool_export_record(args):
     }
 
 
-async def main():
-    log.info("Mem-Fusion MCP Server starting")
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+# ── Cross-client notification primitive ────────────────────────────────────
+def get_new_entries_since(cursor_iso: str | None,
+                          source_filter: str | None = None,
+                          limit: int = 256) -> list[dict]:
+    """Return entries with timestamp > cursor_iso, sorted ascending.
 
+    Used by constellation's publisher loop (with source_filter="local") to
+    detect new local writes for SSE broadcast. Each client tracks its own
+    cursor; pass None on first call to get everything.
 
-if __name__ == "__main__":
-    asyncio.run(main())
-F01E42F0C765_EOF
-chmod +x ~/.local/share/mem-fusion/mem_fusion.py
+    Returns full memory records (including vector) so the caller can
+    forward them directly without a follow-up fetch.
+    """
+    conditions = []
+    if cursor_iso:
+        conditions.append(FieldCondition(
+            key="timestamp",
+            range=DatetimeRange(gt=datetime.fromisoformat(cursor_iso)),
+        ))
+    if source_filter:
+        conditions.append(FieldCondition(
+            key="source", match=MatchValue(value=source_filter),
+        ))
+
+    scroll_filter = Filter(must=conditions) if conditions else None
+    points, _ = qdrant.scroll(
+        collection_name=COLLECTION,
+        scroll_filter=scroll_filter,
+        limit=limit, with_payload=True, with_vectors=True,
+    )
+    # Sort by timestamp ascending so cursor advances monotonically
+    points = sorted(points, key=lambda p: p.payload.get("timestamp", ""))
+    return [{
+        "id":           str(p.id),
+        "vector":       list(p.vector) if p.vector is not None else None,
+        "content":      p.payload.get("content", ""),
+        "content_hash": p.payload.get("content_hash", ""),
+        "type":         p.payload.get("type", ""),
+        "tags":         p.payload.get("tags", []),
+        "project":      p.payload.get("project", ""),
+        "importance":   p.payload.get("importance", 3),
+        "session_id":   p.payload.get("session_id", ""),
+        "timestamp":    p.payload.get("timestamp", ""),
+        "source":       p.payload.get("source", ""),
+        "origin_node":  p.payload.get("origin_node", ""),
+        "group_name":   p.payload.get("group_name", ""),
+    } for p in points]
+3B2A2906F11A_EOF
 ```
 
 ---

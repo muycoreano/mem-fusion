@@ -10,611 +10,425 @@
 
 **Constellation enables group memory across multiple Mem-Fusion nodes.** Where Mem-Fusion gives Claude long-term memory across sessions on one machine, Constellation lets that memory federate across machines — sharing curated knowledge between team members' AI agents while preserving each member's personal memory privacy.
 
-Constellation is bundled with Mem-Fusion (lives in the same repo at `src/`) but runs as a **separate daemon process** with its own MCP server, its own storage, and its own network endpoint. The two products serve different purposes:
+Constellation is bundled with Mem-Fusion (same repo at `src/`) but runs as a **separate daemon process** with its own HTTP server. Both daemons are clients of a shared `core_mem_fusion` library that operates on a single Qdrant collection per peer — see §6 Process Architecture. The two daemons serve different audiences:
 
-| | Mem-Fusion | Constellation |
+| | Mem-Fusion (`mem_fusion.py`) | Constellation (`constellation.py`) |
 |---|---|---|
-| Purpose | Personal memory (cross-session, single machine) | Group memory (across machines) |
-| Transport | stdio MCP, spawned per Claude session | HTTP MCP, persistent daemon |
+| Audience | Claude Code on this machine | Other peers on the network |
+| Transport | stdio MCP, spawned per Claude session | HTTP server + SSE pub/sub, persistent daemon |
 | Network exposure | Localhost only | Network-bound for inter-peer reachability |
-| Storage | Local Qdrant collection (`mem_fusion_memories`) | Separate Qdrant collection (`mem_fusion_canonical_memories`) |
+| Storage | Shared single Qdrant collection (`mem_fusion_memories`) via `core_mem_fusion` | Same shared single Qdrant collection via `core_mem_fusion` |
 | Lifecycle | Ephemeral (Claude subprocess) | Always-on (launchd-managed) |
-| Tool surface to local Claude | All 8 memory tools | All 4 constellation tools |
-| Tool surface to remote peers | None (not reachable) | All 4 constellation tools |
 
-**Critical safety property:** Constellation has no privileged access to Mem-Fusion's local memory. The two daemons share Qdrant infrastructure but operate on disjoint collections. Cross-process boundaries enforce isolation; there is no API path from "remote peer makes a request" to "local memory store."
+Both daemons read and write the same Qdrant collection through `core_mem_fusion`. They distinguish memory provenance by `source` tag (`local` vs `federation`) and `origin_node` (the author identity). There is no IPC between the two daemons; their shared storage layer is the rendezvous.
+
+**Critical safety property:** Process isolation prevents network-side requests from reaching Claude's stdio MCP surface. A compromised constellation can affect only what the federation protocol exposes; it cannot escalate to invoking Claude's personal-memory MCP tools directly. Storage isolation is enforced by `source` tags within the single collection, and by network exposure rules (`mem_fusion.py` is unreachable from the network at all).
 
 ---
 
 ## 2. Object Model
 
-Two entities. One role.
+Two entities. No special roles.
 
 ### Node
 
-A participant in the constellation system. Each Mem-Fusion install on a machine corresponds to one node.
+A participant in the federation. Each Mem-Fusion install on a machine corresponds to one node. Every node is **symmetric** — there are no orchestrators, no peers-with-fewer-capabilities, no central coordinators. Every node holds its own local store and can both publish and subscribe.
 
 ```
 node:
   name             string         e.g., "alice-mac"
-  endpoint         URL            e.g., "http://10.0.0.5:7433"
-  memberships      list of group memberships (group_name + role)
+  endpoint         URL            e.g., "http://10.0.0.5:7533"
+  memberships      list of group memberships (group_name + peers in that group)
 ```
-
-A node has stable identity (its address + name); its *role* (orchestrating vs. non-orchestrating) varies per group.
 
 ### Group
 
-A named federation of nodes that share canonical memory.
+A named federation of symmetric nodes. The group is the unit of memory scope.
 
 ```
 group:
-  name                    string         e.g., "engineering@branch"
-  orchestrating_node      Node           exactly one
-  members                 list of Node   non-orchestrating members
-  canonical_memory        store          this group's shared memory (in orchestrator's Qdrant collection)
+  name             string         e.g., "engineering@branch"
+  peers            list of Node   the full mesh — every node knows every other node
 ```
 
-A group has exactly one orchestrating node and zero or more non-orchestrating member nodes. The orchestrating node holds the canonical memory store for the group.
+There is no "orchestrating node." Every node in a group has the same role and the same capabilities. Group state is the union of every member's local store, reconciled via mesh synchronization (§5).
 
-### The Role
+### Why mesh, not orchestrator-centric
 
-"Orchestrating" is **not a type of node** — it's a **per-group role** that a node plays for a specific group. The same node can be:
+The MVP target is small teams (≤10 people per group) on a local network. At that scale, the cost of every peer holding the group's state directly is trivial (a few MB), and the resilience properties are excellent: any peer can serve any other peer's catch-up query, no single failure point can stall the group, and group setup is one symmetric install per member.
 
-- A non-orchestrating member of group A
-- The orchestrating node of group B
-- A non-orchestrating member of group C
+The orchestrator-centric design (one designated node holds the canonical, others are clients) makes sense at larger scales where bandwidth, storage cost, and operational management justify the centralization. That is reserved for the **enterprise tier** (§13). The MVP is mesh.
 
-…all simultaneously. Three memberships, one orchestrating role. Identity stays at the node; role is contextual.
+### What this model dissolves
 
-### What this dissolves
+There are no "brokers," "relays," "bridges," "federation servers," "canonical stores held by privileged nodes." Those concepts collapse into:
+- A node (the actor — every node is fully capable)
+- A group (the federation unit — a named set of nodes)
+- A membership (the relationship — this node belongs to that group)
 
-The model has no "broker," "relay," "bridge," "federation server," or "peer-to-peer mesh" entities. Those concepts collapse into either:
-- A node (the actor)
-- A group (the federation unit)
-- A membership (the relationship)
-
-If a request flows from one group to another, it does so because a node with memberships in *both* groups made an explicit, deliberate call. No special entity, no third-party intermediation.
+Cross-group flow happens only when a node has memberships in multiple groups and makes explicit, deliberate calls. No third-party intermediation.
 
 ---
 
 ## 3. The Routing Rules
 
-These four invariants are the load-bearing logic of the system. Every protocol operation respects them.
+Four invariants. Every protocol operation respects them.
 
-### Rule 1: Direct send only
+### Rule 1: Mesh fan-out, no relays
 
-A node sending a memory to a group calls that group's orchestrating node *directly*. No intermediation, no relay, no path discovery.
+A node storing a memory in a group fans out the memory directly to every other peer in the group. No intermediation, no path discovery. Each delivery is a one-hop call from origin to recipient.
 
-### Rule 2: Membership equals authorization
+### Rule 2: Receivers do NOT re-fan-out
 
-A node can only send memory to (or query memory from) groups it is a member of. There is no "send to group X without being in X" pathway. Membership IS the permission.
+When peer-B receives a memory from peer-A, peer-B stores it locally and **does not** re-broadcast it. Fan-out is the originator's responsibility. Without this rule, every store would produce N² messages. Combined with content_hash dedup at receivers, this keeps mesh traffic at O(N) per store.
 
-### Rule 3: No transitive routing
+### Rule 3: Membership equals authorization
 
-A node in group A cannot send to group B "via" group A's orchestrator, even if A's orchestrator happens to also be in B. The originating actor must be a direct member of the target group.
+A node can only fan out memory to (or query memory from) groups it is a member of. Membership IS the permission for v0.3.0 MVP. Cryptographic authentication is part of the enterprise tier (§13).
 
-### Rule 4: No automatic propagation
+### Rule 4: No automatic cross-group propagation
 
-An orchestrating node's membership in a parent group is *descriptive*, not *active*. Memory put into group A does NOT automatically propagate to any group A's orchestrator may belong to. Propagation is always an explicit, deliberate second call by a node with multi-group membership.
+A node with memberships in multiple groups does NOT automatically propagate memories from one group to another. Cross-group flow requires an explicit second store_memory call by the node, deliberately scoped to the second group. Provenance is recorded in the new copy.
 
 ### Consequences
 
-- **Routing is degenerate.** Every memory operation is a one-hop call from a member to that group's orchestrating node. There is no routing protocol because there is no routing problem.
-- **Cost is O(1) per memory by default.** Memory storage cost = one canonical copy in the originating group. Multi-group replication only happens when someone explicitly chooses to incur it.
-- **Trust surface is bounded.** Each node verifies only its orchestrating nodes (constant, small N), not other nodes (which would be O(N²) in a mesh).
-- **Audit trail is built in.** When a memory crosses groups, it does so via an explicit `memory/put` call by a known multi-membership node. Provenance is recorded in the new copy.
+- **Routing is degenerate.** Each store produces N-1 fan-out calls plus one local insert. No routing protocol because there is no routing problem.
+- **Bandwidth scales linearly with group size.** For ≤10 peers, fan-out cost per store is at most 9 outbound calls — trivial. Beyond that, the enterprise tier (§13) introduces hub-and-spoke topology to keep per-store cost bounded.
+- **Trust surface is the group's peer list.** Each node trusts every other peer in its group equally. There is no privileged "orchestrator" to compromise; correspondingly, there is no central trust anchor.
+- **Audit trail via `origin_node` tag.** Every stored memory records its original author. Even after fan-out + dedup at receivers, the author identity is preserved.
 
 ---
 
 ## 4. Protocol Surface
 
-Four tools. All scoped by group. All under the `constellation/` namespace.
+Six HTTP endpoints. All scoped by group. Every peer exposes all of them — there are no orchestrator-only or peer-only endpoints.
 
-### `constellation/memory/put`
+### `POST /memory/put`
 
-Submit a memory to a group's canonical store.
-
-```
-inputs:
-  group_name      string       which group to put into
-  content         string       the memory text
-  type            enum         decision|fact|preference|error|code|context|session
-  tags            list[string] optional topic tags
-  importance      int          1-5
-  provenance      object       optional; origin metadata (used when promoting from another group)
-
-returns:
-  status:    stored | duplicate | rejected
-  id:        UUID of stored memory (if stored)
-```
-
-Authorization: caller MUST be a member of `group_name`. Orchestrating node validates membership before accepting.
-
-### `constellation/memory/get`
-
-Fetch memory from a group's canonical store.
+Submit a memory to a peer's local store. Used by mesh fan-out: when peer-A stores a memory locally, it POSTs to every other peer in the group.
 
 ```
 inputs:
-  group_name      string             which group to query
-  id              optional string    specific memory by ID
-  filters         optional object    since, tags, type, importance threshold
-  query           optional string    semantic search query
+  group_name      string       scope
+  memory_record   object       full record: content, vector, content_hash, type, tags, importance, original_timestamp
+  provenance      object       origin_node, origin_local_id, submitted_at, submission_kind
 
 returns:
-  list of memory records
+  status:        stored | duplicate
+  canonical_id:  UUID assigned by this peer (the receiver)
+  received_at:   ISO-8601 microsecond timestamp (this peer's clock)
 ```
 
-Authorization: caller MUST be a member of `group_name`.
+Authorization: caller's membership in `group_name` is implicit (no auth in MVP; local-network-only deployment).
 
-### `constellation/peers`
+### `GET /memory/get`
 
-List all members of a group, including the orchestrating node.
+Fetch one or more memories from a peer's local store. Used for catch-up via pull cycle.
 
 ```
-inputs:
-  group_name      string
+query params:
+  group_name      string             scope
+  id              optional string    specific memory by canonical_id
+  since           optional ISO       filter received_at >= since; sorted ascending
+  limit           optional int       default 10
 
 returns:
-  group:          name + orchestrating_node + members[]
-  each member:    {name, endpoint, role, last_seen}
+  count:     int
+  memories:  list of full memory records
 ```
 
-Authorization: caller MUST be a member of `group_name`.
+### `GET /memory/since`
 
-### `constellation/peers/self`
-
-Return the calling node's own info — its identity and all its memberships.
+Lightweight count probe. Used by the pull cycle to decide whether a follow-up `/memory/get` is needed without paying for the full payload.
 
 ```
-inputs:  none
+query params:
+  group_name      string             scope
+  since           optional ISO       filter received_at > since; returns 0 if absent and group empty
 
 returns:
-  name:           string
-  endpoint:       string
-  memberships:    [{group_name, role}]
+  group_name:           string
+  since:                ISO | null
+  count:                int
+  latest_received_at:   ISO | null
 ```
 
-Authorization: none — every node can query its own info.
+### `GET /memory/events`
+
+**Server-Sent Events (SSE) stream** of `memory.put` events as they happen on this peer. Subscribers connect and hold the connection open; the peer pushes events down as new local memories land.
+
+```
+query params:
+  group_name      string             scope
+
+headers (subscriber):
+  Last-Event-ID   optional ISO       resume from this received_at; absent means replay full history
+
+response:
+  Content-Type: text/event-stream
+  (long-lived; events streamed as they occur)
+
+event format:
+  id: <received_at_iso>
+  event: memory.put
+  data: <full memory record JSON>
+```
+
+Reconnect semantics: subscribers send `Last-Event-ID` on reconnect to resume from their last-applied cursor. The publisher replays from its local store filtered by `received_at > cursor`.
+
+### `GET /peers`
+
+Return the directory of peers known to this node for a given group, with their submission counts and last-seen timestamps (derived from received memories).
+
+### `GET /peers/self`
+
+Return this node's identity — `node_name`, `listen_address`, `version`, configured `memberships`.
+
+### `GET /health`
+
+Liveness probe. Returns `{ok: true, daemon, version, node_name, memberships}`. No authorization.
 
 ### What is NOT in the protocol
 
-The following operations are deliberately absent. Their absence is part of the design:
-
-- **No `broker_request`** — cross-group flow happens by explicit `memory/put` calls by multi-membership nodes, not a special broker verb.
-- **No `subscribe` / `webhook` / `notify` in v0.3.0** — pull-only. Push semantics (subscribe + webhook delivery) added in post-MVP. See §5 Synchronization.
-- **No `delete` / `revoke`** — append-only model for canonical memory. post-MVP may add explicit retraction.
-- **No `promote` / `elevate`** — promotion is just a second `memory/put` call by a multi-membership node. No special verb.
-- **No `role/transfer` / `elect`** — orchestrating node is configured statically; dynamic transfer deferred to post-MVP.
+- **No `subscribe` / `unsubscribe` separate verbs.** SSE subscription is implicit in `GET /memory/events`; disconnect ends it.
+- **No callback-URL webhooks.** Subscribers come to the publisher (SSE), not the other way around. Avoids inbound-listener requirements on subscribers.
+- **No `memory/delete` or `memory/update`.** MVP is append-only.
+- **No `broker_request` / cross-group routing.** Cross-group flow is the responsibility of a multi-membership node making explicit per-group calls.
+- **No authentication tokens.** MVP relies on the local-network deployment as the trust boundary. Auth is part of the enterprise tier (§13).
 
 ---
 
 ## 5. Synchronization
 
-How memories move between peers and the orchestrator. Defines pull, push, watermarks, the promotion queue, and offline behavior.
+How memories propagate across mesh peers. **SSE-primary with a polling safety net.** No persistent queues, no orchestrator-centric pull, no callback subscriptions in the v0.3.0 webhook sense — just long-lived SSE streams between every peer pair, with a slow background pull cycle as belt-and-suspenders.
 
-### 5.1 Sync model
+### 5.1 The model in one paragraph
 
-Constellation is **pull-primary, push-augmented**. Peers read canonical memory from the orchestrator on a schedule (or on demand); the orchestrator can additionally notify peers about new memories in real time when push is enabled.
+Every peer holds its own local store. When peer-A stores a memory, it fans out via SSE to every other peer in the group. Each receiver dedups by content_hash and stores locally with `source=federation` and `origin_node=peer-A`. Receivers do NOT re-fan-out. Subscribers reconnect on drop via `Last-Event-ID`. A periodic pull cycle catches any drift between peers. Convergence is eventual; the only durable state is each peer''s Qdrant collection.
 
-The peer chooses its sync mode in `config.json`:
+### 5.2 The two transports
 
-```json
-{
-  "sync": {
-    "mode": "manual" | "poll" | "push" | "push+poll",
-    "poll_interval_seconds": 30,
-    "auto_apply": true,
-    "auto_promote": true,
-    "failure_verbosity": "verbose"
-  }
-}
-```
+| Channel | Wire shape | Latency | Role |
+|---|---|---|---|
+| **SSE pub/sub** *(primary)* | Each peer exposes `GET /memory/events?group_name=X` as a long-lived `text/event-stream` connection. Every other peer in the group holds an open connection to it. New events stream down as they happen. | Sub-second when both peers online; sub-second on reconnect via `Last-Event-ID` | Real-time delivery; primary path |
+| **Pull cycle** *(safety net)* | Every 60 seconds, each peer calls `GET /memory/since?group_name=X&since=<cursor>` on every other peer; if anything new, pulls via `GET /memory/get?group_name=X&since=<cursor>` | Up to 60s | Belt-and-suspenders; catches any SSE drift |
 
-| Mode | Description | Available |
-|---|---|---|
-| `manual` | No background sync. User/Claude calls `constellation/pull_new` when desired. | v0.3.0 |
-| `poll` | Auto-pull scheduler runs every `poll_interval_seconds`. | v0.3.0 |
-| `push` | Peer subscribes to orchestrator webhooks; pulls on receipt. | post-MVP |
-| `push+poll` | Both. Push for real-time; poll as fallback for missed webhooks. | post-MVP |
+The pull cycle exists to validate that SSE is working correctly in production. After we''ve accumulated evidence that SSE is reliable, the pull cycle can be dropped in a future version.
 
-`auto_apply: true` writes pulled canonicals into the peer's local mem-fusion Qdrant automatically. `auto_promote: true` (the v0.3.0 default) automatically promotes every user-initiated `store_memory` call to the orchestrator for groups this peer is a member of.
+### 5.3 Single Qdrant collection per peer, source-tagged
 
-### 5.2 Pull primitives
+Every peer has **one** Qdrant collection (default `mem_fusion_memories`). Entries are tagged by source:
 
-Two endpoints. Both pull-direction (peer initiates HTTP call to orchestrator). Watermark is a microsecond-precision ISO-8601 timestamp on the canonical's `received_at` field.
+| Tag value | Meaning |
+|---|---|
+| `source=local` | Stored by this peer''s own user (via Claude `store_memory` or `/remember`) |
+| `source=federation` | Received from another peer via SSE fan-out or pull cycle |
 
-#### `GET /memory/since` — lightweight count check *(v0.3.0)*
+Federation entries additionally carry `origin_node` (the original author''s node name, carried through fan-out + pull) and `group_name`. Search across the collection naturally returns both personal and group-shared memories; the user can filter by `source` if desired.
 
-Returns the count of canonicals newer than a watermark, without payloads. Used for cold-boot count display, polling probes, and "is anything new?" checks.
+### 5.4 Cursor model
 
-```
-GET /memory/since?group_name=<str>&since=<iso8601>?
+Each peer tracks a **per-peer cursor** for catch-up: "the latest `received_at` timestamp I''ve observed from this remote peer." Cursors are microsecond-precision ISO-8601 timestamps in the remote peer''s clock. No global ordering, no clock-skew comparisons; each peer maintains a view of every other peer''s log position.
 
-→ 200 {
-    group_name:         str,
-    since:              str | null,
-    count:              int,
-    latest_received_at: str | null
-  }
-```
+The cursor is consumed in two places:
+- As the `Last-Event-ID` header on SSE reconnect
+- As the `since=` parameter on the pull cycle''s `/memory/since` and `/memory/get` calls
 
-If `since` is omitted, returns the total count of canonicals in the group. Useful for fresh peers with no prior watermark.
+Cursor advance rule: **after apply, not after read**. If a batch of memories arrives but only some are successfully stored locally, the cursor advances only to the last successfully-applied entry''s `received_at`. Re-fetching on the next cycle costs a few dedup'd inserts; missing an entry costs convergence.
 
-#### `GET /memory/get` extended with `since` *(v0.3.0)*
+### 5.5 Fan-out (publisher side)
 
-The existing endpoint gains an optional `since` parameter that filters `received_at >= since`. Results are sorted by `received_at` ascending so peers can apply them in order and advance their watermark cleanly.
+When the user stores a memory via Claude on peer-A:
 
-```
-GET /memory/get?group_name=<str>&since=<iso8601>&...
-```
+1. mem_fusion.py calls `core_mem_fusion.store_memory(...)` which inserts into peer-A''s Qdrant with `source=local`.
+2. constellation.py, polling `core.get_new_entries_since(cursor, source_filter="local")` every ~1 second, detects the new entry.
+3. constellation.py broadcasts the entry as an SSE event to every currently-connected subscriber (peer-B, peer-C, …).
+4. Each SSE event carries the full memory record (content + 768-dim vector + payload + provenance) with `id: <received_at_iso>` and `event: memory.put`.
 
-Combines with `id` (still wins if both provided) and future semantic-search `query`. Pagination via continuation cursor deferred to a future version.
+If a subscriber connection is currently down, the event is **not** queued — the subscriber will resume on reconnect with `Last-Event-ID`, and the pull cycle catches anything missed.
 
-### 5.3 Watermarks and cold start
+### 5.6 SSE subscription (subscriber side)
 
-Each peer maintains a `last_synced_at` watermark per group, persisted in `peer_state.json` (§5.5). On sync:
+Each peer establishes one outbound SSE subscription to every other peer in the group. The subscriber:
 
-```
-last_applied = last_synced_at
-for memory in pull_response.memories:  # already sorted by received_at asc
-    upsert(memory)                      # idempotent by canonical_id
-    last_applied = max(last_applied, memory.received_at)
-last_synced_at = last_applied
-```
+1. Opens `GET /memory/events?group_name=X` with `Last-Event-ID: <cursor>` header.
+2. Reads `text/event-stream` lines as they arrive, parses each event.
+3. On `event: memory.put` with full record payload, calls `core.store_memory(..., source="federation", origin_node=<from event>)` to insert into the local collection. Content_hash dedup means a memory already known via another path becomes a no-op.
+4. Advances the per-peer cursor to the just-applied `received_at`.
+5. On disconnect: waits with exponential backoff (2s, 5s, 10s, then 30s indefinitely), then reconnects with the current cursor as `Last-Event-ID`.
 
-**Cold start** (no prior `last_synced_at`): peer omits the `since` parameter, pulls the full corpus for the group, applies in order, sets the watermark to the highest `received_at` returned. From there, every subsequent pull is incremental.
+### 5.7 Pull cycle (belt-and-suspenders)
 
-### 5.4 Push notifications *(post-MVP)*
+Every 60 seconds, each peer runs a pull cycle against every other peer in the group:
 
-When a new canonical lands via `/memory/put`, the orchestrator fires a webhook to every active subscription for that group.
+1. `GET /memory/since?group_name=X&since=<cursor>` → count of new memories on the remote peer
+2. If count > 0: `GET /memory/get?group_name=X&since=<cursor>` → fetch records
+3. For each record: same dedup + insert as SSE handler
+4. Advance per-peer cursor
 
-#### `POST /peers/subscribe`
+This catches drift in three plausible failure modes: (a) SSE bug we haven''t found yet, (b) network corruption silent enough to evade TCP checksums, (c) subscriber cursor accidentally lost (state file corruption). At MVP scale, the pull cycle is cheap and gives us strong eventual-consistency guarantees while SSE is still earning trust.
 
-```
-body: {
-  group_name:      str,
-  callback_url:    str,
-  callback_secret: str?       // HMAC secret for body verification
-}
+### 5.8 Failure surfacing
 
-→ 200 {
-    subscription_id: str,
-    registered_at:   str
-  }
-```
-
-The orchestrator sends a synchronous `subscription.test` event to verify the callback URL is reachable; on failure rolls back the subscription and returns 502.
-
-#### `DELETE /peers/subscribe` and `GET /peers/subscriptions`
-
-Unsubscribe and list-active. Standard CRUD surface.
-
-#### Webhook delivery to the peer
-
-```
-POST <callback_url>
-Headers:
-  Content-Type: application/json
-  X-Constellation-Event:        memory.put | subscription.test
-  X-Constellation-Signature:    hmac-sha256-hex(callback_secret, body)
-  X-Constellation-Subscription: <subscription_id>
-  X-Constellation-Delivery:     <unique_delivery_id>    // for idempotency
-
-body: {
-  event:         "memory.put",
-  group_name:    str,
-  canonical_id:  str,
-  content_hash:  str,
-  origin_node:   str,
-  received_at:   str,
-  summary:       str    // first ~80 chars of content
-}
-```
-
-**Delivery semantics:**
-- **At-least-once.** Idempotency via `X-Constellation-Delivery` header — peer dedupes.
-- **Asynchronous.** `/memory/put`'s response is not blocked on webhook delivery.
-- **Retry schedule:** 1m, 5m, 30m, 2h, 12h (5 attempts). After all fail, subscription is marked degraded; peer can re-subscribe to reset.
-- **Eventual consistency:** Even with complete webhook failure, the peer's pull cycle recovers via `/memory/since` + `/memory/get?since=...`.
-- **No ordering guarantee.** Webhooks for puts A and B may arrive in either order. Peer applies idempotently using `canonical_id` as the key.
-
-### 5.5 Peer state file
-
-`<state_dir>/peer_state.json`. Atomic write (temp + rename). One entry per group.
-
-```json
-{
-  "schema_version": 1,
-  "groups": {
-    "wp2-test-group@dev": {
-      "orchestrator_url":       "http://127.0.0.1:7533",
-      "last_synced_at":         "2026-05-12T02:19:03.938230Z",
-      "last_check_at":          "2026-05-12T02:30:00.000000Z",
-      "pending_count":          0,
-      "orchestrator_reachable": true,
-      "consecutive_failures":   0,
-      "last_failure_at":        null,
-      "last_failure_reason":    null,
-      "subscription_id":        null,
-      "callback_url":           null
-    }
-  }
-}
-```
-
-`last_synced_at` is the sync cursor. `last_check_at` is the most recent `/memory/since` call (separate from the watermark). `pending_count` is the latest known delta — what SessionStart surfaces.
-
-### 5.6 Auto-promotion
-
-`auto_promote: true` (v0.3.0 default) means every `store_memory` call automatically attempts to push the new memory to the orchestrators of every group the peer is a member of. This makes group memory sharing the path of least friction — the user says "remember X," mem-fusion stores locally AND promotes.
-
-The store response always includes a `promoted_to` array showing per-group outcomes:
-
-```json
-{
-  "status":   "stored",
-  "local_id": "026bfa91-...",
-  "promoted_to": [
-    {"group_name": "engineering@branch", "status": "stored",     "canonical_id": "e98037dc-..."},
-    {"group_name": "mobile@branch",       "status": "queued",     "reason":       "ConnectionRefusedError"}
-  ]
-}
-```
-
-Statuses: `stored`, `duplicate`, `queued` (transient failure, will retry), `queue_full` (queue at cap, see §5.7), `failed` (4xx from orchestrator — non-retryable).
-
-### 5.7 Promotion queue
-
-When auto-promote can't reach the orchestrator (network error or 5xx), the promotion is written to `<state_dir>/queue/<group>/<timestamp>-<content_hash>.json`:
-
-```json
-{
-  "queued_at":           "2026-05-12T02:30:00.123456Z",
-  "group_name":          "wp2-test-group@dev",
-  "orchestrator_url":    "http://127.0.0.1:7533",
-  "memory_record":       { ... full /memory/put body ... },
-  "provenance":          { ... },
-  "attempt_count":       0,
-  "last_attempt_at":     null,
-  "last_failure_reason": null
-}
-```
-
-**Queue limits:**
-- **Per-peer max: 100 queued entries.** Practical maximum at expected ~5-10 promotions/day = ~2 weeks of orchestrator outage.
-- **Behavior when full:** new promotions are rejected with `status: "queue_full"` in the `store_memory` response. Local memory is still stored. User/Claude sees the cap loudly and can investigate (orchestrator down? misconfigured? legitimate outage?).
-- **Orphaned group queues** (queue files for a group no longer in `config.json` memberships): left alone. No auto-cleanup in v0.3.0. Manual `rm -rf` if it ever matters.
-
-The queue is Constellation-owned and lives separately from mem-fusion's existing `~/.local/share/mem-fusion/queue/` (which handles Ollama-fallback for the local store). The two queues drain on different conditions.
-
-### 5.8 Drain semantics
-
-The same scheduler that runs pull cycles also drains the promotion queue.
-
-```
-Every poll_interval_seconds:
-  1. Pull cycle (§5.2)
-     - If orchestrator unreachable, record failure in peer_state.json,
-       skip drain for this group this cycle.
-  2. Drain cycle:
-     For each <group>/*.json in queue dir:
-       POST orchestrator_url/memory/put with the queued body
-       ├─ 200  (stored or duplicate)  → delete queue file
-       ├─ 4xx  (real error)            → move to queue/failed/<group>/, log,
-       │                                  surface in next SessionStart
-       └─ 5xx / network                → leave in queue, increment attempt_count,
-                                          retry next cycle
-  3. Update peer_state.json atomically
-```
-
-**Drain triggers:**
-- Every `poll_interval_seconds` (scheduled)
-- Opportunistic: immediately after a successful pull (suggests the orchestrator just came back)
-- Manual: `constellation/sync_now` MCP tool
-
-**No exponential backoff for v0.3.0.** Fixed cadence. If failure rate becomes a real problem (consecutive_failures > 60, ~30 minutes of failures), SessionStart surfaces a clear warning so the user can act.
-
-### 5.9 Offline behavior and failure surfacing
-
-**Every failed delivery attempt is communicated to the user/Claude.** This is intentional instrumentation for v0.3.0 and post-MVP — we don't yet have empirical data on baseline network reliability, so we err on the side of loud rather than silent. Silent retries can mask real bugs.
+Every failed delivery attempt is communicated to the user / Claude. This is intentional instrumentation for MVP — we don''t yet have empirical data on baseline network reliability. Defaults can be tuned in a future version after observation periods.
 
 Four channels surface failures:
 
 | Channel | When | Carries |
 |---|---|---|
-| Synchronous `store_memory` response | Immediate, same MCP call | `promoted_to: [{group, status, reason?}]` per group |
-| `peer_state.json` | Updated every pull/drain cycle | `consecutive_failures`, `last_failure_at`, `last_failure_reason` per group |
-| SessionStart hook (mem-fusion) | At the start of every Claude session | Aggregated state from `peer_state.json` and queue dir |
-| `<state_dir>/logs/peer-client.log` | Continuous append from the scheduler | Every drain attempt's outcome with full reason |
+| `store_memory` response `delivered_to[]` | Synchronously on store | Per-peer status: `delivered` (SSE push succeeded), `unreachable` (peer offline; pull cycle will catch up) |
+| `peer_state.json` | Updated every pull/drain cycle | `consecutive_failures`, `last_failure_at`, `last_failure_reason` per remote peer |
+| SessionStart hook | Start of every Claude session | Aggregated peer reachability summary in the `<memfusion_status>` block |
+| `<state_dir>/logs/peer-client.log` | Continuous append | Every reconnect, every pull cycle outcome |
 
-A failure doesn't vanish in one channel — it's persisted in state and shows up at session start until resolved.
+### 5.9 Known limitations and the migration path
 
-**Future configurability.** Once stability has been empirically demonstrated (likely after a multi-week real deployment with logged failure baselines that look like noise rather than signal), the noise can be tuned:
+These limitations are accepted for the MVP and are part of why the mesh model is positioned for small teams:
 
-```json
-{
-  "sync": {
-    "failure_verbosity": "verbose" | "summary" | "errors-only" | "silent"
-  }
-}
-```
-
-For v0.3.0 and post-MVP the value is fixed at `verbose`. Promoting `summary` or `errors-only` to a release is a deliberate decision made against observed failure-rate data, not a default to enable preemptively.
-
-### 5.10 Known limitations
-
-- **Same-microsecond `received_at` collisions.** Two canonicals landing in the exact same microsecond would be indistinguishable by the `since=<µs>` cursor — a peer could miss one. For a single-threaded HTTP daemon serializing PUTs (the v0.3.0–post-MVP design), this is structurally impossible: each PUT path takes hundreds of microseconds to single-digit milliseconds, so microseconds give ~1000× headroom. The limitation surfaces only if the daemon ever becomes multi-threaded or if multiple orchestrators serve the same group with clock skew. Mitigation at that point: per-group monotonic `sequence_number` payload field as the internal ordering primitive, with timestamps remaining the wire-protocol cursor.
-- **No bulk-fetch pagination.** A peer offline a month coming back to a large canonical could receive a multi-MB `/memory/get?since=...` response. Acceptable for current scale (≤500 canonicals per group, ~6KB each). Pagination via continuation cursor is reserved for a future version when real workloads hit it.
-- **No automatic queue cleanup on membership change.** Removing a group from `memberships` leaves any pending promotions in `<state_dir>/queue/<group>/` untouched. Manual cleanup.
-- **Webhook delivery is best-effort.** After 5 retries spanning ~15 hours, the orchestrator gives up on a webhook subscription. Peers must re-subscribe to recover. Pull-fallback remains the durable path; webhooks are an optimization for real-time, not the system of record.
-
-### 5.11 MCP tool surface for sync
-
-Peer-side MCP tools, in addition to the existing four protocol tools:
-
-| Tool | Args | Returns | Version |
-|---|---|---|---|
-| `constellation/check_new` | `group_name` | `{count, since, latest_received_at}` — uses peer's current watermark | v0.3.0 |
-| `constellation/pull_new` | `group_name`, `auto_apply?` | `{count_pulled, applied, new_watermark}` | v0.3.0 |
-| `constellation/sync_status` | `group_name?` | Per-group state from `peer_state.json` + queue summary | v0.3.0 |
-| `constellation/sync_now` | `group_name?` | Force immediate pull + drain cycle. Returns same shape as `sync_status`. | v0.3.0 |
-| `constellation/subscribe` | `group_name` | `{subscription_id}` — registers webhook, starts listener if needed | post-MVP |
-| `constellation/unsubscribe` | `group_name` | `{ok}` | post-MVP |
-
-Tools read `last_synced_at` from `peer_state.json` automatically. Claude doesn't pass watermarks explicitly.
-
-### 5.12 Cold-boot walk-through
-
-Peer-c boots up after 3 hours offline.
-
-```
-1. launchd loads com.branchapp.memfusion.constellation-pull
-   (RunAtLoad=true, StartInterval=poll_interval_seconds)
-2. constellation_pull.py first run:
-   a. Read config.json → memberships, sync settings
-   b. Read peer_state.json → last_synced_at per group
-   c. For each peer-role group:
-      GET orchestrator_url/memory/since?since=<watermark>
-        → {count: 7, latest_received_at: "2026-05-12T05:30:00.000Z"}
-      If auto_apply:
-        GET orchestrator_url/memory/get?since=<watermark>
-        Apply 7 records to local Qdrant (mem_fusion_memories)
-        Advance last_synced_at = max(received_at)
-   d. Drain queue (§5.8). No queued entries for this group → noop.
-   e. Write peer_state.json atomically.
-3. User opens Claude Code at some point later
-4. SessionStart hook reads peer_state.json + queue dir, surfaces:
-     <memfusion_status>
-       Group memory: 7 new in wp2-test-group@dev (auto-applied)
-       Recent activity: ...
-     </memfusion_status>
-5. Claude has 7 new memories in semantic-search range. User asks
-   "what did the team learn while I was away?" → search returns the new
-   content tagged source=constellation-pull / origin_node=mem-fusion-peer-b.
-```
-
-When the orchestrator is unreachable at boot:
-
-```
-1-2 as above
-2c. GET /memory/since fails → record orchestrator_reachable=false,
-    last_failure_reason="ConnectionRefusedError"
-2d. Drain skipped (orchestrator unreachable).
-3. User opens Claude Code
-4. SessionStart surfaces:
-     <memfusion_status>
-       Group memory:
-         wp2-test-group@dev: orchestrator unreachable for 14 min
-         (last error: ConnectionRefusedError)
-         Queued promotions: 2 — will retry on next sync cycle (30s)
-     </memfusion_status>
-5. Claude knows about the outage. User can call constellation/sync_now
-   to attempt an immediate retry, or wait for the scheduled cycle.
-```
-
-### 5.13 Storage hygiene — where pulled memories live on the peer
-
-Pulled canonicals are written into the peer's local `mem_fusion_memories` collection — the same Qdrant collection that holds personal memories. They are not segregated into a separate group-only collection.
-
-**Tagging:** every pulled canonical's payload includes:
-- `source: "constellation-pull"`
-- `group_name: <group>`
-- `origin_node: <node_name>` (carried over from the canonical's provenance)
-
-**Why same collection:** semantic search returns both personal and group content together, ranked by relevance. The user (or Claude) is searching for *what they need*, not *which store it came from*. The tag enables optional filtering (`source=constellation-pull` to see only group content) without making "find the relevant memory" require a multi-store query.
-
-**Idempotency:** the local upsert uses `canonical_id` as the point id. Re-running a pull (after a crash, after a retry) is a no-op for any memory already applied.
+| Limitation | When it bites | Migration path |
+|---|---|---|
+| **Mesh fan-out is O(N) per store** | At ≤10 peers: 9 outbound calls per store, trivial. At ≥30 peers: 29 outbound calls per store, becomes painful on slow networks. | Enterprise tier (§13) introduces hub-and-spoke or orchestrator-centric topology that converts O(N) into O(1) per store from the origin''s perspective. |
+| **Every peer holds the full group corpus** | At MVP scale (few MB per group): fine. At enterprise scale (GB per group): expensive. | Enterprise tier supports tiered storage and selective replication. |
+| **Subscriber connections are O(N²) across the group** | At ≤10 peers: 90 TCP connections in the group total, fine. At ≥50: 2,450 connections. | Enterprise tier with hub topology drops this to O(N). |
+| **No authentication / TLS** | LAN-only deployment makes this OK for MVP. | Enterprise tier adds mTLS or token-based auth. |
+| **No multi-group membership per peer** | MVP enforces single-group per node. | Enterprise tier supports multi-membership. |
+| **Same-microsecond `received_at` collisions** | Single-threaded HTTP daemon serializing PUTs makes this structurally impossible at MVP scale. | If concurrency becomes real, add sequence_number payload field as the cursor instead of received_at. |
 
 ---
 
 ## 6. Process Architecture
 
-Two daemons, one machine.
+The system uses a **dual-client architecture** over a shared core library:
 
 ```
-LOCAL MACHINE
-│
-├── Qdrant                        (shared infrastructure)
-│   ├── mem_fusion_memories               ← Mem-Fusion's collection (personal)
-│   └── mem_fusion_canonical_memories     ← Constellation's collection (group)
-│
-├── Ollama                        (shared embedding service)
-│
-├── Mem-Fusion daemon             ◄── PROCESS 1
-│   • MCP transport: stdio (per-session subprocess spawned by Claude)
-│   • Bound to: nothing (no network)
-│   • Tool surface: all 8 memory tools, local-only
-│   • Storage: mem_fusion_memories
-│   • Lifecycle: spawned per Claude session, killed at session end
-│   • UNCHANGED from v0.1.0
-│
-└── Constellation daemon          ◄── PROCESS 2 (NEW in v0.3.0)
-    • MCP transport: HTTP/SSE, persistent
-    • Bound to: configured network interface (default 127.0.0.1 for v0.3.0; LAN/WAN later)
-    • Tool surface: constellation/memory/put|get, peers, peers/self
-    • Storage: mem_fusion_canonical_memories
-    • Lifecycle: managed by launchd (com.branchapp.memfusion.constellation)
-    • Access control: localhost-only by default; expanded with explicit network bind
+                    ┌──────────────────────────────┐
+                    │      core_mem_fusion.py      │
+                    │  (memory functions on top    │
+                    │   of Qdrant; the actual      │
+                    │   logic lives here)          │
+                    │                              │
+                    │  store_memory()              │
+                    │  search_memory()             │
+                    │  upsert_memory()             │
+                    │  get_new_entries_since(cur)  │
+                    │  content_hash(), iso_now()   │
+                    └─────────────┬────────────────┘
+                                  │
+                                  ▼
+                              ┌─────────┐
+                              │ Qdrant  │
+                              │ (single │
+                              │  per-   │
+                              │  peer   │
+                              │  store) │
+                              └─────────┘
+                                  ▲
+                ┌─────────────────┼─────────────────┐
+                │                                   │
+                ▼                                   ▼
+        ┌──────────────────┐               ┌──────────────────┐
+        │  mem_fusion.py   │               │ constellation.py │
+        │  (Claude proxy)  │               │ (peer-net proxy) │
+        │                  │               │                  │
+        │  stdio MCP       │               │  HTTP server +   │
+        │  per Claude      │               │  SSE pub/sub     │
+        │  session         │               │  Always-on       │
+        │                  │               │  launchd daemon  │
+        │  Calls core      │               │  Calls core      │
+        │  functions to    │               │  functions to    │
+        │  serve Claude    │               │  serve peers     │
+        │  tool requests   │               │  + run mesh      │
+        │                  │               │  synchronization │
+        └──────────────────┘               └──────────────────┘
 ```
 
-### Why two daemons
+### 6.1 The shared library: `core_mem_fusion.py`
 
-1. **Lifecycle mismatch.** Mem-Fusion only needs to exist while Claude is using it (stdio subprocess). Constellation needs to be reachable when no local Claude is active (persistent daemon).
+A pure-Python module that wraps Qdrant for the project''s memory operations. Includes:
+- All memory CRUD functions (store, search, upsert, delete, get_related, etc.)
+- The cross-client notification primitive: `get_new_entries_since(cursor, source_filter, limit)`
+- Shared constants (VECTOR_SIZE=768, EMBED_MODEL="nomic-embed-text", collection name)
+- The content_hash function (single source of truth, used by both clients)
+- The Ollama embedding helper
 
-2. **Process isolation.** Constellation has no in-process access to Mem-Fusion's memory tools. A bug or compromise in Constellation cannot corrupt or exfiltrate local memory.
+Critical invariant: **the same `content_hash` function is used everywhere**. If it ever diverges, dedup breaks across clients.
 
-3. **Independent deployment.** Each daemon can be upgraded, restarted, or disabled independently. Users can run Mem-Fusion-only for personal memory or Constellation-only for federation gateway deployments.
+### 6.2 Client 1: `mem_fusion.py` — Claude proxy
 
-4. **Clean security model.** Network exposure is opt-in by enabling Constellation. Mem-Fusion has zero network footprint, ever.
+A thin MCP server using stdio transport. Spawned by Claude Code per session. Registers nine MCP tools (`store_memory`, `search_memory`, `search_recent`, `upsert_memory`, `find_or_create`, `delete_memory`, `get_related`, `memory_stats`, `export_record`) and delegates each one to a corresponding `core_mem_fusion` function. Adds no business logic of its own.
 
-### Claude's view
+Lifecycle: ephemeral. When Claude session ends, the process exits.
 
-Claude on the local machine connects to BOTH daemons as MCP servers:
+### 6.3 Client 2: `constellation.py` — peer-network proxy
 
-```
-claude mcp list:
-  mem-fusion        stdio    <command>  ✓ Connected
-  constellation     http     http://127.0.0.1:7433  ✓ Connected
-```
+An always-on HTTP daemon under launchd management. Runs on every node by default — there is no "orchestrator vs peer" install distinction. Responsibilities:
+- Expose HTTP endpoints for peer-to-peer federation (§4)
+- Maintain SSE subscriber connections out to every other peer in the group
+- Maintain SSE subscriber registry for inbound connections from other peers
+- Run the publisher loop (poll core every ~1s for new `source=local` entries; broadcast via SSE)
+- Run the pull cycle every 60s (catch any drift)
+- Persist per-peer cursor state in `<state_dir>/peer_state.json`
 
-The user (via Claude) is the bridge. To share a memory to a group: explicitly call both `mem-fusion`'s `store_memory` (local copy) and `constellation`'s `memory/put` (group canonical). No automatic propagation between the two.
+Lifecycle: persistent. Survives Claude sessions; restarts via launchd `KeepAlive`.
+
+### 6.4 No IPC between siblings
+
+The two clients **do not communicate with each other directly**. There is no socket, pipe, signal, or HTTP loopback between them. They communicate exclusively through their shared Qdrant collection.
+
+When mem_fusion writes a memory locally, constellation observes the change on its next poll cycle (~1s) via `core.get_new_entries_since()`. No notification needed; the storage layer is the rendezvous.
+
+This decoupling means:
+- Either client can crash, restart, or upgrade without affecting the other
+- New clients (a web UI, a Slack bot, an alternate LLM adapter) can be added by importing `core_mem_fusion` — no protocol negotiation with existing clients
+- Tests can hit `core_mem_fusion` directly without spinning up either transport
+
+### 6.5 Why not collapse into one daemon
+
+Two reasons the dual-process model is preserved instead of collapsing everything into one always-on HTTP server:
+
+**Lifecycle and transport mismatch.** Claude Code uses stdio MCP — spawn-per-session, no shared state between sessions. Peers use HTTP MCP — always-on, network-bound. Mixing both transports in one process forces compromises in both directions.
+
+**Security isolation.** mem_fusion.py is stdio-only and localhost-only; it cannot be reached from the network at all. constellation.py is HTTP-bound and listens on a configurable interface (default loopback, optionally LAN). Process isolation means even a compromised constellation has only the surface area constellation exposes — it cannot escalate to Claude''s personal-memory surface.
 
 ---
 
 ## 7. Storage Model
 
-Each group's canonical memory lives in **one Qdrant collection on the orchestrating node's machine**.
+One Qdrant collection per peer, holding all memory the peer knows about (personal and group-shared), distinguished by tags.
 
-For a group orchestrated by node `eng-mgr-mac`:
-- Collection: `mem_fusion_canonical_memories` (with `group_name` payload field)
-- Or: per-group collections like `mem_fusion_canonical_engineering`
-
-(v0.3.0 implementation choice TBD: single collection with `group_name` filter vs. one collection per orchestrated group. Single-collection is simpler; per-group is cleaner. Decide at implementation time.)
-
-Memory records carry these payload fields:
+### 7.1 Collection schema
 
 ```
-{
-  "content":         string,
-  "type":            enum,
-  "tags":            list[string],
-  "importance":      int,
-  "group_name":      string,             which group this belongs to
-  "submitted_by":    node_name,          which node originally submitted
-  "submitted_at":    ISO timestamp,
-  "provenance":      optional object,    if promoted from another group:
-                                         { "origin_group": "...", "promoted_by": "...", "promoted_at": "..." }
-  "content_hash":    string              for dedup
-}
+collection: mem_fusion_memories   (env var MEMFUSION_COLLECTION can override)
+  vectors:        768-dim, cosine distance
+  payload indexes:
+    content_hash      keyword       # dedup
+    type              keyword       # decision, fact, preference, error, code, context, session
+    project           keyword       # multi-tenant tag (mem-fusion native)
+    source            keyword       # local | federation
+    origin_node       keyword       # author identity (federation entries only)
+    group_name        keyword       # group scope (federation entries only)
+    session_id        keyword       # links to Claude session
+    importance        integer       # range filters for min_importance
+    received_at       datetime      # microsecond ISO; cursor for sync
+    timestamp         datetime      # original-author clock (immutable)
 ```
 
-The orchestrating node owns this storage and is the single source of truth for the group's canonical memory.
+### 7.2 Entry kinds in the single collection
 
-### Multi-orchestration
+| Kind | Tags | Sourced by |
+|---|---|---|
+| Personal memory | `source=local`, no `group_name` or `origin_node` | mem_fusion calls from Claude (store_memory, /remember, hook captures) |
+| Group memory received from another peer | `source=federation`, `origin_node=<author>`, `group_name=<scope>` | constellation receiving an SSE event or pull-cycle response |
+| (Optional) Personal memory tagged for sharing | `source=local`, `group_name=<scope>` | Personal store that''s also been broadcast to the group (the fan-out source itself stores its own copy as `source=local` first; recipients get `source=federation` copies) |
 
-A node that orchestrates multiple groups serves multiple canonical stores. Each group's storage is namespaced (via collection or payload filter). The node's Constellation daemon handles requests for any of its orchestrated groups, dispatching to the right backing store.
+Search across the collection returns all three kinds together, ranked by semantic similarity. The `source` tag is a payload filter the user can opt into for hygiene (e.g., "only show me the team''s shared knowledge, not my personal notes").
+
+### 7.3 Single source of truth, no replication
+
+Each peer''s Qdrant collection is **its own canonical** for the memories it holds. There is no "replication" between peers — instead, mesh fan-out propagates memories so that every peer''s collection independently converges to the same content via content_hash dedup. Different peers may have memories in slightly different orders or with slightly different `received_at` timestamps (since each peer stamps with its own clock on insert), but the content and original `origin_node` attribution are byte-identical across peers once propagation completes.
+
+This model is what makes the mesh resilient: any single peer''s Qdrant disappearing does not lose the group''s state. As long as at least one peer in the group still has the memory in its local collection, the memory survives and propagates to peers that lost it.
 
 ---
 
@@ -853,7 +667,52 @@ When the task force disbands, Alice removes the membership from her config. Her 
 
 ---
 
-## 13. Open Questions
+## 13. Enterprise tier — at-scale design (post-MVP)
+
+The MVP is positioned for **small teams: ≤10 peers per group, single local network**. Multiple architectural decisions trade away scale to keep the MVP simple, debuggable, and self-sufficient. The following capabilities are deliberately deferred and represent a future **commercial enterprise tier** for organizations operating at scale.
+
+### 13.1 What MVP gives up to stay simple
+
+| MVP choice | Scale ceiling | Enterprise version |
+|---|---|---|
+| Mesh fan-out (every store → N-1 outbound calls) | ≤10 peers per group; N=30 starts to feel slow | Hub-and-spoke topology: orchestrating node(s) hold the canonical; peers push once to the hub, pull from the hub. Per-store cost from origin is O(1). |
+| Every peer holds the full group corpus | Few-MB scale | Tiered storage: hot tier on peers, cold tier on shared/managed storage. Selective replication based on access patterns. |
+| O(N²) SSE connections within the group | ≤10 peers (≤90 connections) | Centralized broker (NATS, cloud pub/sub, or managed broker) reduces per-peer connections to O(1) at the cost of an external dependency. |
+| Local-network-only deployment, no auth | LAN scope | mTLS, IAM-backed auth, audit logging, multi-tenant isolation. Cloud-hosted brokers handle WAN traversal and NAT. |
+| Single-group membership per peer | One project / one team | Multi-group membership with cross-group routing rules and per-group policies. |
+| No conflict resolution beyond content_hash dedup | Single-threaded peers; rare concurrent same-content writes | Vector clocks or sequence numbers; explicit conflict resolution for `upsert_memory` style mutations. |
+| `received_at` cursor (microsecond ISO timestamps) | Single-orchestrator concurrency model | Per-group monotonic `sequence_number` assigned by the canonical; survives multi-threaded orchestrator implementations. |
+| No replication / no canonical copy beyond peers' own stores | Group is "alive" only as long as ≥1 peer is online | Managed durable storage tier; group state persists independent of peer availability. |
+
+### 13.2 Why deferring this is the right call
+
+Each enterprise capability above has a real implementation cost, a real ongoing operational cost (broker management, IAM setup, storage tiering), and a real complexity cost in the protocol and code. For ≤10 person teams on a LAN, those costs aren't repaid by value. Building them into the MVP would slow shipping, complicate the install story, and lock in design decisions before we've learned anything from real usage.
+
+The MVP exists to **validate the core product hypothesis**: that small teams want shared AI memory and will use it if it's frictionless to install and intuitive to operate. Until that's validated, scaling work is premature optimization.
+
+### 13.3 The commercial wedge
+
+The enterprise tier is the natural product split:
+
+- **MVP / Open source**: small teams, LAN deployments, self-contained install, no external services, no recurring cost.
+- **Enterprise**: managed deployment, cross-WAN federation, mTLS auth, audit logs, multi-tenant isolation, IAM-backed access control, per-group policy enforcement, durable group state independent of peer uptime. Paid offering.
+
+This split is what makes the MVP architectural simplifications acceptable. We're not building "the cheap version of the real product." We're building the right product for small teams, and reserving the operational complexity for the population that needs it and can pay for it.
+
+### 13.4 Migration path
+
+Each MVP design decision maps to a non-disruptive enterprise upgrade path:
+
+- **Mesh → hub-and-spoke**: peers' fan-out targets become a single orchestrator URL instead of a peer list. No protocol changes; only configuration.
+- **`received_at` cursor → `sequence_number` cursor**: the wire protocol stays cursor-based; the cursor format becomes opaque (peers don't interpret it; just pass it back).
+- **No auth → mTLS**: HTTP endpoints add TLS termination; client certificates carry node identity. Wire protocol shapes don't change.
+- **Single group → multi-group**: configuration adds `memberships[]` entries; runtime adds membership lookup; protocol stays group-scoped.
+
+The MVP isn't a throwaway. It's the foundation; the enterprise tier adds operational features on top without rewriting the core.
+
+---
+
+## 14. Open Questions
 
 The following are known unresolved decisions. They don't block v0.3.0 implementation but should be settled before v0.3.0 ships:
 
@@ -871,7 +730,7 @@ The following are known unresolved decisions. They don't block v0.3.0 implementa
 
 ---
 
-## 14. What Constellation is NOT
+## 15. What Constellation is NOT
 
 Closing with a clear list of things Constellation deliberately is not, so future contributors don't try to bend it into them:
 

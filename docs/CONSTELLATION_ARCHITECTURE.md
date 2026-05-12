@@ -10,7 +10,7 @@
 
 **Constellation enables group memory across multiple Mem-Fusion nodes.** Where Mem-Fusion gives Claude long-term memory across sessions on one machine, Constellation lets that memory federate across machines — sharing curated knowledge between team members' AI agents while preserving each member's personal memory privacy.
 
-Constellation is bundled with Mem-Fusion (same repo at `src/`) but runs as a **separate daemon process** with its own HTTP server. Both daemons are clients of a shared `core_mem_fusion` library that operates on a single Qdrant collection per peer — see §6 Process Architecture. The two daemons serve different audiences:
+Constellation is bundled with Mem-Fusion (same repo at `src/`) but runs as a **separate daemon process** with its own HTTP server. Both daemons are clients of a shared `core_mem_fusion` library that operates on a single Qdrant collection per peer — see §7 Process Architecture. The two daemons serve different audiences:
 
 | | Mem-Fusion (`mem_fusion.py`) | Constellation (`constellation.py`) |
 |---|---|---|
@@ -26,7 +26,74 @@ Both daemons read and write the same Qdrant collection through `core_mem_fusion`
 
 ---
 
-## 2. Object Model
+## 2. Primary use cases
+
+Mem-Fusion + Constellation serves two scenarios. The first is the dominant case the system is designed around; the second is the natural extension that uses the same architecture without modification.
+
+### 2.1 Primary use case — one user, multiple machines
+
+The most common scenario: **a single developer using Claude Code on more than one machine.** A laptop and a desktop. A work machine and a home machine. A primary workstation and a server they SSH into. Without federation, every machine is its own memory island — what Claude learns on the laptop is invisible to Claude on the desktop. The user has to manually re-establish context every time they switch machines.
+
+Constellation closes this gap. The user''s own machines form a small group (typically 2-4 peers). Memories stored on any one machine propagate to the others automatically. The user gets one continuous Claude memory across all the devices they work from.
+
+**Why this is the primary case:**
+
+- Most developers work across multiple devices already (laptop ↔ desktop is the default; remote development is increasingly common)
+- It''s the direct multi-device extension of Mem-Fusion''s value proposition (long-term memory across sessions → long-term memory across machines)
+- It solves a pain point every multi-device user has experienced
+- It validates the federation architecture end-to-end without needing collaboration semantics
+- It''s the lowest-friction adoption path: no team coordination, no permission negotiation, no "convince colleagues to install something" friction
+- Privacy concerns are trivial in this case — it''s all one person''s memory; everything is "shared" with themselves by definition
+
+**Architectural shape for this case:**
+
+- The user''s machines form a Constellation group named for the user (e.g., `mitch@personal` or `self@dev-machines`)
+- Each machine runs the standard install: Mem-Fusion + Constellation, same software stack
+- The group''s peer list is the user''s machines
+- Configurations are identical across machines except for `node_name` and `listen_address`
+- New machines join by adding them to the peer list and restarting Constellation on existing peers — no migration, no coordination, no central authority
+
+### 2.2 Secondary use case — small team, shared knowledge
+
+The same architecture extends to teams: multiple users, each with one or more machines, all participating in a shared group. Bounded at approximately ten peers per group at MVP scale (per the mesh-topology cost analysis in §4).
+
+The protocol doesn''t distinguish between the two cases. A "group" is just a named set of peers; whether those peers all belong to one person or to many, the wire protocol and storage model are identical.
+
+**The natural progression from single-user to team:**
+
+1. Solo: one user, one machine. Personal Mem-Fusion only. No Constellation needed.
+2. Multi-device: same user, second machine added. Set up Constellation on both, each lists the other in the peers config. Memory syncs across the user''s two machines.
+3. Team: invite a colleague. Add their machine to the peer list (and they add yours to theirs). The colleague''s memories now appear in the group; the user''s memories appear in the colleague''s group. Up to ~10 peers, the cost stays trivial.
+
+Same install procedure at every step. Same config schema. Adding the third machine (whether your own or a colleague''s) is the same operation. The "team" case is just "more peers in the group."
+
+### 2.3 What changes between the use cases
+
+| Concern | Single user (primary) | Team (secondary) |
+|---|---|---|
+| Privacy of personal vs shared | Trivial — everything is the user''s; no distinction needed in practice | Real — the `source=local` vs `source=federation` distinction matters; users want to know what came from team vs themselves |
+| Trust model | User trusts their own machines | Each member trusts every other member of the group equally |
+| Setup ceremony | One person edits configs on their own machines | A "group setup coordinator" picks the group name + gathers peer URLs + distributes config |
+| Author attribution (`origin_node`) | "Which of my machines first stored this" — useful for debugging | "Which colleague wrote this" — critical for context |
+| Typical mesh size | 2–4 | Up to ~10 |
+| Concurrent-write conflicts | Rare (single user, occasionally same content from two devices) | Slightly higher (multiple users may store similar content) — content_hash dedup handles both cases |
+
+The architecture handles both use cases with the same mesh + content_hash dedup + source-tagged storage. No code paths differ based on which case is in play.
+
+### 2.4 Why this framing matters for product positioning
+
+The single-user multi-machine case is the most common scenario and the lowest-friction adoption path. Treating it as primary in the documentation and onboarding has consequences:
+
+- The first install story is framed as "you, on multiple machines" not "you, on a team"
+- Group setup is presented as something a single user can do alone (no need to convince colleagues)
+- The team case is positioned as "naturally extends from this" rather than the main mental model
+- Marketing and copy emphasize "your memory across your devices" before "shared team knowledge"
+
+The team case remains supported — it''s the same architecture — but it''s the secondary mental model rather than the primary one. This positioning carries through the install procedure, the README, and any onboarding flows.
+
+---
+
+## 3. Object Model
 
 Two entities. No special roles.
 
@@ -51,13 +118,13 @@ group:
   peers            list of Node   the full mesh — every node knows every other node
 ```
 
-There is no "orchestrating node." Every node in a group has the same role and the same capabilities. Group state is the union of every member's local store, reconciled via mesh synchronization (§5).
+There is no "orchestrating node." Every node in a group has the same role and the same capabilities. Group state is the union of every member's local store, reconciled via mesh synchronization (§6).
 
 ### Why mesh, not orchestrator-centric
 
 The MVP target is small teams (≤10 people per group) on a local network. At that scale, the cost of every peer holding the group's state directly is trivial (a few MB), and the resilience properties are excellent: any peer can serve any other peer's catch-up query, no single failure point can stall the group, and group setup is one symmetric install per member.
 
-The orchestrator-centric design (one designated node holds the canonical, others are clients) makes sense at larger scales where bandwidth, storage cost, and operational management justify the centralization. That is reserved for the **enterprise tier** (§13). The MVP is mesh.
+The orchestrator-centric design (one designated node holds the canonical, others are clients) makes sense at larger scales where bandwidth, storage cost, and operational management justify the centralization. That is reserved for the **enterprise tier** (§14). The MVP is mesh.
 
 ### What this model dissolves
 
@@ -70,7 +137,7 @@ Cross-group flow happens only when a node has memberships in multiple groups and
 
 ---
 
-## 3. The Routing Rules
+## 4. The Routing Rules
 
 Four invariants. Every protocol operation respects them.
 
@@ -84,7 +151,7 @@ When peer-B receives a memory from peer-A, peer-B stores it locally and **does n
 
 ### Rule 3: Membership equals authorization
 
-A node can only fan out memory to (or query memory from) groups it is a member of. Membership IS the permission for v0.3.0 MVP. Cryptographic authentication is part of the enterprise tier (§13).
+A node can only fan out memory to (or query memory from) groups it is a member of. Membership IS the permission for v0.3.0 MVP. Cryptographic authentication is part of the enterprise tier (§14).
 
 ### Rule 4: No automatic cross-group propagation
 
@@ -93,13 +160,13 @@ A node with memberships in multiple groups does NOT automatically propagate memo
 ### Consequences
 
 - **Routing is degenerate.** Each store produces N-1 fan-out calls plus one local insert. No routing protocol because there is no routing problem.
-- **Bandwidth scales linearly with group size.** For ≤10 peers, fan-out cost per store is at most 9 outbound calls — trivial. Beyond that, the enterprise tier (§13) introduces hub-and-spoke topology to keep per-store cost bounded.
+- **Bandwidth scales linearly with group size.** For ≤10 peers, fan-out cost per store is at most 9 outbound calls — trivial. Beyond that, the enterprise tier (§14) introduces hub-and-spoke topology to keep per-store cost bounded.
 - **Trust surface is the group's peer list.** Each node trusts every other peer in its group equally. There is no privileged "orchestrator" to compromise; correspondingly, there is no central trust anchor.
 - **Audit trail via `origin_node` tag.** Every stored memory records its original author. Even after fan-out + dedup at receivers, the author identity is preserved.
 
 ---
 
-## 4. Protocol Surface
+## 5. Protocol Surface
 
 Six HTTP endpoints. All scoped by group. Every peer exposes all of them — there are no orchestrator-only or peer-only endpoints.
 
@@ -194,11 +261,11 @@ Liveness probe. Returns `{ok: true, daemon, version, node_name, memberships}`. N
 - **No callback-URL webhooks.** Subscribers come to the publisher (SSE), not the other way around. Avoids inbound-listener requirements on subscribers.
 - **No `memory/delete` or `memory/update`.** MVP is append-only.
 - **No `broker_request` / cross-group routing.** Cross-group flow is the responsibility of a multi-membership node making explicit per-group calls.
-- **No authentication tokens.** MVP relies on the local-network deployment as the trust boundary. Auth is part of the enterprise tier (§13).
+- **No authentication tokens.** MVP relies on the local-network deployment as the trust boundary. Auth is part of the enterprise tier (§14).
 
 ---
 
-## 5. Synchronization
+## 6. Synchronization
 
 How memories propagate across mesh peers. **SSE-primary with a polling safety net.** No persistent queues, no orchestrator-centric pull, no callback subscriptions in the v0.3.0 webhook sense — just long-lived SSE streams between every peer pair, with a slow background pull cycle as belt-and-suspenders.
 
@@ -287,7 +354,7 @@ These limitations are accepted for the MVP and are part of why the mesh model is
 
 | Limitation | When it bites | Migration path |
 |---|---|---|
-| **Mesh fan-out is O(N) per store** | At ≤10 peers: 9 outbound calls per store, trivial. At ≥30 peers: 29 outbound calls per store, becomes painful on slow networks. | Enterprise tier (§13) introduces hub-and-spoke or orchestrator-centric topology that converts O(N) into O(1) per store from the origin''s perspective. |
+| **Mesh fan-out is O(N) per store** | At ≤10 peers: 9 outbound calls per store, trivial. At ≥30 peers: 29 outbound calls per store, becomes painful on slow networks. | Enterprise tier (§14) introduces hub-and-spoke or orchestrator-centric topology that converts O(N) into O(1) per store from the origin''s perspective. |
 | **Every peer holds the full group corpus** | At MVP scale (few MB per group): fine. At enterprise scale (GB per group): expensive. | Enterprise tier supports tiered storage and selective replication. |
 | **Subscriber connections are O(N²) across the group** | At ≤10 peers: 90 TCP connections in the group total, fine. At ≥50: 2,450 connections. | Enterprise tier with hub topology drops this to O(N). |
 | **No authentication / TLS** | LAN-only deployment makes this OK for MVP. | Enterprise tier adds mTLS or token-based auth. |
@@ -296,7 +363,7 @@ These limitations are accepted for the MVP and are part of why the mesh model is
 
 ---
 
-## 6. Process Architecture
+## 7. Process Architecture
 
 The system uses a **dual-client architecture** over a shared core library:
 
@@ -362,7 +429,7 @@ Lifecycle: ephemeral. When Claude session ends, the process exits.
 ### 6.3 Client 2: `constellation.py` — peer-network proxy
 
 An always-on HTTP daemon under launchd management. Runs on every node by default — there is no "orchestrator vs peer" install distinction. Responsibilities:
-- Expose HTTP endpoints for peer-to-peer federation (§4)
+- Expose HTTP endpoints for peer-to-peer federation (§5)
 - Maintain SSE subscriber connections out to every other peer in the group
 - Maintain SSE subscriber registry for inbound connections from other peers
 - Run the publisher loop (poll core every ~1s for new `source=local` entries; broadcast via SSE)
@@ -392,7 +459,7 @@ Two reasons the dual-process model is preserved instead of collapsing everything
 
 ---
 
-## 7. Storage Model
+## 8. Storage Model
 
 One Qdrant collection per peer, holding all memory the peer knows about (personal and group-shared), distinguished by tags.
 
@@ -432,7 +499,7 @@ This model is what makes the mesh resilient: any single peer''s Qdrant disappear
 
 ---
 
-## 8. Authentication & Authorization
+## 9. Authentication & Authorization
 
 ### v0.3.0 model
 
@@ -463,7 +530,7 @@ What v0.3.0 does NOT protect against:
 
 ---
 
-## 9. Lifecycle
+## 10. Lifecycle
 
 ### Node startup
 
@@ -520,7 +587,7 @@ For v0.3.0, `memberships` has length 1 and `orchestrating` is either empty (peer
 
 ---
 
-## 10. v0.3.0 Scope Constraints
+## 11. v0.3.0 Scope Constraints
 
 The following are **explicitly out of scope** for v0.3.0. The protocol is designed to extend cleanly into them later, but they are not implemented in this release.
 
@@ -549,7 +616,7 @@ Everything else is either (a) deferred because it can be added without breaking 
 
 ---
 
-## 11. Forward Compatibility
+## 12. Forward Compatibility
 
 The v0.3.0 protocol is designed so that post-MVP extensions don't break existing nodes:
 
@@ -567,7 +634,7 @@ No anticipated breaking change at the protocol level between v0.3.0 and v1.0.
 
 ---
 
-## 12. Examples
+## 13. Examples
 
 ### Example 1: Single-group v0.3.0 — two engineers and a PM share a project context
 
@@ -667,7 +734,7 @@ When the task force disbands, Alice removes the membership from her config. Her 
 
 ---
 
-## 13. Enterprise tier — at-scale design (post-MVP)
+## 14. Enterprise tier — at-scale design (post-MVP)
 
 The MVP is positioned for **small teams: ≤10 peers per group, single local network**. Multiple architectural decisions trade away scale to keep the MVP simple, debuggable, and self-sufficient. The following capabilities are deliberately deferred and represent a future **commercial enterprise tier** for organizations operating at scale.
 
@@ -712,7 +779,7 @@ The MVP isn't a throwaway. It's the foundation; the enterprise tier adds operati
 
 ---
 
-## 14. Open Questions
+## 15. Open Questions
 
 The following are known unresolved decisions. They don't block v0.3.0 implementation but should be settled before v0.3.0 ships:
 
@@ -730,7 +797,7 @@ The following are known unresolved decisions. They don't block v0.3.0 implementa
 
 ---
 
-## 15. What Constellation is NOT
+## 16. What Constellation is NOT
 
 Closing with a clear list of things Constellation deliberately is not, so future contributors don't try to bend it into them:
 

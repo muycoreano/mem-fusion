@@ -69,6 +69,12 @@ You don't need to explicitly recall a memory. The `UserPromptSubmit` hook embeds
 
 Manual recall is always available — just ask: *"What did we decide about the auth service?"* triggers Claude to call `search_memory(...)` and surface the relevant entry.
 
+### Prompt Tip - Periodically Consolidate your Learnings
+
+After working 2-3 hours straight with Claude, it tends to get a bit 'loose' naturally with and without mem-fusion.  Telling it to 'consolidate learnings' helps it manage its context:
+
+"Let's stop and reflect on what we learned.  Update your memory and make sure to udpate mem-fusion as well"
+
 ---
 
 ## How it works - Mem-Fusion

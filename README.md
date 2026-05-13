@@ -1,95 +1,41 @@
 # Mem-Fusion
 
-**Memory fusion for Claude Code — across sessions, across cognitive layers, and across machines.**
+**Persistent memory for Claude Code — across sessions, across machines, across your team.**
 
-Out of the box, Claude Code has only a context window. Every session starts blank. Decisions evaporate. Preferences must be re-stated. Resolved errors recur. Worse: when you build a useful AI workflow on one machine, it's stranded there — your other Macs, your team, your future self all start over.
+Out of the box, Claude Code is brilliant in the moment and amnesic between moments. Every session starts blank. Yesterday's architectural decision, last week's stated preference, last month's hard-won bug fix — all gone. You re-explain your codebase. You re-establish your conventions. You re-debug the same errors. The smarter Claude gets as a model, the more painful the reset becomes, because what you're losing each time is more valuable.
 
-Mem-Fusion fuses memory across three axes:
+**Mem-Fusion fixes this.** A local memory layer watches your Claude Code sessions, captures decisions and patterns as you work, and surfaces them automatically the next time they're relevant. Most of the time it's invisible — Claude finds and uses what it needs, when it needs it — but `/remember` is there when you want to pin something explicitly. The longer you use it, the sharper your Claude gets at *your* work, in *your* codebase, with *your* preferences. Everything runs on your machine; nothing leaves it.
 
-- **Across sessions** — Tuesday's decision surfaces in Friday's session, automatically.
-- **Across cognitive layers** — episodic, semantic, procedural, and working memory fused into one substrate via 9 memory tools and 4 automatic hooks.
-- **Across machines** *(when you enable the Constellation extension — shipping in v0.3.0)* — personal memory streams from peer machines fuse into curated group memory, governed by an apprenticeship loop that learns your judgment over time.
-
-Same substrate, three axes of fusion. Standalone fuses two of them; turn on Constellation to add the third.
+**Constellation** is the optional companion that extends this memory across machines and teammates. When your laptop's Claude learns something useful, your desktop's Claude knows it too. When a teammate cracks a tricky problem, the rest of the team benefits. AI capability stops being trapped per-person, per-machine, per-session and starts compounding across the people working on the same thing.
 
 ---
 
-## Why this matters
+## Install
 
-Every team using AI in 2026 has the same hidden bug: **the AI is learning, but only for one person at a time.**
+Both installers are AI-native: paste the markdown into a Claude Code session and Claude runs the steps with your approval. Requires macOS + Homebrew + Claude Code already installed.
 
-When your sharpest engineer figures out how to debug a tricky issue, their AI knows. Your AI doesn't. When your most AI-fluent PM develops the right instinct for a recurring tradeoff, no colleague's agent benefits. When that person leaves, their AI capability leaves with them.
+### 1. Personal memory (required, ~10 min)
 
-AI memory is currently a personal asset — trapped per-individual, per-machine, per-tool. Teams using AI heavily are getting more productive, but the productivity stays individual. Every conversation produces learning; almost none of it propagates. **The gap between a team's best AI user and its median isn't closing — it's widening**, because AI fluency compounds inside one head but doesn't transfer.
+1. Open Claude Code in a terminal.
+2. Open [`INSTALL_MEM_FUSION.md`](INSTALL_MEM_FUSION.md), copy the entire file, paste it as your first message.
+3. Approve the commands through the 15 steps.
 
-Mem-Fusion makes AI memory a *team* asset. Same memory layer runs locally on every team member's machine. Lessons fuse into a shared, human-curated group memory store. Your best engineer's workflow can be invoked by a colleague who has never seen it. Knowledge survives role changes and turnover. Compliance stays intact because every cross-person memory passes through an apprenticeship-loop curator — the human decides what propagates.
+Installs Qdrant 1.13.4, Ollama + `nomic-embed-text`, the Mem-Fusion MCP server, 4 Claude Code hooks, and the `/remember` skill. ~200 MB on disk.
 
-The next decade's productivity divide won't be "people who use AI vs. people who don't." It'll be **organizations whose AI memory compounds vs. organizations whose AI memory resets every Monday.** Mem-Fusion is the substrate for the first kind.
+### 2. Group memory across machines (optional, ~5 min per peer)
 
----
+Install Mem-Fusion first on each machine. Then on each one:
 
-## Two scopes of one mission
+1. Open [`INSTALL_CONSTELLATION.md`](INSTALL_CONSTELLATION.md), copy, paste into Claude Code.
+2. Approve the steps. Every peer joins as a symmetric mesh participant — nothing to designate, no central node, no special configuration per machine.
 
-| Scope | Axes active | What it delivers | Status |
-|---|---|---|---|
-| **Personal memory** *(standalone, default)* | Sessions + cognitive layers | Your AI remembers across sessions on this machine | ✅ Available now (v0.1.0) |
-| **Group memory** *(Constellation extension)* | + across machines | Peers' learnings fuse into shared, curated memory | 🚧 Shipping in v0.3.0 |
+Constellation runs as a persistent HTTP MCP daemon (port 7533) alongside Mem-Fusion. Federation entries land in the same Qdrant collection as your local memories, tagged `source=federation`.
 
----
-
-## Install (personal memory, today)
-
-The install is AI-native: there's no shell installer to run yourself. Instead, you paste a setup prompt into Claude Code and Claude does the install for you, asking your approval at each step.
-
-1. Open Claude Code in a terminal on your Mac.
-2. Open [`INSTALL_MEM_FUSION.md`](INSTALL_MEM_FUSION.md) in this repo.
-3. Copy its entire contents.
-4. Paste it as your first message in Claude Code.
-5. Approve the commands as Claude works through the 14 steps.
-
-That's it. Claude will install Qdrant, Ollama, the embedding model, the MCP server, the four hooks, and the `/remember` skill — and run a smoke test before reporting success.
-
-> Requires macOS, Homebrew, and Claude Code already installed. ~10 minutes end to end. ~200 MB on disk.
+> v0.3.0 ships **auto-promote** by default — every locally-stored memory propagates to the rest of the mesh. A human-review / apprenticeship loop is deferred to post-MVP.
 
 ---
 
-## What you get
-
-| Component | What it does |
-|---|---|
-| **Qdrant 1.13.4** | Local vector database (port 6333) |
-| **Ollama 0.20.5 + `nomic-embed-text`** | Local 768-dim embeddings (port 11434) |
-| **Mem-Fusion MCP server** | Exposes 9 memory tools to Claude Code via stdio |
-| **4 Claude Code hooks** | SessionStart, UserPromptSubmit, Stop, PostToolUse:Write — all automatic |
-| **`/remember` skill** | One-command pinning for high-importance memory |
-
-The nine MCP tools:
-
-`store_memory` · `search_memory` · `search_recent` · `upsert_memory` · `find_or_create` · `delete_memory` · `get_related` · `memory_stats` · `export_record`
-
-(`export_record` returns a stored memory's full Qdrant record including its vector — used by the Constellation extension to faithfully propagate memory across machines without re-embedding.)
-
----
-
-## Memory types
-
-Mem-Fusion classifies memories into seven types, each with its own retention and retrieval semantics:
-
-| Type | What it captures |
-|---|---|
-| `decision` | Choices made (architecture, tool selection, approach) |
-| `preference` | User-stated rules ("always X", "never Y") |
-| `fact` | Verifiable observations |
-| `error` | Resolved errors and their fixes |
-| `code` | Significant code patterns / file writes |
-| `context` | Background context about an initiative |
-| `session` | Auto-extracted session summaries |
-
-Importance is 1 (trivial) → 5 (user-curated, highest priority).
-
----
-
-## How fusion works (per node)
+## How it works
 
 ```
    ┌──────────────────────────────────────────────────────┐
@@ -102,7 +48,7 @@ Importance is 1 (trivial) → 5 (user-curated, highest priority).
      │                                             │ context, code
      ▼                                             ▼
    ┌─────────────────────────────────────────────────────┐
-   │             MEM-FUSION MCP SERVER                   │
+   │             MEM-FUSION MCP SERVER (9 tools)         │
    │   ┌──────────────┐         ┌──────────────────┐     │
    │   │  VECTOR DB   │  fused  │  MD MEMORY FILES │     │
    │   │  (Qdrant)    │ ──────▶ │  (operating      │     │
@@ -114,62 +60,71 @@ Importance is 1 (trivial) → 5 (user-curated, highest priority).
               SessionStart · UserPromptSubmit · Stop · PostToolUse:Write
 ```
 
-Three storage layers fused into one substrate: in-context working memory ↔ MCP server (8 tools) ↔ Qdrant (vector / episodic / semantic) + markdown files (procedural / operating-principle).
+Three storage layers fused into one substrate: in-context working memory ↔ MCP server ↔ Qdrant (vector / episodic / semantic) + markdown files (procedural / operating-principle). The hooks make memory invisible by default — you don't have to explicitly recall or store; the system does it. Manual `/remember` for high-importance items remains available.
 
-The hooks make memory **invisible by default** — you don't have to explicitly recall or store; the system does it. Manual `/remember` for high-importance items remains available.
+With Constellation enabled, a second daemon federates memory across peers via HTTP, using the same Qdrant collection with a `source` payload tag distinguishing local from federated entries.
 
-When you enable Constellation (v0.3.0), the same per-node substrate fuses *horizontally* with peer nodes through a curator-mediated propagation layer. The vertical and temporal fusion stays exactly as it works today; the third axis just turns on.
+For full architectural detail:
+
+- [`docs/MEM_FUSION_ARCHITECTURE.md`](docs/MEM_FUSION_ARCHITECTURE.md) — single-node design (storage model, MCP tool surface, hooks, lifecycle)
+- [`docs/CONSTELLATION_ARCHITECTURE.md`](docs/CONSTELLATION_ARCHITECTURE.md) — federation design (mesh topology, peer protocol, source tagging)
+- [`CHANGELOG.md`](CHANGELOG.md) — what's in each version
+
+---
+
+## MCP tools (9)
+
+`store_memory` · `search_memory` · `search_recent` · `upsert_memory` · `find_or_create` · `delete_memory` · `get_related` · `memory_stats` · `export_record`
+
+`export_record` returns a memory's full Qdrant record including its 768-dim vector — used by Constellation to propagate memory across machines without re-embedding.
+
+## Memory types
+
+| Type | Captures |
+|---|---|
+| `decision` | Architecture / tool / approach choices |
+| `preference` | User-stated rules ("always X", "never Y") |
+| `fact` | Verifiable observations |
+| `error` | Resolved errors and their fixes |
+| `code` | Significant code patterns / file writes |
+| `context` | Background context about an initiative |
+| `session` | Auto-extracted session summaries |
+
+Importance: 1 (trivial) → 5 (user-curated, highest priority).
 
 ---
 
 ## Configure Claude to use it
 
-After running [`INSTALL_MEM_FUSION.md`](INSTALL_MEM_FUSION.md), paste this block into your `~/CLAUDE.md` (or a project-level `CLAUDE.md`) so Claude knows when to call the memory tools:
+Paste this into `~/CLAUDE.md` (or a project-level `CLAUDE.md`) so Claude calls the tools at the right moments:
 
 ````markdown
 ## Vector Memory System
 
 Connected to a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on localhost).
-**Check this at session start** by calling `memory_stats()` to confirm the system is live.
+Check at session start: `memory_stats()`.
 
 ### When to search
-- **Session start**: `search_memory(query="<current task>", top_k=8)`
-- **Before architectural decisions**: search for prior decisions on the same topic
-- **When hitting a recurring error**: search for prior resolutions
-- **When unsure about a user preference**: search type="preference"
+- Session start: `search_memory(query="<current task>", top_k=8)`
+- Before architectural decisions: search for prior decisions on the same topic
+- On recurring errors: search prior resolutions
+- Unsure about a user preference: search type="preference"
 
 ### When to store
-- **Decision made**: `store_memory(content, type="decision", importance=4, project="<name>")`
-- **Novel error resolved**: `store_memory(..., type="error", importance=3)`
-- **User reveals a preference**: `store_memory(..., type="preference", importance=4)`
-- **Important context learned**: `store_memory(..., type="context", importance=3)`
-- **User explicitly asks to remember**: use `/remember` skill → `importance=5`
+- Decision made: `store_memory(content, type="decision", importance=4, project="<name>")`
+- Novel error resolved: `store_memory(..., type="error", importance=3)`
+- User reveals a preference: `store_memory(..., type="preference", importance=4)`
+- Important context learned: `store_memory(..., type="context", importance=3)`
+- User explicitly asks to remember: use `/remember` → importance=5
 
 ### What NOT to store
 Trivial facts, transient state, things derivable from code or `git log`.
 
 ### Verification rule
-Memories are point-in-time observations. Before recommending a file/function/flag named in
-a memory, verify it still exists in the current code.
+Memories are point-in-time observations. Before recommending a file/function/flag named in a memory, verify it still exists in the current code.
 ````
 
----
-
-## What's intentionally not included
-
-- **No telemetry, no phone-home, no cloud.** Everything is localhost-only.
-- **No Linux/Windows support.** macOS launchd is required by the current architecture.
-- **No group memory yet** — that's the v0.3.0 Constellation bundle. Single-machine memory today; multi-machine memory soon.
-
----
-
-## Roadmap
-
-| Version | What | Status |
-|---|---|---|
-| **v0.1.0** | Personal memory (sessions + cognitive layers) | ✅ Shipped 2026-05-08 |
-| **v0.3.0** | Bundled Constellation daemon — group memory across peers via federated per-group Qdrant collections + `export_record` tool for faithful memory promotion | 🚧 In progress; see [CHANGELOG](CHANGELOG.md) for design and scope |
-| **post-MVP** | Deferred capabilities — no commitment to specific release timing: push notifications between peers, swarm-key / Bearer auth, human review queue, multi-group membership, hierarchical orchestrators, per-peer cryptographic identity, native OS notifications | 📋 Will be scoped as real usage surfaces specific needs |
+INSTALL_CONSTELLATION.md adds further CLAUDE.md content for federation — the install prompt drops it in automatically.
 
 ---
 
@@ -177,22 +132,22 @@ a memory, verify it still exists in the current code.
 
 ```bash
 claude mcp remove mem-fusion
+claude mcp remove constellation 2>/dev/null   # if installed
 launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.qdrant.plist
 launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.ollama.plist
+launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist 2>/dev/null
 rm ~/Library/LaunchAgents/com.branchapp.memfusion.*.plist
-rm -rf ~/.local/share/mem-fusion         # ⚠ deletes all stored memories
+rm -rf ~/.local/share/mem-fusion          # ⚠ deletes all stored memories
 rm -rf ~/.claude/skills/remember
-# Then remove the 4 mem-fusion entries from ~/.claude/settings.json (or restore from .bak)
+# Then remove the 4 mem-fusion hook entries from ~/.claude/settings.json
 ```
 
-Full uninstall instructions are at the bottom of [`INSTALL_MEM_FUSION.md`](INSTALL_MEM_FUSION.md).
+Full uninstall sections are at the bottom of each INSTALL file.
 
 ---
 
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
-
----
 
 *Built at [Branch](https://branchapp.com).*

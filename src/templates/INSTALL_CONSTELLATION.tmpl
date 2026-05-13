@@ -68,7 +68,7 @@ The Constellation daemon needs a `config.json` describing this node's identity a
 ```bash
 echo "Edit ~/.local/share/mem-fusion/constellation/config.json:"
 echo "  - Replace <your-machine-name> with this peer's identifier"
-echo "  - Replace <your-group-name> with the group this node orchestrates"
+echo "  - Replace <your-group-name> with the group this node joins"
 ```
 
 ---
@@ -126,19 +126,20 @@ Print this snippet and instruct the user to paste it into `~/CLAUDE.md`:
 Connected to a local `constellation` MCP server (HTTP, port 7533) that federates
 group memory across machines.
 
-### When to promote a memory to the group canonical
+### When to propagate a memory to the group
 On user "remember X" (the `/remember` skill flow), after `store_memory` returns
 a local ID, also call:
 1. `mem-fusion/export_record(id=<local_id>)` — returns the full record incl. vector
 2. `constellation/memory/put(group_name=<group>, memory_record=<record>, provenance=<...>)`
-   — promotes to the group canonical
+   — propagates the entry to the rest of the mesh
 
-The group canonical is the orchestrator's authoritative copy. Other peers in the
-group can search and retrieve via `constellation/memory/get(group_name=..., query=...)`.
+Every peer is symmetric. Any peer in the group can accept the propagation; other
+peers in the same group can retrieve via
+`constellation/memory/get(group_name=..., query=...)`.
 
-### When NOT to promote
+### When NOT to propagate
 Personal preferences, machine-specific config, anything the user marked
-local-only. Default for v0.3.0 is auto-promote on explicit `/remember`.
+local-only. Default for v0.3.0 is auto-propagate on explicit `/remember`.
 ```
 
 ---
@@ -150,7 +151,7 @@ local-only. Default for v0.3.0 is auto-promote on explicit `/remember`.
 | Daemon won't start | Check `~/.local/share/mem-fusion/constellation/logs/constellation-error.log`. Common cause: `config.json` placeholders (`<your-machine-name>`) not replaced with real values. |
 | `claude mcp list` shows constellation but `Failed to connect` | Verify the daemon is listening: `curl http://127.0.0.1:7533/health`. If not, check the launchd plist loaded: `launchctl list \| grep memfusion.constellation`. |
 | Port 7533 conflict | Stop the other process or pick a different port in `config.json` `listen_address`, then update the launchd plist's `--config` path and `claude mcp add` URL. |
-| `/peers` returns empty | Peers are inferred from `memory/put` activity. Once any peer submits a memory to this orchestrator's group, they'll appear. |
+| `/peers` returns empty | Peers are inferred from `memory/put` activity. Once any peer in the group submits a memory to this node, they'll appear. |
 
 Logs: `~/.local/share/mem-fusion/constellation/logs/{constellation.log,constellation-error.log}`.
 
@@ -174,4 +175,4 @@ read -p "Delete the Constellation install directory? [y/N] " yn
 
 When all 7 steps + smoke test pass, tell the user:
 
-> Constellation is live on this peer. **Restart your Claude Code session** so the new MCP server is visible. Paste the CLAUDE.md snippet from Step 8 into your `~/CLAUDE.md` so Claude knows when to promote memories to the group canonical. To test the federation, have another peer install Constellation pointing at the same `group_name`, then say *"remember that we picked Qdrant for v0.3.0"* — the memory will land both locally and in the group canonical, retrievable from the other peer via `constellation/memory/get`.
+> Constellation is live on this peer. **Restart your Claude Code session** so the new MCP server is visible. Paste the CLAUDE.md snippet from Step 8 into your `~/CLAUDE.md` so Claude knows when to propagate memories to the group. To test the federation, have another peer install Constellation pointing at the same `group_name`, then say *"remember that we picked Qdrant for v0.3.0"* — the memory will land locally and propagate across the mesh, retrievable from the other peer via `constellation/memory/get`.

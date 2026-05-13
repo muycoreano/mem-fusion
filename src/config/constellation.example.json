@@ -9,8 +9,7 @@
 
   "memberships": [
     {
-      "group_name": "<your-group-name>",
-      "role": "orchestrator"
+      "group_name": "<your-group-name>"
     }
   ]
 }

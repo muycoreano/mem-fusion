@@ -32,7 +32,7 @@ import core  # noqa: E402
 ORCHESTRATOR_CONFIG = Path.home() / ".local/share/mem-fusion-dev/constellation/config.json"
 DAEMON_URL          = "http://127.0.0.1:7533"
 GROUP_NAME          = "wp2-test-group@dev"
-ORCHESTRATOR_NAME   = "mem-fusion-dev-test"
+NODE_NAME           = "mem-fusion-dev-test"
 CANONICAL_QDRANT    = "http://127.0.0.1:6433"
 
 PEERS_CFG = {
@@ -144,12 +144,11 @@ async def run_test():
     print("\nSTEP 2: GET /peers/self")
     r = httpx.get(f"{DAEMON_URL}/peers/self", timeout=5).json()
     print(f"  response: {json.dumps(r, indent=2)}")
-    passed.append(check("self.node_name matches config", r["node_name"] == ORCHESTRATOR_NAME))
+    passed.append(check("self.node_name matches config", r["node_name"] == NODE_NAME))
     passed.append(check("self has version field", "version" in r))
     passed.append(check("self has listen_address", "listen_address" in r))
-    passed.append(check("self lists our group with orchestrator role",
-                        any(m["group_name"] == GROUP_NAME and m["role"] == "orchestrator"
-                            for m in r["memberships"])))
+    passed.append(check("self lists our group as a flat name",
+                        GROUP_NAME in r["memberships"]))
 
     print("\nSTEP 3: GET /peers with no federation entries — expect empty list")
     r = httpx.get(f"{DAEMON_URL}/peers",
@@ -157,7 +156,7 @@ async def run_test():
     print(f"  response: {json.dumps(r, indent=2)}")
     passed.append(check("empty group: count == 0", r["count"] == 0))
     passed.append(check("empty group: peers == []", r["peers"] == []))
-    passed.append(check("orchestrator field set", r["orchestrator"] == ORCHESTRATOR_NAME))
+    passed.append(check("responding_node set", r["responding_node"] == NODE_NAME))
 
     print("\nSTEP 4: promote 1 memory from peer-b → /peers shows 1 member")
     peer_b_ids = list_local("mem-fusion-peer-b")

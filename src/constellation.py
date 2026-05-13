@@ -102,8 +102,13 @@ def point_to_record(p) -> dict:
 def load_config(path: Path) -> dict:
     """Load and validate the daemon's config. Raises ValueError on invalid schema.
 
-    The Qdrant collection is fixed at `core.COLLECTION` — it is never a config
-    field. Isolation between peers comes from distinct Qdrant ports, not names.
+    Every peer in the mesh is symmetric — no orchestrator/peer role distinction.
+    A peer that lists a group in `memberships` is a full participant in that
+    group's mesh: it can accept federation entries (POST /memory/put), serve
+    reads (GET /memory/get), and report the directory (GET /peers).
+
+    The Qdrant collection is fixed at `core.COLLECTION`. Isolation between
+    peers in dev comes from distinct Qdrant ports, not names.
     """
     with open(path) as f:
         cfg = json.load(f)
@@ -114,11 +119,8 @@ def load_config(path: Path) -> dict:
         raise ValueError("config missing or invalid 'memberships' (must be a list)")
 
     for i, m in enumerate(cfg["memberships"]):
-        for k in ("group_name", "role"):
-            if k not in m:
-                raise ValueError(f"memberships[{i}] missing field: {k}")
-        if m["role"] not in ("orchestrator", "peer"):
-            raise ValueError(f"memberships[{i}].role must be 'orchestrator' or 'peer', got {m['role']!r}")
+        if "group_name" not in m:
+            raise ValueError(f"memberships[{i}] missing field: group_name")
 
     if len(cfg["memberships"]) > 1:
         raise ValueError(
@@ -197,10 +199,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
                 "daemon":      DAEMON_NAME,
                 "version":     VERSION,
                 "node_name":   cfg["node_name"],
-                "memberships": [
-                    {"group_name": m["group_name"], "role": m["role"]}
-                    for m in cfg["memberships"]
-                ],
+                "memberships": [m["group_name"] for m in cfg["memberships"]],
             })
         elif self.path.startswith("/memory/get"):
             self._handle_memory_get()
@@ -239,11 +238,11 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         record     = body["memory_record"]
         provenance = body["provenance"]
 
-        orchestrated = [m["group_name"] for m in cfg["memberships"] if m["role"] == "orchestrator"]
-        if group_name not in orchestrated:
+        memberships = [m["group_name"] for m in cfg["memberships"]]
+        if group_name not in memberships:
             return self._send_json(HTTP_FORBIDDEN, {
-                "error":            f"this node does not orchestrate {group_name!r}",
-                "orchestrated":     orchestrated,
+                "error":        f"this node is not a member of {group_name!r}",
+                "memberships":  memberships,
             })
 
         required = ("content", "vector", "content_hash",
@@ -340,11 +339,11 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         if not group_name:
             return self._send_json(HTTP_BAD_REQUEST, {"error": "missing query param: group_name"})
 
-        orchestrated = [m["group_name"] for m in cfg["memberships"] if m["role"] == "orchestrator"]
-        if group_name not in orchestrated:
+        memberships = [m["group_name"] for m in cfg["memberships"]]
+        if group_name not in memberships:
             return self._send_json(HTTP_FORBIDDEN, {
-                "error":         f"this node does not orchestrate {group_name!r}",
-                "orchestrated":  orchestrated,
+                "error":        f"this node is not a member of {group_name!r}",
+                "memberships":  memberships,
             })
 
         if memory_id:
@@ -394,11 +393,11 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         if not group_name:
             return self._send_json(HTTP_BAD_REQUEST, {"error": "missing query param: group_name"})
 
-        orchestrated = [m["group_name"] for m in cfg["memberships"] if m["role"] == "orchestrator"]
-        if group_name not in orchestrated:
+        memberships = [m["group_name"] for m in cfg["memberships"]]
+        if group_name not in memberships:
             return self._send_json(HTTP_FORBIDDEN, {
-                "error":        f"this node does not orchestrate {group_name!r}",
-                "orchestrated": orchestrated,
+                "error":        f"this node is not a member of {group_name!r}",
+                "memberships":  memberships,
             })
 
         group_filter = Filter(must=[
@@ -427,10 +426,10 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         peer_list = sorted(peers.values(), key=lambda e: e["last_seen"], reverse=True)
         log.info("GET /peers: group=%s count=%d", group_name, len(peer_list))
         return self._send_json(HTTP_OK, {
-            "group_name":   group_name,
-            "orchestrator": cfg["node_name"],
-            "count":        len(peer_list),
-            "peers":        peer_list,
+            "group_name":      group_name,
+            "responding_node": cfg["node_name"],
+            "count":           len(peer_list),
+            "peers":           peer_list,
         })
 
     # ── /peers/self — this node's identity and group memberships ─────────
@@ -442,10 +441,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             "node_name":      cfg["node_name"],
             "listen_address": cfg["listen_address"],
             "version":        VERSION,
-            "memberships": [
-                {"group_name": m["group_name"], "role": m["role"]}
-                for m in cfg["memberships"]
-            ],
+            "memberships":    [m["group_name"] for m in cfg["memberships"]],
         })
 
 
@@ -487,7 +483,7 @@ def main():
     log.info("  qdrant_url:  %s", cfg["qdrant_url"])
     log.info("  collection:  %s", core.COLLECTION)
     for m in cfg["memberships"]:
-        log.info("  membership:  %s (role=%s)", m["group_name"], m["role"])
+        log.info("  membership:  %s", m["group_name"])
 
     init_collection(core.COLLECTION, log)
 

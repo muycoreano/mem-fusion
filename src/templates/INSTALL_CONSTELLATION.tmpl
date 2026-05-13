@@ -132,14 +132,26 @@ with other peers in your group. Two MCP tools on `mem-fusion`:
   dump the raw JSON.
 
 ### When to push
-On user "remember X" (the `/remember` skill flow), after `store_memory`
-returns a local ID:
+The `/remember` skill handles routing internally: it sends behavioral rules
+to file-based memory (never pushed) and knowledge to the vector DB. For the
+knowledge branch, the skill already calls `group_push` after `store_memory`.
+
+You only need to invoke `group_push` directly outside the `/remember` flow —
+for example, if the user says *"share this with the group"* about a memory
+they stored earlier, or if a hook captured something worth propagating:
 1. Call `mem-fusion/group_push(id=<local_id>)`.
-2. Summarize: "Shared with N peers. Peer-X unreachable: <reason>" etc.
+2. Render a per-peer summary: "Shared with N peers. Peer-X unreachable: <reason>".
+   Never dump the raw JSON.
 
 ### When NOT to push
-Personal preferences, machine-specific config, anything the user marked
-local-only. Default for v0.3.0 is auto-push on explicit `/remember`.
+- **Behavioral rules and personal preferences.** These belong in file-based
+  memory (the `/remember` skill routes them there automatically). If you
+  somehow have one as a vector DB entry, don't push it.
+- Machine-specific config (paths, ports, ssh keys).
+- Anything tied to ephemeral session state.
+
+Vector entries shared via Constellation become visible on every peer in the
+group — personal rules shouldn't propagate to teammates.
 
 ### When to pull
 On `/remember pull`, or when the user asks "what's new from the group?".

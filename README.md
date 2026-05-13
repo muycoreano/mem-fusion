@@ -41,27 +41,56 @@ Both INSTALL_MEM_FUSION.md and INSTALL_CONSTELLATION.md will instruct you on add
 
 Most memory operations are invisible — the four Claude Code hooks (`SessionStart`, `UserPromptSubmit`, `Stop`, `PostToolUse:Write`) inject relevant context before Claude responds and capture decisions, errors, preferences, and code patterns as you work. You don't have to remember to recall or store; the system does it.
 
-`/remember` is the explicit pin — use it when you've just made a decision you absolutely want Claude to surface again later.
+`/remember` is the explicit pin — use it when you've just made a decision (or stated a preference) you want Claude to act on going forward.
 
-### Example: `/remember` in a Claude Code session
+### Two memory stores — knowledge vs. behavior
+
+Mem-Fusion has two memory stores that serve different purposes. The distinction matters — especially with Constellation installed.
+
+| Store | What goes there | Loaded when | Shared via Constellation? |
+|---|---|---|---|
+| **File-based memory** (`~/.claude/projects/<encoded-cwd>/memory/`) | **Behavioral rules** — how you want Claude to act. Personal preferences, conventions, style choices, workflow rules. | Always at session start | **Never** — stays on your machine, period |
+| **Vector DB** (Qdrant) | **Knowledge** — decisions, facts, observations, errors, code patterns, contextual notes. | On-demand semantic search by hooks and tools | **Yes** — `/remember` and `group_push` propagate to peers |
+
+`/remember` figures out which store the content belongs in and writes it to the right place automatically. You don't pick — Claude classifies the content based on its shape and routes accordingly.
+
+### `/remember` examples
+
+**Behavioral rule** — routed to file-based, stays local:
+
+```
+You:   /remember always use uv for Python environments on this machine
+
+Claude: ✓ Pinned as a behavioral rule in preference_use-uv-for-python.md.
+        Loads at every session start. Stays local, never shared.
+```
+
+**Knowledge** — routed to vector DB, shared with group:
 
 ```
 You:   /remember We standardized on PostgreSQL 16 with logical replication
        for the auth service.
 
-Claude: ✓ Stored as decision (id: a7e3c2d1, importance: 5, project: auth-service)
+Claude: ✓ Stored as decision (id: a7e3c2d1, importance: 5, project: auth-service).
         ✓ Shared with engineering@branch:
             - alice-desktop: stored
             - bob-mac:       stored
             - carol-laptop:  unreachable (connection refused)
 ```
 
-What happened:
-1. The `/remember` skill instructs Claude to call `mem-fusion/store_memory(...)` with `importance=5`.
-2. Because Constellation is installed and your CLAUDE.md includes the group-memory snippet, Claude also calls `mem-fusion/group_push(id=...)` to share with every peer in your group.
-3. Carol's machine was offline — the memory landed locally and at the two reachable peers. When Carol next runs Claude Code, she'll either see it via an automatic hook search or by asking Claude to pull (`/remember pull` skill is on the roadmap; for now, just ask Claude "pull anything new from the group").
+**Ambiguous content** — Claude asks before routing:
 
-If Constellation isn't installed, `/remember` just stores locally — the group_push step gracefully no-ops with a `constellation_not_installed` message.
+```
+You:   /remember the deploy script uses Python 3.12
+
+Claude: Quick check — is this a behavioral rule (always use Python 3.12
+        going forward, stays local) or knowledge (a fact about the
+        current deploy script, shared with your group)?
+```
+
+Why this routing matters: behavioral rules are about *how you want Claude to act* — they're personal, and shouldn't propagate to teammates' machines. File-based memory keeps them yours. Knowledge is *about your project* — sharing it with the group is the whole point of Constellation.
+
+If Constellation isn't installed, the knowledge branch still works — entries land locally as `source=local`. The "Shared with" line is replaced with "Local only — Constellation not installed."
 
 ### How memories surface
 

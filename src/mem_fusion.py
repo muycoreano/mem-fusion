@@ -2,14 +2,21 @@
 """
 Mem-Fusion MCP Server — stdio transport for Claude Code.
 
-Thin proxy over `core.py`. Registers 9 memory tools with the MCP server
-and delegates each one to the corresponding `core` function. No business
-logic lives in this file; it exists to translate between MCP's call/response
-shape and `core`'s plain-Python function shape.
+Thin proxy over `core.py`. Registers 11 memory tools with the MCP server
+and delegates each one to the corresponding `core` function (for local
+memory ops) or to the local Constellation gateway over HTTP (for group
+ops). No business logic lives in this file.
+
+The two group tools (`group_pull`, `group_push`) call Constellation's
+local gateway at 127.0.0.1:7534. If Constellation isn't installed/running,
+the calls fail cleanly with {"error": "constellation_not_installed"} and
+Claude can tell the user to install Constellation if they want group memory.
 """
 import asyncio
 import json
+import os
 
+import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
@@ -20,6 +27,11 @@ import core
 log = core.configure_logging("mem-fusion")
 
 server = Server("mem-fusion")
+
+# Local Constellation gateway. Override with MEMFUSION_CONSTELLATION_GATEWAY.
+CONSTELLATION_GATEWAY = os.getenv("MEMFUSION_CONSTELLATION_GATEWAY",
+                                  "http://127.0.0.1:7534")
+GATEWAY_TIMEOUT_S = 30.0
 
 
 @server.list_tools()
@@ -97,6 +109,26 @@ async def list_tools():
              inputSchema={"type": "object", "properties": {
                  "id": {"type": "string", "description": "Memory ID from a prior store/search result"},
              }, "required": ["id"]}),
+        Tool(name="group_pull",
+             description=("Pull new memories from every peer in this node's group via the "
+                          "local Constellation daemon. Returns per-peer telemetry "
+                          "{peers: [{node_name, group_name, status: responsive|unreachable, "
+                          "entry_ids?, reason?}]}. After calling this, use export_record(id) "
+                          "or search_recent to surface the new content to the user — render "
+                          "a per-peer natural-language summary; never dump the raw JSON. "
+                          "Requires Constellation to be installed."),
+             inputSchema={"type": "object", "properties": {}, "required": []}),
+        Tool(name="group_push",
+             description=("Share a locally-stored memory with every peer in this node's group "
+                          "via the local Constellation daemon. Takes the local memory's ID "
+                          "(from a prior store_memory result). Returns per-peer delivery "
+                          "telemetry {peers: [{node_name, group_name, status, delivery?, "
+                          "reason?}]}. Render a per-peer summary to the user; never dump JSON. "
+                          "Requires Constellation to be installed."),
+             inputSchema={"type": "object", "properties": {
+                 "id": {"type": "string",
+                        "description": "Local memory ID from a prior store_memory result"},
+             }, "required": ["id"]}),
     ]
 
 
@@ -120,7 +152,56 @@ async def dispatch(name, args):
     if name == "get_related":    return await core.get_related(args)
     if name == "memory_stats":   return await core.memory_stats(args)
     if name == "export_record":  return await core.export_record(args)
+    if name == "group_pull":     return await group_pull(args)
+    if name == "group_push":     return await group_push(args)
     raise ValueError(f"Unknown tool: {name}")
+
+
+# ── Group tools — thin proxies to local Constellation gateway ────────────
+async def group_pull(_args):
+    """POST /pull on local Constellation gateway. Returns per-peer telemetry."""
+    try:
+        async with httpx.AsyncClient(timeout=GATEWAY_TIMEOUT_S) as client:
+            r = await client.post(f"{CONSTELLATION_GATEWAY}/pull", json={})
+        if r.status_code != 200:
+            return {"error": "gateway_error",
+                    "detail": f"http {r.status_code}: {r.text[:200]}"}
+        return r.json()
+    except httpx.ConnectError:
+        return {"error": "constellation_not_installed",
+                "detail": f"could not reach gateway at {CONSTELLATION_GATEWAY}"}
+    except httpx.TimeoutException:
+        return {"error": "gateway_timeout",
+                "detail": f"gateway did not respond within {GATEWAY_TIMEOUT_S}s"}
+
+
+async def group_push(args):
+    """POST /push on local Constellation gateway. mem-fusion fetches the full
+    record via core.export_record and forwards it; the gateway handles the
+    fan-out and the local-entry augmentation.
+    """
+    memory_id = args.get("id")
+    if not memory_id:
+        return {"error": "missing_argument", "detail": "id is required"}
+
+    record = await core.export_record({"id": memory_id})
+    if "error" in record:
+        return {"error": "memory_not_found", "detail": record["error"]}
+
+    try:
+        async with httpx.AsyncClient(timeout=GATEWAY_TIMEOUT_S) as client:
+            r = await client.post(f"{CONSTELLATION_GATEWAY}/push",
+                                  json={"record": record})
+        if r.status_code != 200:
+            return {"error": "gateway_error",
+                    "detail": f"http {r.status_code}: {r.text[:200]}"}
+        return r.json()
+    except httpx.ConnectError:
+        return {"error": "constellation_not_installed",
+                "detail": f"could not reach gateway at {CONSTELLATION_GATEWAY}"}
+    except httpx.TimeoutException:
+        return {"error": "gateway_timeout",
+                "detail": f"gateway did not respond within {GATEWAY_TIMEOUT_S}s"}
 
 
 async def main():

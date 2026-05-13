@@ -6,14 +6,14 @@
 
 ## What this builds
 
-A persistent HTTP MCP daemon that shares group memory across Mem-Fusion peers. Constellation runs alongside Mem-Fusion, sharing the same Qdrant collection (`cowork_memories`); group-shared entries are tagged `source=group` to distinguish them from locally-originated memories.
+A persistent HTTP daemon that lets Mem-Fusion peers share memory with each other. Constellation is a backend for the local Mem-Fusion MCP server — Claude never talks to Constellation directly; Mem-Fusion does, through a localhost-only gateway.
 
-- **HTTP MCP daemon** on port 7533 (separate from Mem-Fusion's stdio MCP)
-- **Shared Qdrant collection** (`cowork_memories`) — group-shared entries carry `source=group`, `origin_node`, `group_name` tags
-- **launchd service** (`com.branchapp.memfusion.constellation`) — KeepAlive, RunAtLoad
-- **4 MCP tools**: `memory/put`, `memory/get`, `peers`, `peers/self`
+- **Peer surface** on port 7533 (bound to all interfaces) — other peers' Constellation daemons reach this one for memory delivery and catch-up.
+- **Gateway surface** on port 7534 (bound to 127.0.0.1) — what Mem-Fusion calls when Claude invokes `group_pull` or `group_push`.
+- **Shared Qdrant collection** (`cowork_memories`) — group entries carry `source=group`, `origin_node`, `group_name`, `submitted_at` payload tags.
+- **launchd service** (`com.branchapp.memfusion.constellation`) — KeepAlive, RunAtLoad.
 
-Network exposure: localhost by default. Disk footprint: minimal (<10 MB beyond what Mem-Fusion already uses).
+Disk footprint: minimal (<10 MB beyond what Mem-Fusion already uses).
 
 ---
 
@@ -33,12 +33,11 @@ Network exposure: localhost by default. Disk footprint: minimal (<10 MB beyond w
 curl -s http://127.0.0.1:6333/healthz   >/dev/null || { echo "Qdrant not up — check Mem-Fusion install"; exit 1; }
 curl -s http://127.0.0.1:11434/api/tags >/dev/null || { echo "Ollama not up — check Mem-Fusion install"; exit 1; }
 
-# 4. Port 7533 free
+# 4. Ports 7533 and 7534 free
 lsof -nP -iTCP:7533 -sTCP:LISTEN -t >/dev/null 2>&1 && \
   { echo "Port 7533 already in use — stop the conflicting process first"; exit 1; }
-
-# 5. No prior constellation MCP registered
-claude mcp list 2>/dev/null | grep -q "constellation" && echo "WARN: constellation MCP already registered — will overwrite"
+lsof -nP -iTCP:7534 -sTCP:LISTEN -t >/dev/null 2>&1 && \
+  { echo "Port 7534 already in use — stop the conflicting process first"; exit 1; }
 ```
 
 If any check fails, **stop and ask the user** before continuing.
@@ -61,14 +60,18 @@ mkdir -p ~/.local/share/mem-fusion/constellation/{logs,state}
 
 ## Step 3 — Write the config
 
-The Constellation daemon needs a `config.json` describing this node's identity and group memberships. Edit the values below to match your deployment, then write the file:
+The Constellation daemon needs a `config.json` describing this node's identity, listeners, group membership, and peer endpoints. Edit the values below, then write the file:
 
 <!-- INCLUDE: src/config/constellation.example.json AS ~/.local/share/mem-fusion/constellation/config.json -->
 
 ```bash
 echo "Edit ~/.local/share/mem-fusion/constellation/config.json:"
-echo "  - Replace <your-machine-name> with this peer's identifier"
-echo "  - Replace <your-group-name> with the group this node joins"
+echo "  - <your-machine-name>:  this peer's identifier"
+echo "  - <your-group-name>:    the group this peer joins"
+echo "  - peers[]:              other peers in the group (node_name + endpoint URL)"
+echo ""
+echo "The peer endpoints are HTTP URLs to each other peer's port-7533 listener."
+echo "If you only have one peer right now, set peers to [] — you can add more later."
 ```
 
 ---
@@ -88,58 +91,60 @@ export HOME_LIT="$HOME"
 ```bash
 launchctl load ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist
 curl -s --retry 12 --retry-delay 1 --retry-connrefused http://127.0.0.1:7533/health >/dev/null \
-  && echo "  Constellation up" \
-  || { echo "Constellation failed to start — check ~/.local/share/mem-fusion/constellation/logs/constellation-error.log"; exit 1; }
+  && echo "  Peer listener up" \
+  || { echo "Constellation failed to start — check ~/.local/share/mem-fusion/constellation/logs/"; exit 1; }
 ```
 
 ---
 
-## Step 6 — Register the Constellation MCP with Claude Code
+## Step 6 — Smoke test
 
 ```bash
-claude mcp add --transport http constellation http://127.0.0.1:7533
-claude mcp list | grep constellation
-```
-
-You should see `constellation: ... - ✓ Connected`.
-
----
-
-## Step 7 — Smoke test
-
-```bash
-curl -s http://127.0.0.1:7533/health    | python3 -m json.tool
+curl -s http://127.0.0.1:7533/health     | python3 -m json.tool
 curl -s http://127.0.0.1:7533/peers/self | python3 -m json.tool
+curl -s -X POST http://127.0.0.1:7534/pull -d '{}' -H 'Content-Type: application/json' | python3 -m json.tool
 ```
 
-Expect both responses to show your `node_name`, `version`, and `memberships`.
+The first two responses should show your `node_name`, `version`, and `memberships`. The third should return `{"peers": [...]}` — empty if no peers configured, or per-peer telemetry if peers are listed.
 
 ---
 
-## Step 8 — Tell the user what to add to their CLAUDE.md
+## Step 7 — Tell the user what to add to their CLAUDE.md
 
 Print this snippet and instruct the user to paste it into `~/CLAUDE.md`:
 
 ```markdown
 ## Group Memory (Constellation)
 
-Connected to a local `constellation` MCP server (HTTP, port 7533) that shares
-group memory across machines.
+Local Mem-Fusion is connected to a Constellation backend that shares memory
+with other peers in your group. Two MCP tools on `mem-fusion`:
 
-### When to propagate a memory to the group
-On user "remember X" (the `/remember` skill flow), after `store_memory` returns
-a local ID, also call:
-1. `mem-fusion/export_record(id=<local_id>)` — returns the full record incl. vector
-2. `constellation/memory/put(group_name=<group>, memory_record=<record>, provenance=<...>)`
-   — shares the entry with the rest of the group
+- `group_pull` — pull new memories from all peers in your group. Returns
+  per-peer telemetry: `{peers: [{node_name, group_name, status, entry_ids?, reason?}]}`.
+  Render a per-peer natural-language summary to the user; never dump the raw JSON.
+  After pulling, use `export_record` or `search_recent` to surface specific
+  entries when the user wants to see them.
 
-Every peer is symmetric. Any peer in the group can accept the share; other
-peers in the same group can retrieve via
-`constellation/memory/get(group_name=..., query=...)`.
+- `group_push` — share a locally-stored memory with all peers in your group.
+  Call this after `store_memory` returns an `id`, on memories the user wants
+  to share. Returns per-peer delivery telemetry: `{peers: [{node_name,
+  group_name, status, delivery?, reason?}]}`. Render a per-peer summary; never
+  dump the raw JSON.
 
-### When NOT to propagate
+### When to push
+On user "remember X" (the `/remember` skill flow), after `store_memory`
+returns a local ID:
+1. Call `mem-fusion/group_push(id=<local_id>)`.
+2. Summarize: "Shared with N peers. Peer-X unreachable: <reason>" etc.
+
+### When NOT to push
 Personal preferences, machine-specific config, anything the user marked
-local-only. Default for v0.3.0 is auto-propagate on explicit `/remember`.
+local-only. Default for v0.3.0 is auto-push on explicit `/remember`.
+
+### When to pull
+On `/remember pull`, or when the user asks "what's new from the group?".
+Render a per-peer summary of arrivals; surface specific entries the user
+asks about with `export_record(id)`.
 ```
 
 ---
@@ -148,20 +153,19 @@ local-only. Default for v0.3.0 is auto-propagate on explicit `/remember`.
 
 | Symptom | Fix |
 |---|---|
-| Daemon won't start | Check `~/.local/share/mem-fusion/constellation/logs/constellation-error.log`. Common cause: `config.json` placeholders (`<your-machine-name>`) not replaced with real values. |
-| `claude mcp list` shows constellation but `Failed to connect` | Verify the daemon is listening: `curl http://127.0.0.1:7533/health`. If not, check the launchd plist loaded: `launchctl list \| grep memfusion.constellation`. |
-| Port 7533 conflict | Stop the other process or pick a different port in `config.json` `listen_address`, then update the launchd plist's `--config` path and `claude mcp add` URL. |
-| `/peers` returns empty | Peers are inferred from `memory/put` activity. Once any peer in the group submits a memory to this node, they'll appear. |
+| Daemon won't start | Check `~/.local/share/mem-fusion/constellation/logs/`. Common causes: config placeholders not replaced; port 7533 or 7534 already in use. |
+| `group_pull` / `group_push` returns `constellation_not_installed` | Daemon not running. `launchctl load ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist`. |
+| `/peers` returns empty | Peers are inferred from received-memory activity. Once any peer pushes to this node, they'll appear. |
+| Port 7533 or 7534 conflict | Stop the other process, or pick different ports in `config.json` and update the launchd plist's `--config`. |
+| Pull returns all peers as `unreachable` | Other peers' Constellation daemons aren't running, their endpoints in your config are wrong, or there's a network/firewall issue. |
 
-Logs: `~/.local/share/mem-fusion/constellation/logs/{constellation.log,constellation-error.log}`.
+Logs: `~/.local/share/mem-fusion/logs/constellation.<UTC-timestamp>.log`.
 
 ---
 
 ## Uninstall
 
 ```bash
-claude mcp remove constellation
-
 launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist 2>/dev/null
 rm ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist
 
@@ -169,10 +173,12 @@ read -p "Delete the Constellation install directory? [y/N] " yn
 [[ "$yn" == "y" ]] && rm -rf ~/.local/share/mem-fusion/constellation ~/.local/share/mem-fusion/constellation.py
 ```
 
+Mem-Fusion is not affected — `group_pull` / `group_push` will simply return `constellation_not_installed` until Constellation is reinstalled.
+
 ---
 
 ## After install — final report to the user
 
 When all 7 steps + smoke test pass, tell the user:
 
-> Constellation is live on this peer. **Restart your Claude Code session** so the new MCP server is visible. Paste the CLAUDE.md snippet from Step 8 into your `~/CLAUDE.md` so Claude knows when to share memories with the group. To test group sharing, have another peer install Constellation pointing at the same `group_name`, then say *"remember that we picked Qdrant for v0.3.0"* — the memory will land locally and be shared with the rest of the group, retrievable from another peer via `constellation/memory/get`.
+> Constellation is live on this peer. Paste the CLAUDE.md snippet from Step 7 into your `~/CLAUDE.md` so Claude knows when to push and pull group memory. Mem-Fusion now has two new MCP tools: `group_push` (called automatically after `/remember`) and `group_pull` (use `/remember pull` to invoke). To test group sharing, install Constellation on another machine pointing at the same `group_name` and add each peer's endpoint to the other's `peers` list, then say *"remember that we picked Qdrant for v0.3.0"* — the memory will land locally and be pushed to the other peer.

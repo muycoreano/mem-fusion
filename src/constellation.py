@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
-Constellation Daemon — HTTP peer service for a single Mem-Fusion node.
+Constellation Daemon — group memory backend for a single Mem-Fusion node.
 
-Sibling daemon to mem_fusion.py. Both are thin proxies over core.py; Qdrant
-is the rendezvous between them. Constellation owns the public HTTP surface;
-mem-fusion owns the private stdio surface to Claude.
+Two HTTP listeners in one process:
 
-Storage model:
-  - One Qdrant collection per peer (shared with mem-fusion via core).
-  - Memories originated locally:    source="local"
-  - Memories received from peers:   source="group" (carries origin_node,
-                                                     group_name, received_at)
-  - dedup key:                       content_hash (byte-identical across daemons)
+  PEER surface — bound to peer_listen_address (default 0.0.0.0:7533).
+    What other peers in the group call to share memories with this peer.
+      GET  /health                    — liveness
+      GET  /peers/self                — this node's identity + memberships
+      GET  /peers?group_name=         — directory inferred from received entries
+      POST /memory/put                — receive a memory from another peer
+      GET  /memory/get?group_name=    — fetch group entries by id or scroll
+      GET  /memory/since?group_name=&cursor=  — pull catch-up since cursor
 
-HTTP surface (MVP — no SSE yet):
-  GET  /health                            — liveness
-  POST /memory/put                        — accept a memory from a peer
-  GET  /memory/get?group_name=...&id=...  — fetch group-shared memories
-  GET  /peers?group_name=...              — directory inferred from group-shared
-                                            entries' origin_node
-  GET  /peers/self                        — this node's identity + memberships
+  GATEWAY surface — bound to gateway_listen_address (default 127.0.0.1:7534).
+    What the local mem-fusion process calls to drive group operations.
+    Localhost-only by network binding.
+      POST /pull   — pull new memories from every peer in the group
+      POST /push   — share a local memory with every peer in the group
+
+Storage model (shared Qdrant collection `cowork_memories`):
+  source="local"  — written by Mem-Fusion on this peer. If the peer pushes the
+                    memory to a group, the local entry is augmented in place
+                    with group_name, origin_node (= self), submitted_at.
+  source="group"  — received from another peer via /memory/put or pull.
+
+Dedup is on (content_hash, group_name) regardless of source — a peer that
+echoes back its own originated memory via pull doesn't create a duplicate.
 
 Usage:
   python constellation.py --config /path/to/config.json [--foreground]
@@ -28,11 +35,13 @@ import argparse
 import json
 import signal
 import sys
+import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+import httpx
 from qdrant_client.models import (
     Distance, FieldCondition, Filter, MatchValue,
     PayloadSchemaType, PointStruct, VectorParams,
@@ -41,25 +50,22 @@ from qdrant_client.models import (
 import core
 
 
-# ── Constants ──────────────────────────────────────────────────────────────
 VERSION          = "0.3.0-alpha"
 DAEMON_NAME      = "constellation"
 SCROLL_PAGE_SIZE = 256
+PEER_HTTP_TIMEOUT = 10.0
+PULL_LIMIT_DEFAULT = 256
 
 HTTP_OK          = 200
 HTTP_BAD_REQUEST = 400
 HTTP_FORBIDDEN   = 403
 HTTP_NOT_FOUND   = 404
+HTTP_INTERNAL    = 500
 
 
 # ── Scroll helper ──────────────────────────────────────────────────────────
-def scroll_all(collection: str, scroll_filter, payload_keys, page_size: int = SCROLL_PAGE_SIZE):
-    """Yield every Qdrant point matching `scroll_filter`, paginating internally.
-
-    Cursor-based pagination is do-while in nature: the first request has no
-    offset, and we only know if there's a next page from the response.
-    Bootstrap explicitly so the main loop carries a clean termination condition.
-    """
+def scroll_all(collection, scroll_filter, payload_keys, page_size=SCROLL_PAGE_SIZE):
+    """Yield every Qdrant point matching `scroll_filter`, paginating internally."""
     def _page(offset):
         return core.qdrant.scroll(
             collection_name=collection,
@@ -69,7 +75,6 @@ def scroll_all(collection: str, scroll_filter, payload_keys, page_size: int = SC
             with_vectors=False,
             offset=offset,
         )
-
     points, next_offset = _page(None)
     yield from points
     while next_offset is not None:
@@ -77,38 +82,31 @@ def scroll_all(collection: str, scroll_filter, payload_keys, page_size: int = SC
         yield from points
 
 
-def point_to_record(p) -> dict:
-    """Wire shape for a group-shared entry returned by /memory/get."""
+def point_to_record(p):
+    """Wire shape for a group entry returned by peer-side /memory/get."""
     pl = p.payload or {}
     return {
-        "canonical_id":         str(p.id),
-        "vector":               list(p.vector) if p.vector is not None else None,
-        "content":              pl.get("content", ""),
-        "content_hash":         pl.get("content_hash", ""),
-        "type":                 pl.get("type", ""),
-        "tags":                 pl.get("tags", []),
-        "importance":           pl.get("importance", 3),
-        "original_timestamp":   pl.get("original_timestamp", ""),
-        "group_name":           pl.get("group_name", ""),
-        "origin_node":          pl.get("origin_node", ""),
-        "origin_local_id":      pl.get("origin_local_id", ""),
-        "submitted_at":         pl.get("submitted_at", ""),
-        "received_at":          pl.get("received_at", ""),
-        "submission_kind":      pl.get("submission_kind", ""),
+        "id":           str(p.id),
+        "content":      pl.get("content", ""),
+        "content_hash": pl.get("content_hash", ""),
+        "vector":       list(p.vector) if p.vector is not None else None,
+        "type":         pl.get("type", ""),
+        "tags":         pl.get("tags", []),
+        "project":      pl.get("project", ""),
+        "importance":   pl.get("importance", 3),
+        "group_name":   pl.get("group_name", ""),
+        "origin_node":  pl.get("origin_node", ""),
+        "submitted_at": pl.get("submitted_at", ""),
+        "received_at":  pl.get("received_at", ""),
     }
 
 
 # ── Config loading ─────────────────────────────────────────────────────────
-def load_config(path: Path) -> dict:
-    """Load and validate the daemon's config. Raises ValueError on invalid schema.
+def load_config(path):
+    """Load and validate the daemon's config.
 
-    Every peer in a group is symmetric — no orchestrator/peer role distinction.
-    A peer that lists a group in `memberships` is a full participant in that
-    group: it can accept group-shared entries (POST /memory/put), serve reads
-    (GET /memory/get), and report the directory (GET /peers).
-
-    The Qdrant collection is fixed at `core.COLLECTION`. Isolation between
-    peers in dev comes from distinct Qdrant ports, not names.
+    Required: node_name, memberships[].group_name, memberships[].peers[].
+    Each peer entry: {node_name, endpoint}. v0.3.0 = single membership.
     """
     with open(path) as f:
         cfg = json.load(f)
@@ -117,32 +115,31 @@ def load_config(path: Path) -> dict:
         raise ValueError("config missing required field: node_name")
     if "memberships" not in cfg or not isinstance(cfg["memberships"], list):
         raise ValueError("config missing or invalid 'memberships' (must be a list)")
+    if len(cfg["memberships"]) != 1:
+        raise ValueError("v0.3.0 supports exactly one membership per node")
 
     for i, m in enumerate(cfg["memberships"]):
         if "group_name" not in m:
             raise ValueError(f"memberships[{i}] missing field: group_name")
+        if "peers" not in m or not isinstance(m["peers"], list):
+            raise ValueError(f"memberships[{i}] missing 'peers' list")
+        for j, p in enumerate(m["peers"]):
+            if "node_name" not in p or "endpoint" not in p:
+                raise ValueError(
+                    f"memberships[{i}].peers[{j}] needs both 'node_name' and 'endpoint'"
+                )
 
-    if len(cfg["memberships"]) > 1:
-        raise ValueError(
-            "v0.3.0 supports only one membership per node; "
-            "multi-membership is reserved for post-MVP"
-        )
-
-    cfg.setdefault("listen_address", "127.0.0.1:7433")
-    cfg.setdefault("qdrant_url", core.QDRANT_URL)
-    cfg.setdefault("state_dir", str(Path.home() / ".local/share/mem-fusion/constellation"))
+    cfg.setdefault("peer_listen_address",    "0.0.0.0:7533")
+    cfg.setdefault("gateway_listen_address", "127.0.0.1:7534")
+    cfg.setdefault("qdrant_url",             core.QDRANT_URL)
+    cfg.setdefault("state_dir",              str(Path.home() / ".local/share/mem-fusion/constellation"))
 
     return cfg
 
 
 # ── Qdrant collection ─────────────────────────────────────────────────────
-def init_collection(collection_name: str, log):
-    """Ensure the shared collection exists with the payload indexes we need.
-
-    Same collection as mem-fusion. Adding indexes is idempotent; the group-share
-    payload fields (origin_node, group_name, received_at) get their own indexes
-    so /peers and /memory/get scrolls stay efficient.
-    """
+def init_collection(collection_name, log):
+    """Ensure the shared collection + payload indexes exist (idempotent)."""
     existing = [c.name for c in core.qdrant.get_collections().collections]
     if collection_name in existing:
         log.info("Collection '%s' already exists", collection_name)
@@ -162,28 +159,25 @@ def init_collection(collection_name: str, log):
         "origin_node":  PayloadSchemaType.KEYWORD,
         "importance":   PayloadSchemaType.INTEGER,
         "timestamp":    PayloadSchemaType.DATETIME,
+        "submitted_at": PayloadSchemaType.DATETIME,
         "received_at":  PayloadSchemaType.DATETIME,
     }
     for field, schema in indexes.items():
         try:
             core.qdrant.create_payload_index(collection_name, field, schema)
-            log.info("  index: %s (%s)", field, schema.value)
         except Exception as e:
-            if "already exists" in str(e).lower():
-                continue
-            log.warning("  index %s FAILED: %s", field, e)
+            if "already exists" not in str(e).lower():
+                log.warning("  index %s FAILED: %s", field, e)
 
 
-# ── HTTP handler ───────────────────────────────────────────────────────────
-class ConstellationHandler(BaseHTTPRequestHandler):
-    """HTTP request handler. State injected via class attribute before serving."""
-    daemon_state: dict = None  # populated at boot
+# ── Shared response helpers ────────────────────────────────────────────────
+class _BaseHandler(BaseHTTPRequestHandler):
+    daemon_state = None  # populated at boot by main()
 
-    def log_message(self, fmt: str, *args):
-        log = self.daemon_state["log"]
-        log.info("HTTP %s - %s", self.client_address[0], fmt % args)
+    def log_message(self, fmt, *args):
+        self.daemon_state["log"].info("HTTP %s - %s", self.client_address[0], fmt % args)
 
-    def _send_json(self, status: int, payload: dict):
+    def _send_json(self, status, payload):
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -191,145 +185,136 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            return None, "empty body"
+        try:
+            return json.loads(self.rfile.read(length)), None
+        except json.JSONDecodeError as e:
+            return None, f"invalid JSON: {e}"
+
+
+# ── Peer-facing HTTP handler ───────────────────────────────────────────────
+class PeerHandler(_BaseHandler):
+    """Endpoints other peers in the group call to share memories with us."""
+
     def do_GET(self):
         if self.path == "/health":
-            cfg = self.daemon_state["config"]
-            self._send_json(HTTP_OK, {
-                "ok":          True,
-                "daemon":      DAEMON_NAME,
-                "version":     VERSION,
-                "node_name":   cfg["node_name"],
-                "memberships": [m["group_name"] for m in cfg["memberships"]],
-            })
-        elif self.path.startswith("/memory/get"):
-            self._handle_memory_get()
-        elif self.path.startswith("/peers/self"):
-            self._handle_peers_self()
-        elif self.path.startswith("/peers"):
-            self._handle_peers_list()
-        else:
-            self._send_json(HTTP_NOT_FOUND, {"error": "not found", "path": self.path})
+            return self._handle_health()
+        if self.path.startswith("/memory/get"):
+            return self._handle_memory_get()
+        if self.path.startswith("/memory/since"):
+            return self._handle_memory_since()
+        if self.path.startswith("/peers/self"):
+            return self._handle_peers_self()
+        if self.path.startswith("/peers"):
+            return self._handle_peers_list()
+        return self._send_json(HTTP_NOT_FOUND, {"error": "not found", "path": self.path})
 
     def do_POST(self):
         if self.path == "/memory/put":
-            self._handle_memory_put()
-        else:
-            self._send_json(HTTP_NOT_FOUND, {"error": "not found", "path": self.path})
+            return self._handle_memory_put()
+        return self._send_json(HTTP_NOT_FOUND, {"error": "not found", "path": self.path})
 
-    # ── /memory/put — receive a peer's memory into this node's collection ──
+    # ── /health ───────────────────────────────────────────────────────────
+    def _handle_health(self):
+        cfg = self.daemon_state["config"]
+        return self._send_json(HTTP_OK, {
+            "ok":          True,
+            "daemon":      DAEMON_NAME,
+            "version":     VERSION,
+            "node_name":   cfg["node_name"],
+            "memberships": [m["group_name"] for m in cfg["memberships"]],
+        })
+
+    # ── /memory/put — receive a memory from another peer ─────────────────
     def _handle_memory_put(self):
         cfg = self.daemon_state["config"]
         log = self.daemon_state["log"]
-        collection = core.COLLECTION
 
-        length = int(self.headers.get("Content-Length", 0))
-        if length <= 0:
-            return self._send_json(HTTP_BAD_REQUEST, {"error": "empty body"})
-        try:
-            body = json.loads(self.rfile.read(length))
-        except json.JSONDecodeError as e:
-            return self._send_json(HTTP_BAD_REQUEST, {"error": f"invalid JSON: {e}"})
+        body, err = self._read_json()
+        if err:
+            return self._send_json(HTTP_BAD_REQUEST, {"error": err})
 
-        for k in ("group_name", "memory_record", "provenance"):
+        # Flat record. All fields top-level.
+        for k in ("content", "content_hash", "vector", "type", "importance",
+                  "group_name", "origin_node", "submitted_at"):
             if k not in body:
-                return self._send_json(HTTP_BAD_REQUEST, {"error": f"missing top-level field: {k}"})
+                return self._send_json(HTTP_BAD_REQUEST, {"error": f"missing field: {k}"})
 
         group_name = body["group_name"]
-        record     = body["memory_record"]
-        provenance = body["provenance"]
-
         memberships = [m["group_name"] for m in cfg["memberships"]]
         if group_name not in memberships:
             return self._send_json(HTTP_FORBIDDEN, {
-                "error":        f"this node is not a member of {group_name!r}",
-                "memberships":  memberships,
+                "error":       f"this node is not a member of {group_name!r}",
+                "memberships": memberships,
             })
 
-        required = ("content", "vector", "content_hash",
-                    "type", "importance", "original_timestamp")
-        for k in required:
-            if k not in record:
-                return self._send_json(HTTP_BAD_REQUEST, {"error": f"memory_record missing field: {k}"})
-
-        expected_chash = core.content_hash(record["content"])
-        if expected_chash != record["content_hash"]:
+        if core.content_hash(body["content"]) != body["content_hash"]:
             return self._send_json(HTTP_BAD_REQUEST, {
-                "error":              "content_hash mismatch",
-                "expected":           expected_chash,
-                "received":           record["content_hash"],
-                "note":               "content was modified somewhere in transit",
+                "error": "content_hash mismatch — content modified in transit",
             })
 
-        vec = record["vector"]
+        vec = body["vector"]
         if not isinstance(vec, list) or len(vec) != core.VECTOR_SIZE:
             return self._send_json(HTTP_BAD_REQUEST, {
-                "error":              f"vector must be {core.VECTOR_SIZE}-dim list",
-                "received_length":    len(vec) if isinstance(vec, list) else None,
-                "received_type":      type(vec).__name__,
+                "error":           f"vector must be {core.VECTOR_SIZE}-dim list",
+                "received_length": len(vec) if isinstance(vec, list) else None,
             })
 
-        # Dedup on content_hash + group_name + source=group.
-        # Locally-originated rows with the same hash are not duplicates from a
-        # group-sharing perspective; the peer asked us to record an inbound copy.
+        # Dedup on (content_hash, group_name). Source-agnostic — a peer's own
+        # originated memory shouldn't be inserted again as source=group.
         existing, _ = core.qdrant.scroll(
-            collection_name=collection,
+            collection_name=core.COLLECTION,
             scroll_filter=Filter(must=[
-                FieldCondition(key="content_hash", match=MatchValue(value=record["content_hash"])),
+                FieldCondition(key="content_hash", match=MatchValue(value=body["content_hash"])),
                 FieldCondition(key="group_name",   match=MatchValue(value=group_name)),
-                FieldCondition(key="source",       match=MatchValue(value="group")),
             ]),
             limit=1, with_payload=False,
         )
         if existing:
             existing_id = str(existing[0].id)
             log.info("PUT duplicate: group=%s hash=%s existing=%s",
-                     group_name, record["content_hash"], existing_id)
+                     group_name, body["content_hash"], existing_id)
             return self._send_json(HTTP_OK, {
-                "status":        "duplicate",
-                "canonical_id":  existing_id,
+                "status": "duplicate",
+                "id":     existing_id,
             })
 
-        canonical_id = str(uuid.uuid4())
-        received_at  = core.iso_now()
+        new_id      = str(uuid.uuid4())
+        received_at = core.iso_now()
         payload = {
-            "content":            record["content"],
-            "content_hash":       record["content_hash"],
-            "type":               record["type"],
-            "tags":               record.get("tags", []),
-            "importance":         record["importance"],
-            "original_timestamp": record["original_timestamp"],
-            "group_name":         group_name,
-            "source":             "group",
-            "origin_node":        provenance.get("origin_node", ""),
-            "origin_local_id":    provenance.get("origin_local_id", ""),
-            "submitted_at":       provenance.get("submitted_at", ""),
-            "submission_kind":    provenance.get("submission_kind", ""),
-            "received_at":        received_at,
-            "received_by":        cfg["node_name"],
-            # `timestamp` mirrors `received_at` so mem-fusion's `search_recent`
-            # (which filters on `timestamp`) surfaces group-shared entries naturally.
-            "timestamp":          received_at,
+            "content":      body["content"],
+            "content_hash": body["content_hash"],
+            "type":         body["type"],
+            "tags":         body.get("tags", []),
+            "project":      body.get("project", ""),
+            "importance":   body["importance"],
+            "group_name":   group_name,
+            "source":       "group",
+            "origin_node":  body["origin_node"],
+            "submitted_at": body["submitted_at"],
+            "received_at":  received_at,
+            # `timestamp` mirrors `received_at` so mem-fusion's search_recent
+            # surfaces group entries naturally without code paths needing to know.
+            "timestamp":    received_at,
         }
         core.qdrant.upsert(
-            collection_name=collection,
-            points=[PointStruct(id=canonical_id, vector=vec, payload=payload)],
+            collection_name=core.COLLECTION,
+            points=[PointStruct(id=new_id, vector=vec, payload=payload)],
         )
-        log.info("PUT stored: group=%s id=%s origin=%s/%s",
-                 group_name, canonical_id,
-                 provenance.get("origin_node", "?"),
-                 (provenance.get("origin_local_id", "?") or "?")[:8])
-
+        log.info("PUT stored: group=%s id=%s origin=%s",
+                 group_name, new_id, body["origin_node"])
         return self._send_json(HTTP_OK, {
-            "status":        "stored",
-            "canonical_id":  canonical_id,
-            "received_at":   received_at,
+            "status": "stored",
+            "id":     new_id,
         })
 
-    # ── /memory/get — fetch group-shared entries from this node ──────────
+    # ── /memory/get ───────────────────────────────────────────────────────
     def _handle_memory_get(self):
         cfg = self.daemon_state["config"]
         log = self.daemon_state["log"]
-        collection = core.COLLECTION
 
         params = parse_qs(urlparse(self.path).query)
         group_name = (params.get("group_name") or [None])[0]
@@ -342,31 +327,26 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         memberships = [m["group_name"] for m in cfg["memberships"]]
         if group_name not in memberships:
             return self._send_json(HTTP_FORBIDDEN, {
-                "error":        f"this node is not a member of {group_name!r}",
-                "memberships":  memberships,
+                "error":       f"this node is not a member of {group_name!r}",
+                "memberships": memberships,
             })
 
         if memory_id:
             points = core.qdrant.retrieve(
-                collection_name=collection,
+                collection_name=core.COLLECTION,
                 ids=[memory_id], with_vectors=True, with_payload=True,
             )
-            if not points:
-                return self._send_json(HTTP_NOT_FOUND, {"error": f"memory {memory_id} not found"})
-            p = points[0]
-            pl = p.payload or {}
-            if pl.get("group_name") != group_name or pl.get("source") != "group":
+            if not points or (points[0].payload or {}).get("group_name") != group_name:
                 return self._send_json(HTTP_NOT_FOUND, {
-                    "error":     f"memory {memory_id} not a group-shared entry in {group_name!r}",
+                    "error": f"memory {memory_id} not in group {group_name!r}",
                 })
             log.info("GET by-id: group=%s id=%s", group_name, memory_id)
-            return self._send_json(HTTP_OK, {"count": 1, "memories": [point_to_record(p)]})
+            return self._send_json(HTTP_OK, {"count": 1, "memories": [point_to_record(points[0])]})
 
         points, _ = core.qdrant.scroll(
-            collection_name=collection,
+            collection_name=core.COLLECTION,
             scroll_filter=Filter(must=[
                 FieldCondition(key="group_name", match=MatchValue(value=group_name)),
-                FieldCondition(key="source",     match=MatchValue(value="group")),
             ]),
             limit=limit, with_payload=True, with_vectors=True,
         )
@@ -376,17 +356,38 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             "memories": [point_to_record(p) for p in points],
         })
 
-    # ── /peers — directory inferred from group-shared entries' origin_node ─
-    def _handle_peers_list(self):
-        """Aggregate origin_node stats from group-shared entries in this group.
-
-        v0.3.0 has no registration step — peers are inferred from submission
-        activity. A node that has never PUT is not listed. Adequate for the
-        trust-as-membership model where visibility follows interaction.
-        """
+    # ── /memory/since — catch-up pull for a peer with a cursor ──────────
+    def _handle_memory_since(self):
         cfg = self.daemon_state["config"]
         log = self.daemon_state["log"]
-        collection = core.COLLECTION
+
+        params = parse_qs(urlparse(self.path).query)
+        group_name = (params.get("group_name") or [None])[0]
+        cursor     = (params.get("cursor") or [None])[0]
+        limit      = int((params.get("limit") or [str(PULL_LIMIT_DEFAULT)])[0])
+
+        if not group_name:
+            return self._send_json(HTTP_BAD_REQUEST, {"error": "missing query param: group_name"})
+
+        memberships = [m["group_name"] for m in cfg["memberships"]]
+        if group_name not in memberships:
+            return self._send_json(HTTP_FORBIDDEN, {
+                "error":       f"this node is not a member of {group_name!r}",
+                "memberships": memberships,
+            })
+
+        memories = core.get_entries_for_pull(group_name, cursor, limit)
+        log.info("GET /memory/since: group=%s cursor=%s returned=%d",
+                 group_name, cursor or "-", len(memories))
+        return self._send_json(HTTP_OK, {
+            "count":    len(memories),
+            "memories": memories,
+        })
+
+    # ── /peers — directory inferred from group entries' origin_node ──────
+    def _handle_peers_list(self):
+        cfg = self.daemon_state["config"]
+        log = self.daemon_state["log"]
 
         params = parse_qs(urlparse(self.path).query)
         group_name = (params.get("group_name") or [None])[0]
@@ -396,26 +397,25 @@ class ConstellationHandler(BaseHTTPRequestHandler):
         memberships = [m["group_name"] for m in cfg["memberships"]]
         if group_name not in memberships:
             return self._send_json(HTTP_FORBIDDEN, {
-                "error":        f"this node is not a member of {group_name!r}",
-                "memberships":  memberships,
+                "error":       f"this node is not a member of {group_name!r}",
+                "memberships": memberships,
             })
 
-        group_filter = Filter(must=[
-            FieldCondition(key="group_name", match=MatchValue(value=group_name)),
-            FieldCondition(key="source",     match=MatchValue(value="group")),
-        ])
-        peers: dict = {}
-        for p in scroll_all(collection, group_filter,
-                            payload_keys=["origin_node", "received_at"]):
+        seen = {}
+        for p in scroll_all(
+            core.COLLECTION,
+            Filter(must=[FieldCondition(key="group_name", match=MatchValue(value=group_name))]),
+            payload_keys=["origin_node", "received_at"],
+        ):
             origin = (p.payload or {}).get("origin_node") or ""
             ts     = (p.payload or {}).get("received_at") or ""
-            if not origin:
+            if not origin or origin == cfg["node_name"]:
                 continue
-            entry = peers.setdefault(origin, {
-                "node_name":         origin,
-                "submission_count":  0,
-                "first_seen":        ts,
-                "last_seen":         ts,
+            entry = seen.setdefault(origin, {
+                "node_name":        origin,
+                "submission_count": 0,
+                "first_seen":       ts,
+                "last_seen":        ts,
             })
             entry["submission_count"] += 1
             if ts and ts < entry["first_seen"]:
@@ -423,7 +423,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             if ts and ts > entry["last_seen"]:
                 entry["last_seen"] = ts
 
-        peer_list = sorted(peers.values(), key=lambda e: e["last_seen"], reverse=True)
+        peer_list = sorted(seen.values(), key=lambda e: e["last_seen"], reverse=True)
         log.info("GET /peers: group=%s count=%d", group_name, len(peer_list))
         return self._send_json(HTTP_OK, {
             "group_name":      group_name,
@@ -432,17 +432,187 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             "peers":           peer_list,
         })
 
-    # ── /peers/self — this node's identity and group memberships ─────────
+    # ── /peers/self ──────────────────────────────────────────────────────
     def _handle_peers_self(self):
         cfg = self.daemon_state["config"]
-        log = self.daemon_state["log"]
-        log.info("GET /peers/self")
+        self.daemon_state["log"].info("GET /peers/self")
         return self._send_json(HTTP_OK, {
             "node_name":      cfg["node_name"],
-            "listen_address": cfg["listen_address"],
+            "listen_address": cfg["peer_listen_address"],
             "version":        VERSION,
             "memberships":    [m["group_name"] for m in cfg["memberships"]],
         })
+
+
+# ── Gateway HTTP handler (mem-fusion → constellation, localhost-only) ─────
+class GatewayHandler(_BaseHandler):
+    """Endpoints the local mem-fusion process calls to drive group operations.
+
+    Bound to 127.0.0.1; network-enforced localhost-only.
+    """
+
+    def do_POST(self):
+        if self.path == "/pull":
+            return self._handle_pull()
+        if self.path == "/push":
+            return self._handle_push()
+        return self._send_json(HTTP_NOT_FOUND, {"error": "not found", "path": self.path})
+
+    # ── POST /pull — fan out GET /memory/since to every peer in group ────
+    def _handle_pull(self):
+        cfg = self.daemon_state["config"]
+        log = self.daemon_state["log"]
+        membership = cfg["memberships"][0]
+        group_name = membership["group_name"]
+        peers      = membership["peers"]
+
+        cursor = core.max_submitted_at_in_group(group_name)
+        log.info("PULL start: group=%s cursor=%s peers=%d",
+                 group_name, cursor or "-", len(peers))
+
+        results = []
+        for peer in peers:
+            r = {"node_name": peer["node_name"], "group_name": group_name}
+            try:
+                params = {"group_name": group_name}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = httpx.get(f"{peer['endpoint']}/memory/since",
+                                 params=params, timeout=PEER_HTTP_TIMEOUT)
+                if resp.status_code != HTTP_OK:
+                    r["status"] = "unreachable"
+                    r["reason"] = f"http {resp.status_code}"
+                else:
+                    inserted = self._insert_pulled(resp.json().get("memories", []), group_name)
+                    r["status"]    = "responsive"
+                    r["entry_ids"] = inserted
+                    log.info("PULL from %s: inserted=%d", peer["node_name"], len(inserted))
+            except httpx.ConnectError:
+                r["status"], r["reason"] = "unreachable", "connection refused"
+            except httpx.TimeoutException:
+                r["status"], r["reason"] = "unreachable", "timeout"
+            except Exception as e:
+                r["status"], r["reason"] = "unreachable", str(e)[:200]
+            results.append(r)
+
+        results.sort(key=lambda r: r["node_name"])
+        return self._send_json(HTTP_OK, {"peers": results})
+
+    def _insert_pulled(self, memories, group_name):
+        """Insert pulled entries into local Qdrant; dedup by (content_hash, group_name)."""
+        inserted_ids = []
+        for mem in memories:
+            existing, _ = core.qdrant.scroll(
+                collection_name=core.COLLECTION,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="content_hash",
+                                   match=MatchValue(value=mem.get("content_hash", ""))),
+                    FieldCondition(key="group_name",
+                                   match=MatchValue(value=group_name)),
+                ]),
+                limit=1, with_payload=False,
+            )
+            if existing:
+                continue
+            canonical_id = str(uuid.uuid4())
+            received_at = core.iso_now()
+            payload = {
+                "content":      mem.get("content", ""),
+                "content_hash": mem.get("content_hash", ""),
+                "type":         mem.get("type", ""),
+                "tags":         mem.get("tags", []),
+                "project":      mem.get("project", ""),
+                "importance":   mem.get("importance", 3),
+                "group_name":   group_name,
+                "source":       "group",
+                "origin_node":  mem.get("origin_node", ""),
+                "submitted_at": mem.get("submitted_at", ""),
+                "received_at":  received_at,
+                "timestamp":    received_at,
+            }
+            core.qdrant.upsert(
+                collection_name=core.COLLECTION,
+                points=[PointStruct(id=canonical_id, vector=mem.get("vector"), payload=payload)],
+            )
+            inserted_ids.append(canonical_id)
+        return inserted_ids
+
+    # ── POST /push — share a local memory with every peer in group ───────
+    def _handle_push(self):
+        cfg = self.daemon_state["config"]
+        log = self.daemon_state["log"]
+        membership = cfg["memberships"][0]
+        group_name = membership["group_name"]
+        peers      = membership["peers"]
+        node_name  = cfg["node_name"]
+
+        body, err = self._read_json()
+        if err:
+            return self._send_json(HTTP_BAD_REQUEST, {"error": err})
+        if "record" not in body or "id" not in body["record"]:
+            return self._send_json(HTTP_BAD_REQUEST, {"error": "missing record.id"})
+
+        record   = body["record"]
+        local_id = record["id"]
+
+        # Augment local entry: re-upsert with group metadata added.
+        existing = core.qdrant.retrieve(
+            collection_name=core.COLLECTION,
+            ids=[local_id], with_payload=True, with_vectors=True,
+        )
+        if not existing:
+            return self._send_json(HTTP_NOT_FOUND, {"error": f"local memory {local_id} not found"})
+
+        submitted_at = core.iso_now()
+        p = existing[0]
+        augmented = dict(p.payload or {})
+        augmented["group_name"]   = group_name
+        augmented["origin_node"]  = node_name
+        augmented["submitted_at"] = submitted_at
+        augmented["received_at"]  = submitted_at
+        core.qdrant.upsert(
+            collection_name=core.COLLECTION,
+            points=[PointStruct(id=local_id, vector=p.vector, payload=augmented)],
+        )
+        log.info("PUSH augment: id=%s group=%s submitted_at=%s",
+                 local_id[:8], group_name, submitted_at)
+
+        wire = {
+            "content":      record["content"],
+            "content_hash": record["content_hash"],
+            "vector":       record["vector"],
+            "type":         record["type"],
+            "tags":         record.get("tags", []),
+            "project":      record.get("project", ""),
+            "importance":   record["importance"],
+            "group_name":   group_name,
+            "origin_node":  node_name,
+            "submitted_at": submitted_at,
+        }
+
+        results = []
+        for peer in peers:
+            r = {"node_name": peer["node_name"], "group_name": group_name}
+            try:
+                resp = httpx.post(f"{peer['endpoint']}/memory/put",
+                                  json=wire, timeout=PEER_HTTP_TIMEOUT)
+                if resp.status_code != HTTP_OK:
+                    r["status"] = "unreachable"
+                    r["reason"] = f"http {resp.status_code}"
+                else:
+                    r["status"]   = "responsive"
+                    r["delivery"] = resp.json().get("status", "stored")
+                    log.info("PUSH to %s: %s", peer["node_name"], r["delivery"])
+            except httpx.ConnectError:
+                r["status"], r["reason"] = "unreachable", "connection refused"
+            except httpx.TimeoutException:
+                r["status"], r["reason"] = "unreachable", "timeout"
+            except Exception as e:
+                r["status"], r["reason"] = "unreachable", str(e)[:200]
+            results.append(r)
+
+        results.sort(key=lambda r: r["node_name"])
+        return self._send_json(HTTP_OK, {"peers": results})
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -467,9 +637,6 @@ def main():
     state_dir = Path(cfg["state_dir"])
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    # Point core's module-level Qdrant client at the daemon's configured URL.
-    # (Dev peers run their own Qdrant on a distinct port; production uses the
-    # default 6333.) Collection name is invariant — never rewritten.
     core.QDRANT_URL = cfg["qdrant_url"]
     from qdrant_client import QdrantClient
     core.qdrant = QdrantClient(url=cfg["qdrant_url"], timeout=10)
@@ -477,51 +644,72 @@ def main():
     log = core.configure_logging(DAEMON_NAME)
     log.info("=" * 60)
     log.info("Constellation daemon v%s starting", VERSION)
-    log.info("  node_name:   %s", cfg["node_name"])
-    log.info("  config:      %s", config_path)
-    log.info("  state_dir:   %s", state_dir)
-    log.info("  qdrant_url:  %s", cfg["qdrant_url"])
-    log.info("  collection:  %s", core.COLLECTION)
+    log.info("  node_name:        %s", cfg["node_name"])
+    log.info("  config:           %s", config_path)
+    log.info("  state_dir:        %s", state_dir)
+    log.info("  qdrant_url:       %s", cfg["qdrant_url"])
+    log.info("  collection:       %s", core.COLLECTION)
+    log.info("  peer_listener:    %s", cfg["peer_listen_address"])
+    log.info("  gateway_listener: %s", cfg["gateway_listen_address"])
     for m in cfg["memberships"]:
-        log.info("  membership:  %s", m["group_name"])
+        log.info("  membership:       %s (peers=%d)",
+                 m["group_name"], len(m["peers"]))
 
     init_collection(core.COLLECTION, log)
 
-    host, port_str = cfg["listen_address"].split(":")
-    port = int(port_str)
-    ConstellationHandler.daemon_state = {"config": cfg, "log": log}
+    state = {"config": cfg, "log": log}
+    PeerHandler.daemon_state = state
+    GatewayHandler.daemon_state = state
 
     HTTPServer.allow_reuse_address = True
+
+    peer_host, peer_port = cfg["peer_listen_address"].rsplit(":", 1)
+    gw_host,   gw_port   = cfg["gateway_listen_address"].rsplit(":", 1)
     try:
-        server = HTTPServer((host, port), ConstellationHandler)
+        peer_server = HTTPServer((peer_host, int(peer_port)), PeerHandler)
     except OSError as e:
-        log.error("Failed to bind %s: %s", cfg["listen_address"], e)
-        print(f"ERROR: cannot bind {cfg['listen_address']}: {e}", file=sys.stderr)
+        print(f"ERROR: cannot bind peer listener {cfg['peer_listen_address']}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        gateway_server = HTTPServer((gw_host, int(gw_port)), GatewayHandler)
+    except OSError as e:
+        peer_server.server_close()
+        print(f"ERROR: cannot bind gateway listener {cfg['gateway_listen_address']}: {e}",
+              file=sys.stderr)
         sys.exit(1)
 
-    log.info("HTTP listener bound on %s", cfg["listen_address"])
+    peer_thread    = threading.Thread(target=peer_server.serve_forever,    daemon=True)
+    gateway_thread = threading.Thread(target=gateway_server.serve_forever, daemon=True)
+    peer_thread.start()
+    gateway_thread.start()
+
     if args.foreground:
-        print(f"✓ Constellation daemon v{VERSION} listening on http://{cfg['listen_address']}")
+        print(f"✓ Constellation daemon v{VERSION}")
         print(f"  Node:        {cfg['node_name']}")
-        print(f"  Memberships: {[m['group_name'] for m in cfg['memberships']]}")
+        print(f"  Peer:        http://{cfg['peer_listen_address']}    (peer-to-peer)")
+        print(f"  Gateway:     http://{cfg['gateway_listen_address']}  (mem-fusion → constellation)")
         print(f"  Qdrant:      {cfg['qdrant_url']} ({core.COLLECTION})")
+        print(f"  Membership:  {cfg['memberships'][0]['group_name']} "
+              f"({len(cfg['memberships'][0]['peers'])} peers)")
         print(f"  Log:         {core.ACTIVE_LOG_PATH}")
-        print(f"  Try:         curl http://{cfg['listen_address']}/health")
         print(f"  Stop:        Ctrl-C")
 
+    shutdown_event = threading.Event()
     def _shutdown(signum, _frame):
         log.info("Received signal %d, shutting down", signum)
-        server.shutdown()
+        shutdown_event.set()
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log.info("Daemon shutting down (KeyboardInterrupt)")
-    finally:
-        server.server_close()
-        log.info("Constellation daemon stopped")
+    shutdown_event.wait()
+    peer_server.shutdown()
+    gateway_server.shutdown()
+    peer_thread.join(timeout=5)
+    gateway_thread.join(timeout=5)
+    peer_server.server_close()
+    gateway_server.server_close()
+    log.info("Constellation daemon stopped")
 
 
 if __name__ == "__main__":

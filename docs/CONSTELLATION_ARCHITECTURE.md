@@ -70,36 +70,68 @@ MVP group size (≤10 peers) makes per-write fan-out trivial — 9 outbound HTTP
 
 ## 5. Protocol surface
 
-All endpoints scoped by `group_name`. Every peer exposes every endpoint. Localhost binding by default.
+Constellation exposes two HTTP surfaces in one process, on two ports:
 
-| Endpoint | Purpose | Status |
-|---|---|---|
-| `POST /memory/put` | Receive a memory from another peer | ✅ Implemented |
-| `GET /memory/get?group_name=&id=` | Fetch a shared memory by ID | ✅ Implemented |
-| `GET /memory/get?group_name=&limit=` | Scroll recent shared memories | ✅ Implemented |
-| `GET /peers?group_name=` | Directory of peers known to this node (inferred from PUT activity) | ✅ Implemented |
-| `GET /peers/self` | This node's identity + memberships | ✅ Implemented |
-| `GET /health` | Liveness probe | ✅ Implemented |
-| `GET /memory/since?group_name=&cursor=` | Incremental catch-up fetch | 🚧 Planned (next milestone) |
-| `GET /memory/events` (SSE) | Long-lived stream of new entries | 🚧 Planned (next milestone) |
+- **Peer surface** (bound to `0.0.0.0:7533`) — what other peers' Constellation daemons call. Network-reachable on LAN/VPN.
+- **Gateway surface** (bound to `127.0.0.1:7534`) — what the local Mem-Fusion process calls. Localhost-only by network binding.
 
-### `POST /memory/put`
+### Peer surface (peer ↔ peer)
 
-Validate `content_hash` (recompute and compare — reject on mismatch). Validate vector dimension. Dedup on `(content_hash, group_name, source=group)`. Insert with full provenance payload (`origin_node`, `group_name`, `submitted_at`, `received_at`, `submission_kind`).
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness probe; returns node identity + memberships |
+| `GET /peers/self` | This node's identity + memberships + listen address |
+| `GET /peers?group_name=` | Directory of peers known to this node, inferred from received-memory `origin_node` activity |
+| `POST /memory/put` | Receive a memory from another peer |
+| `GET /memory/get?group_name=&id=` | Fetch a group entry by ID |
+| `GET /memory/get?group_name=&limit=` | Scroll recent group entries |
+| `GET /memory/since?group_name=&cursor=` | Pull entries with `submitted_at > cursor` (called during another peer's pull) |
 
-### `GET /memory/get`
+### Gateway surface (mem-fusion → constellation, localhost-only)
 
-Two modes. By-ID returns one shared memory, vector and all. Scroll mode returns recent shared memories in the group (with a configurable limit).
+| Endpoint | Purpose |
+|---|---|
+| `POST /pull` | Pull new entries from every peer in the group; insert deduped; return per-peer telemetry |
+| `POST /push` | Augment a local entry with group metadata, then send to every peer in the group; return per-peer delivery telemetry |
 
-### `GET /peers`
+### `POST /memory/put` (peer surface)
 
-Directory inferred from each shared memory's `origin_node` payload field. A peer that has never submitted a memory to this node is not listed — this is fine for MVP (visibility follows interaction).
+Receives a flat record from another peer:
+```json
+{
+  "content": "...", "content_hash": "...", "vector": [...],
+  "type": "...", "tags": [...], "project": "...", "importance": 4,
+  "group_name": "...", "origin_node": "...", "submitted_at": "..."
+}
+```
+Validates `content_hash` (recompute and compare — reject on mismatch). Validates vector dimension. Dedups on `(content_hash, group_name)` — source-agnostic. Inserts tagged `source=group` with `received_at = now()` and `timestamp = received_at`. Returns `{status: "stored"|"duplicate", id}`.
+
+### `GET /memory/since` (peer surface)
+
+Returns entries where `(group_name == X) AND (submitted_at > cursor)`, sorted ascending by `submitted_at`. Full records including vector — no re-embedding required at the receiver. The cursor key is `submitted_at` (origin's timestamp) so it's comparable across peers regardless of who's answering.
+
+### `POST /pull` (gateway surface)
+
+Mem-fusion calls this to refresh the local store from group peers. Daemon:
+1. Reads `memberships[].peers[]` from config.
+2. Derives cursor as `max(submitted_at)` over local Qdrant entries in the group (no stored cursor state).
+3. Calls `GET /memory/since?group_name=&cursor=` on each peer.
+4. Inserts returned entries into local Qdrant tagged `source=group`, deduped by `(content_hash, group_name)`.
+5. Returns per-peer telemetry. See §7 for the response shape.
+
+### `POST /push` (gateway surface)
+
+Mem-fusion calls this after `store_memory` to share a memory with the group. Body: `{record: {id, content, content_hash, vector, ...}}`. Daemon:
+1. Augments the local entry (by ID) with `group_name`, `origin_node` (= self), `submitted_at` (= now).
+2. Sends the same record + group metadata to every peer in the group via `POST /memory/put`.
+3. Returns per-peer delivery telemetry.
 
 ### What is NOT in the protocol
 
-- **No group-wide search.** Each peer searches its own collection. The group network is for sharing writes, not for routing queries between peers.
-- **No memory editing across the group.** Shared entries are append-only on each receiving peer.
-- **No automatic peer discovery.** Memberships are set in each peer's config.
+- **No group-wide search.** Each peer searches its own collection.
+- **No memory editing across the group.** Group entries are append-only on each receiving peer.
+- **No automatic peer discovery.** `memberships[].peers[]` is statically configured.
+- **No background sync.** All sharing is user-initiated through `/remember` or `/remember pull`.
 
 ---
 
@@ -110,81 +142,155 @@ Constellation does not own a separate Qdrant collection. It writes into the same
 | Tag | Origin | Carries |
 |---|---|---|
 | `source=local` | Written by Mem-Fusion on this peer | `content`, `vector`, `content_hash`, `timestamp`, `type`, `tags`, `project`, `importance` |
-| `source=group` | Received via `POST /memory/put` from another peer | Same fields + `origin_node`, `group_name`, `received_at`, `submitted_at`, `submission_kind` |
+| `source=group` | Received from another peer via `POST /memory/put` or `POST /pull` | Same fields + `group_name`, `origin_node`, `submitted_at`, `received_at` |
 
-`timestamp` on shared entries is aliased to `received_at` so Mem-Fusion's time-filtered queries (`search_recent`, etc.) surface them naturally — same query, same shape, same vector format — without code paths having to know the difference.
+When a peer **pushes** a local memory to its group, the originator's `source=local` entry is augmented in place: `group_name`, `origin_node` (= self), `submitted_at` (= push time) are added to its payload. The entry stays `source=local` (it's still locally-originated) but now carries group identity so it shows up in subsequent pull queries from other peers.
 
-**Dedup is on `(content_hash, group_name, source=group)`.** A peer's local copy and a copy received from another peer with the same content can coexist; they're different events ("I wrote this" vs. "I received this from X").
+`timestamp` on group entries (whether origin-side or receive-side) reflects local store/receive time, so Mem-Fusion's time-filtered queries (`search_recent`, etc.) surface group entries naturally — same query, same shape, same vector format — without code paths having to know the difference.
 
-**No replication state.** Each peer's Qdrant is the source of truth for what that peer knows. No replication ledger, no conflict resolution, no consensus protocol. Convergence is eventual via per-write fan-out.
+**Dedup is on `(content_hash, group_name)` — source-agnostic.** This is what prevents an originator from receiving back its own pushed memory as a separate `source=group` entry during a subsequent pull. Once any peer has content X for group G, further inserts of the same `(content_hash, group_name)` are dropped as duplicates.
+
+**No replication state.** Each peer's Qdrant is the source of truth for what that peer knows. No replication ledger, no conflict resolution, no consensus protocol. Convergence is eventual via push-on-write plus user-initiated pulls.
 
 ---
 
 ## 7. Synchronization
 
-### Currently (v0.3.0): send on write
+All sharing is **user-initiated** in v0.3.0. There is no background timer in Constellation, no SSE pub/sub, no automatic catch-up cycle. The user decides when memory moves between peers; Claude executes the decision via two MCP tools on Mem-Fusion.
 
-When a node writes a memory locally:
+### Push (write distribution) — automatic on `/remember`
 
-1. Mem-Fusion stores it (`source=local`) in this peer's Qdrant via `core.store_memory`.
-2. CLAUDE.md instructs Claude to call `mem-fusion/export_record(id=<local_id>)` to extract the full record (incl. 768-dim vector).
-3. Claude calls `constellation/memory/put(...)` on each remote peer in the group.
+CLAUDE.md instructs Claude that after `store_memory` returns successfully, also call `mem-fusion/group_push(id=<local_id>)`. The flow:
 
-Send-on-write only. This guarantees forward-going writes reach peers that are online but doesn't backfill peers offline at write time. The publisher sees the failure for any peer it couldn't reach — no silent queueing.
+1. Mem-Fusion stores the memory locally (`source=local`).
+2. Mem-Fusion's `group_push` tool fetches the full record via `core.export_record(id)` and POSTs it to the local Constellation gateway at `POST 127.0.0.1:7534/push`.
+3. The gateway augments the local entry in place with `group_name`, `origin_node` (= self), `submitted_at` (= now).
+4. The gateway fans out `POST /memory/put` to every peer in the group's `peers[]` list.
+5. The gateway returns per-peer delivery telemetry to Mem-Fusion.
+6. Claude renders a per-peer summary to the user.
 
-### Planned: SSE pub/sub + pull safety net
+If a peer is unreachable at push time, that peer's entry in the telemetry says `status: "unreachable"` with a `reason`. The publisher knows what didn't get through. The offline peer will pick up the memory when *anyone* in the group later issues a `/remember pull`.
 
-Two transports together cover both online and offline-at-write-time cases:
+### Pull (catch-up) — manual via `/remember pull`
 
-- **SSE primary.** Each peer subscribes via long-lived `GET /memory/events?group_name=` connections to every other peer. New writes stream in real-time. Each subscriber tracks its own cursor (`received_at` timestamp).
-- **Pull safety net.** Every 60 seconds each peer calls `GET /memory/since?cursor=` on every other peer to catch what SSE missed.
+The user invokes `/remember pull`. Claude calls `mem-fusion/group_pull({})`. The flow:
 
-Both share the same primitive: `core.get_new_entries_since(cursor, source_filter, limit)` — already extracted into `core.py` for this purpose.
+1. Mem-Fusion's `group_pull` tool POSTs to the local Constellation gateway at `POST 127.0.0.1:7534/pull`.
+2. The gateway derives the cursor as `max(submitted_at)` over local group entries (no stored state).
+3. The gateway calls `GET /memory/since?group_name=&cursor=` on every peer in `peers[]`.
+4. Each peer returns entries with `submitted_at > cursor`, vector and all, sorted ascending.
+5. The gateway inserts each new entry locally tagged `source=group`, deduped by `(content_hash, group_name)`.
+6. The gateway returns per-peer telemetry with `entry_ids` of newly-inserted entries (or `reason` for unreachable peers).
+7. Claude renders a per-peer summary to the user; for entries the user asks about, Claude fetches content via `export_record(id)` or `search_recent`.
+
+### Telemetry response shapes
+
+Both `POST /pull` and `POST /push` return per-peer telemetry — never raw content. The data lives in Qdrant; the telemetry tells Claude what happened.
+
+`POST /pull` response:
+```json
+{
+  "peers": [
+    {"node_name": "alice", "group_name": "g", "status": "responsive", "entry_ids": [...]},
+    {"node_name": "carol", "group_name": "g", "status": "unreachable", "reason": "..."}
+  ]
+}
+```
+
+`POST /push` response:
+```json
+{
+  "peers": [
+    {"node_name": "alice", "group_name": "g", "status": "responsive", "delivery": "stored"},
+    {"node_name": "bob",   "group_name": "g", "status": "responsive", "delivery": "duplicate"},
+    {"node_name": "carol", "group_name": "g", "status": "unreachable", "reason": "..."}
+  ]
+}
+```
+
+Claude derives counts and aggregates by walking the array; the daemon doesn't pre-compute them.
+
+### Why user-initiated, not automatic
+
+The user controls when their group memory is "freshened." No silent background traffic. No clock-driven daemon decisions. The complexity of automatic sync (SSE reconnects, cursor-per-subscription state, pull-cycle rotation) buys little at MVP scale and obscures what the system is doing. If real usage shows manual pulls are too friction-heavy, automatic sync can be added later — Claude can invoke `group_pull` from a hook or installed prompt, keeping the orchestration on the AI side rather than the daemon side.
 
 ---
 
 ## 8. Process architecture
 
 ```
-   ┌─────────────────────┐              ┌─────────────────────────┐
-   │   mem_fusion.py     │              │    constellation.py     │
-   │  (stdio MCP)        │              │   (HTTP MCP, :7433)     │
-   │  served to Claude   │              │   served to peers       │
-   └─────────────────┬───┘              └───┬─────────────────────┘
-                     │                       │
-                     └──────┐       ┌────────┘
-                            ▼       ▼
-                       ┌─────────────┐
-                       │   core.py   │
-                       │   (shared)  │
-                       └──────┬──────┘
-                              ▼
-                       ┌─────────────┐
-                       │   Qdrant    │
-                       │  cowork_    │
-                       │  memories   │
-                       └─────────────┘
+        Claude
+          │  MCP stdio (the only MCP surface Claude talks to)
+          ▼
+   ┌────────────────────────────────┐
+   │   mem_fusion.py                │
+   │   (stdio MCP server)           │
+   │                                │
+   │   11 tools:                    │
+   │   • 9 memory tools → core.py   │
+   │   • group_pull  → gateway      │
+   │   • group_push  → gateway      │
+   └─────┬──────────────────────┬───┘
+         │                      │
+         │ core.py              │ HTTP to 127.0.0.1:7534
+         │ (Qdrant access)      │ (group_pull / group_push)
+         ▼                      ▼
+   ┌─────────────┐    ┌──────────────────────────────────┐
+   │   Qdrant    │    │  constellation.py (one process)  │
+   │  cowork_    │    │                                  │
+   │  memories   │    │  ┌────────────────────────────┐  │
+   └─────────────┘    │  │ Peer surface 0.0.0.0:7533  │  │
+         ▲           │  │ (LAN-reachable)            │◄─┼── remote peers
+         │           │  │ /health /peers/self /peers │  │
+         │ core.py   │  │ /memory/put /memory/get    │  │
+         │           │  │ /memory/since              │  │
+         │           │  └────────────────────────────┘  │
+         │           │                                  │
+         │           │  ┌────────────────────────────┐  │
+         │           │  │ Gateway     127.0.0.1:7534 │  │
+         └───────────┼──┤ (localhost-only)           │  │
+                     │  │ /pull   /push              │  │
+                     │  └─────────┬──────────────────┘  │
+                     │            │ outbound HTTP       │
+                     │            ▼ fan-out             │
+                     │   remote peers' :7533 listeners  │
+                     └──────────────────────────────────┘
 ```
 
 ### `core.py` — the shared library
 
-The only module that talks to Qdrant. Contains the Qdrant client, the Ollama embedding helper, all 9 memory operations (`store_memory`, `search_memory`, `export_record`, etc.), and the `get_new_entries_since` notification helper. Both daemons import it.
+The only module that talks to Qdrant. Contains the Qdrant client, the Ollama embedding helper, all 9 memory operations (`store_memory`, `search_memory`, `export_record`, etc.), plus group-pull helpers (`get_entries_for_pull`, `max_submitted_at_in_group`). Both daemons import it.
 
-### `mem_fusion.py` — Claude's MCP proxy (stdio)
+### `mem_fusion.py` — the MCP server (stdio)
 
-A ~130-line wrapper that translates MCP JSON-RPC over stdio into calls to `core.py`. One subprocess per Claude session. Localhost-only by design — no network listener.
+A thin wrapper that translates MCP JSON-RPC over stdio into calls to `core.py` (for local memory ops) or to the local Constellation gateway over HTTP (for `group_pull` and `group_push`). One subprocess per Claude session. Localhost-only by design — no network listener.
 
-### `constellation.py` — group peer's MCP proxy (HTTP)
+### `constellation.py` — group backend (HTTP, two listeners)
 
-A persistent HTTP daemon under launchd. Exposes the protocol surface from §5 to other peers in the group. Imports `core.py` for storage; never talks directly to Mem-Fusion.
+A persistent HTTP daemon under launchd. **Two listeners** in one process:
+
+- **Peer surface** (`0.0.0.0:7533`) — what other peers' Constellation daemons call. Network-reachable on LAN/VPN. Receives pushed memories (`POST /memory/put`) and answers pull queries (`GET /memory/since`).
+- **Gateway surface** (`127.0.0.1:7534`) — what the local Mem-Fusion process calls. Localhost-only by network binding. Drives outbound peer fan-out for `POST /pull` and `POST /push`.
+
+Constellation is **not** an MCP server. Claude only talks to one MCP server — `mem_fusion.py`. Constellation is a backend that Mem-Fusion delegates group operations to.
 
 ### Why two daemons, not one
 
-The HTTP listener is a public attack surface. Mem-Fusion's stdio serves only the Claude subprocess it's parented to. Process isolation means a compromised Constellation cannot read or modify Mem-Fusion's in-memory state directly. The daemons communicate only through Qdrant.
+The peer listener is a public attack surface (LAN-reachable). Mem-Fusion's stdio MCP serves only the Claude subprocess it's parented to. Process isolation means a compromised Constellation cannot read or modify Mem-Fusion's in-memory state directly. The daemons communicate only through:
+- Qdrant (shared collection, source-tagged entries)
+- The local gateway HTTP surface (Mem-Fusion → Constellation only)
 
-### No IPC
+### Why two listeners on one daemon
 
-Qdrant is the meeting point. Either daemon writes to `cowork_memories`; either daemon reads from `cowork_memories`. The `source` tag tells them which entries are "theirs." A freshly-installed Constellation picks up Mem-Fusion's existing memory with no handshake.
+The peer surface and gateway surface have different threat models — peer surface is exposed to other machines; gateway is local-only. Binding them to different addresses gives **network-enforced separation**: traffic from a remote peer cannot reach the gateway port regardless of any path or auth logic in the handler.
+
+### Graceful degradation
+
+If Constellation isn't installed/running, `group_pull` and `group_push` on Mem-Fusion return `{error: "constellation_not_installed"}`. Mem-Fusion still works for all local-memory operations. Group memory is a strict opt-in — installing Constellation activates the group tools without re-registering anything with Claude.
+
+### No IPC between daemons
+
+Qdrant is the rendezvous. Mem-Fusion writes to `cowork_memories`; Constellation writes to `cowork_memories`. The `source` tag tells them which entries are "theirs." A freshly-installed Constellation picks up Mem-Fusion's existing memory with no handshake.
 
 ---
 
@@ -193,16 +299,32 @@ Qdrant is the meeting point. Either daemon writes to `cowork_memories`; either d
 ```json
 {
   "node_name": "alice-mac",
-  "listen_address": "127.0.0.1:7433",
+  "peer_listen_address":    "0.0.0.0:7533",
+  "gateway_listen_address": "127.0.0.1:7534",
   "qdrant_url": "http://127.0.0.1:6333",
-  "state_dir": "~/.local/share/mem-fusion/constellation",
+  "state_dir":  "~/.local/share/mem-fusion/constellation",
   "memberships": [
-    { "group_name": "engineering@branch" }
+    {
+      "group_name": "engineering@branch",
+      "peers": [
+        { "node_name": "bob-mac",       "endpoint": "http://10.0.0.5:7533" },
+        { "node_name": "carol-laptop",  "endpoint": "http://10.0.0.7:7533" }
+      ]
+    }
   ]
 }
 ```
 
-`memberships` lists group names this peer belongs to. There is no role per membership — every member is a full participant in the group. v0.3.0 restricts `memberships` to length 1; multi-group membership is post-MVP.
+| Field | Purpose |
+|---|---|
+| `node_name` | This peer's identifier (used as `origin_node` on every memory it shares) |
+| `peer_listen_address` | Address for the peer surface. `0.0.0.0:7533` exposes on LAN for other peers' Constellation daemons to reach |
+| `gateway_listen_address` | Address for the Mem-Fusion gateway. `127.0.0.1:7534` binds localhost-only |
+| `qdrant_url` | The local Qdrant instance Mem-Fusion and Constellation both use |
+| `memberships[].group_name` | Which group this peer belongs to (v0.3.0 = exactly one) |
+| `memberships[].peers[]` | Other peers in the group — each entry has `node_name` and `endpoint` (the peer's `http://host:7533` URL) |
+
+There is no role per membership — every peer is a full participant. v0.3.0 restricts `memberships` to length 1; multi-group membership is post-MVP. Peers are statically configured; no automatic discovery.
 
 ---
 
@@ -212,8 +334,8 @@ Qdrant is the meeting point. Either daemon writes to `cowork_memories`; either d
 
 1. Read config.
 2. Init the shared Qdrant collection (idempotent — no-op if Mem-Fusion already initialized it).
-3. Bind HTTP listener on `listen_address`.
-4. Begin serving the protocol surface for each group in `memberships`.
+3. Bind two HTTP listeners — peer (`peer_listen_address`) and gateway (`gateway_listen_address`).
+4. Serve both surfaces concurrently in separate threads. Begin accepting peer pushes and gateway calls from Mem-Fusion.
 
 ### Joining a group
 
@@ -229,7 +351,7 @@ There is no creation ritual. The first peer to configure a group with a given `g
 
 ## 11. Authentication (v0.3.0)
 
-None. Both daemons bind to `127.0.0.1` by default. Peers reaching each other across machines do so over a private network (LAN, Tailscale, VPN) — Constellation does not authenticate the connection.
+None. The peer surface binds to `0.0.0.0:7533` for LAN reachability; the gateway surface binds to `127.0.0.1:7534`. Peers reaching each other across machines do so over a private network (LAN, Tailscale, VPN) — Constellation does not authenticate the connection.
 
 Intentional for MVP. The threat model is "machines I own and people I work directly with." Swarm-key Bearer auth, mTLS, and per-peer Ed25519 identities are designed for post-MVP but not implemented.
 
@@ -240,15 +362,18 @@ Intentional for MVP. The threat model is "machines I own and people I work direc
 ### Implemented
 
 - Symmetric peers (no roles)
-- Single Qdrant collection per peer with source tagging
-- Send-on-write group sharing
+- Two-listener architecture (peer surface + localhost-only gateway surface)
+- Single Qdrant collection per peer with `source` tagging
+- Constellation as Mem-Fusion's group backend (not a separate MCP server)
+- `group_pull` and `group_push` MCP tools on Mem-Fusion
+- Push-on-`/remember` (automatic) + manual pull via `/remember pull`
 - Single-group membership per node
+- Static peer config (no discovery)
 - `content_hash` dedup + verbatim-vector integrity invariants
-- Localhost-only listener; no auth
 
 ### Deferred to post-MVP
 
-- SSE pub/sub and pull safety net (`/memory/since`, `/memory/events`)
+- Automatic background sync (SSE pub/sub or timer-driven pull)
 - Multi-group membership per node
 - Auth (swarm key, mTLS, per-peer identity)
 - Human review / curator / apprenticeship loop (MVP ships auto-share)

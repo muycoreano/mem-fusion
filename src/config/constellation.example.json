@@ -1,7 +1,8 @@
 {
   "node_name": "<your-machine-name>",
 
-  "listen_address": "127.0.0.1:7533",
+  "peer_listen_address":    "0.0.0.0:7533",
+  "gateway_listen_address": "127.0.0.1:7534",
 
   "qdrant_url": "http://127.0.0.1:6333",
 
@@ -9,7 +10,11 @@
 
   "memberships": [
     {
-      "group_name": "<your-group-name>"
+      "group_name": "<your-group-name>",
+      "peers": [
+        { "node_name": "<peer-2-name>", "endpoint": "http://<peer-2-ip>:7533" },
+        { "node_name": "<peer-3-name>", "endpoint": "http://<peer-3-ip>:7533" }
+      ]
     }
   ]
 }

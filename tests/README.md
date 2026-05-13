@@ -1,85 +1,70 @@
-# Mem-Fusion — Tests & Dev Tooling
+# Mem-Fusion — Tests
 
-Manual, ephemeral, log-friendly. No launchd. No persistence beyond what you start. Stop a peer, it's gone until you start it again. Reboot the machine, no dev peer comes back automatically.
+All tests are self-contained. Each spins up its own Qdrant (and Constellation daemons, where needed) in a tempdir and tears everything down on exit. No external setup, no peer-management scripts, no shared state between runs.
 
 ## Layout
 
 ```
 tests/
 ├── README.md
-├── lib/common.sh
-├── setup-peer.sh, start-peer.sh, stop-peer.sh, restart-peer.sh,
-│   teardown-peer.sh, status-peers.sh, logs-peer.sh, logs-all.sh
-├── constellation/                  ← multi-peer group-sharing tests (needs dev peers running)
-│   ├── preload-memories.py         ← seeds peer-b and peer-c via core.store_memory
-│   ├── test-promotion.py           ← peer promotes via /memory/put, reads back via /memory/get
-│   └── test-directory.py           ← /peers and /peers/self aggregation
-└── mem_fusion/                     ← single-node MCP tests (self-contained Qdrant on :6733)
-    └── test-mcp-tools.py           ← exercises all 9 MCP tools via stdio JSON-RPC
+├── lib/
+│   └── harness.py             ← shared Qdrant + Constellation lifecycle helpers
+├── constellation/
+│   ├── test-promotion.py      ← /memory/put + /memory/get + content_hash integrity (1 daemon, simulated peer push)
+│   ├── test-directory.py      ← /peers + /peers/self aggregation (1 daemon, simulated peers via origin_node)
+│   └── test-pull-push.py      ← end-to-end gateway /pull + /push (2 daemons, real peer fan-out)
+└── mem_fusion/
+    └── test-mcp-tools.py      ← all 11 MCP tools (9 memory + group_pull + group_push) over stdio JSON-RPC
 ```
 
-Constellation tests assume the dev peers are running on `:6433`, `:6533`, `:6633`. The mem_fusion test spins up its own Qdrant in a tempdir and tears it down on exit — no peer setup required.
+## What each test exercises
 
-## Inner-loop workflow
+| Test | Scope |
+|---|---|
+| `test-mcp-tools.py` | Mem-fusion's stdio MCP server end-to-end — every tool, plus graceful degradation when Constellation isn't installed. |
+| `test-promotion.py` | The receive side: integrity invariants on `/memory/put` (byte-identical content + vector, content_hash recompute, group_name tagging, receiver-assigned id), duplicate detection on re-push, content_hash mismatch rejection. |
+| `test-directory.py` | The directory side: `/peers/self` shape, `/peers` aggregation (submission_count, first_seen/last_seen, sort order), negative cases (unknown group → 403, missing param → 400). |
+| `test-pull-push.py` | Two daemons talking real HTTP: push fan-out, push idempotency, pull dedup, pull-privacy (non-pushed memories stay local), pull catch-up after a drop. |
+
+## Run
 
 ```bash
-./setup-peer.sh mem-fusion-dev      # one-time install
-./start-peer.sh mem-fusion-dev      # start the peer
-./logs-peer.sh mem-fusion-dev       # tail all its logs in another terminal
-# ... edit code, drop extensions, etc. ...
-./restart-peer.sh mem-fusion-dev    # reload after a code change
-./stop-peer.sh mem-fusion-dev       # done for the session
+~/.local/share/cowork-memory/venv/bin/python tests/mem_fusion/test-mcp-tools.py
+~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-promotion.py
+~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-directory.py
+~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-pull-push.py
 ```
 
-## Multi-peer testing
+Each prints a per-step trace and a final `N/N invariants passed` line followed by a pass/fail summary.
 
-```bash
-./setup-peer.sh mem-fusion-peer-b   # one-time
-./setup-peer.sh mem-fusion-peer-c   # one-time
-./start-peer.sh mem-fusion-dev
-./start-peer.sh mem-fusion-peer-b
-./start-peer.sh mem-fusion-peer-c
-./logs-all.sh                       # tail every running peer simultaneously
-./status-peers.sh                   # see what's running
+## Port allocation (tempdir-scoped, won't collide with production or each other)
+
+| Test | Qdrant | Peer | Gateway |
+|---|---|---|---|
+| `test-mcp-tools.py` | 6733 | — | — |
+| `test-promotion.py` | 6733 | 7733 | 7734 |
+| `test-directory.py` | 6743 | 7743 | 7744 |
+| `test-pull-push.py` (peer-a) | 6833 | 7833 | 7834 |
+| `test-pull-push.py` (peer-b) | 6933 | 7933 | 7934 |
+
+If a test crashes mid-run, the subprocess may linger and hold its port. `lsof -nP -iTCP:<port> -t | xargs kill` clears it.
+
+## Adding a test
+
+Use `tests/lib/harness.py`:
+
+```python
+import pathlib, sys, tempfile
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "tests" / "lib"))
+import core, harness
+
+with tempfile.TemporaryDirectory() as tdir:
+    tmp = pathlib.Path(tdir)
+    qdrant = harness.start_qdrant(6733, tmp, tmp / "qdrant.log")
+    harness.init_cowork_memories(6733)
+    # ...
 ```
 
-## Reset / cleanup
-
-```bash
-./teardown-peer.sh mem-fusion-peer-c   # wipe one peer entirely
-```
-
-## Known peers and their port assignments
-
-See `lib/common.sh`:
-
-| Peer name | Qdrant HTTP | Qdrant gRPC |
-|---|---|---|
-| `mem-fusion-dev` | 6433 | 6434 |
-| `mem-fusion-peer-b` | 6533 | 6534 |
-| `mem-fusion-peer-c` | 6633 | 6634 |
-
-Add more peers by appending a line to the `PEER_PORTS` array in `lib/common.sh`.
-
-## What dev peers share with production Mem-Fusion
-
-- **Qdrant binary** — copied from production install (no separate download)
-- **Python venv** — symlinked to production's venv (saves disk + setup time)
-- **Ollama** — both production and dev consume the same Ollama on port 11434 (stateless service, no conflict)
-- **`init_collection.py` script** — borrowed from production install
-
-## What dev peers do NOT share with production
-
-- **Qdrant data** — every peer has its own `qdrant-data/` and its own collection
-- **MCP server process** — each peer runs its own `mcp_server.py` (patched to point at its own port + collection)
-- **Hooks** — production hooks fire on YOUR live Claude sessions; dev peers have no hooks installed at all
-- **launchd plists** — production has them (durability); dev peers don't (ephemeral)
-
-## When NOT to use this tooling
-
-- Production install (`~/.local/share/mem-fusion/`) — has its own install/upgrade flow via the Mem-Fusion repo's `INSTALL_MEM_FUSION.md`
-- Anything you want to survive a reboot — dev peers don't auto-restart
-
-## Convention for new scripts
-
-If you add a new dev tooling script, source `lib/common.sh` and use the helpers (`peer_dir`, `peer_port`, `peer_is_running`, `require_peer_name`). Don't hardcode peer names or ports.
+The harness exposes: `start_qdrant`, `init_cowork_memories`, `write_constellation_config`, `start_constellation`, `wait_health`, `check`, `stop_proc`.

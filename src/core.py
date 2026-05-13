@@ -385,50 +385,62 @@ async def export_record(args: dict) -> dict:
     }
 
 
-# ── Cross-client notification primitive ────────────────────────────────────
-def get_new_entries_since(cursor_iso: str | None,
-                          source_filter: str | None = None,
-                          limit: int = 256) -> list[dict]:
-    """Return entries with timestamp > cursor_iso, sorted ascending.
+# ── Group pull primitive ───────────────────────────────────────────────────
+def get_entries_for_pull(group_name: str,
+                         cursor_iso: str | None,
+                         limit: int = 256) -> list[dict]:
+    """Return group entries with submitted_at > cursor_iso, sorted ascending.
 
-    Used by constellation's publisher loop (with source_filter="local") to
-    detect new local writes for SSE broadcast. Each client tracks its own
-    cursor; pass None on first call to get everything.
+    Used by constellation's GET /memory/since endpoint to answer pull queries
+    from other peers. Filters on submitted_at — the originating peer's
+    timestamp, which is global across the group — so cursors are comparable
+    no matter which peer answers the query.
 
-    Returns full memory records (including vector) so the caller can
-    forward them directly without a follow-up fetch.
+    Returns full memory records (including vector) so the requesting peer can
+    insert them locally without a follow-up fetch and without re-embedding.
     """
-    conditions = []
+    conditions = [
+        FieldCondition(key="group_name", match=MatchValue(value=group_name)),
+    ]
     if cursor_iso:
         conditions.append(FieldCondition(
-            key="timestamp",
+            key="submitted_at",
             range=DatetimeRange(gt=datetime.fromisoformat(cursor_iso)),
         ))
-    if source_filter:
-        conditions.append(FieldCondition(
-            key="source", match=MatchValue(value=source_filter),
-        ))
 
-    scroll_filter = Filter(must=conditions) if conditions else None
     points, _ = qdrant.scroll(
         collection_name=COLLECTION,
-        scroll_filter=scroll_filter,
+        scroll_filter=Filter(must=conditions),
         limit=limit, with_payload=True, with_vectors=True,
     )
-    # Sort by timestamp ascending so cursor advances monotonically
-    points = sorted(points, key=lambda p: p.payload.get("timestamp", ""))
+    points = sorted(points, key=lambda p: p.payload.get("submitted_at", ""))
     return [{
-        "id":           str(p.id),
-        "vector":       list(p.vector) if p.vector is not None else None,
         "content":      p.payload.get("content", ""),
         "content_hash": p.payload.get("content_hash", ""),
+        "vector":       list(p.vector) if p.vector is not None else None,
         "type":         p.payload.get("type", ""),
         "tags":         p.payload.get("tags", []),
         "project":      p.payload.get("project", ""),
         "importance":   p.payload.get("importance", 3),
-        "session_id":   p.payload.get("session_id", ""),
-        "timestamp":    p.payload.get("timestamp", ""),
-        "source":       p.payload.get("source", ""),
-        "origin_node":  p.payload.get("origin_node", ""),
         "group_name":   p.payload.get("group_name", ""),
+        "origin_node":  p.payload.get("origin_node", ""),
+        "submitted_at": p.payload.get("submitted_at", ""),
     } for p in points]
+
+
+def max_submitted_at_in_group(group_name: str) -> str | None:
+    """Return the highest submitted_at currently stored locally for a group,
+    or None if no entries exist for that group yet.
+
+    Used by /pull on the local gateway to derive the cursor at sync time
+    (no stored cursor state — derived from local Qdrant on every pull).
+    """
+    points, _ = qdrant.scroll(
+        collection_name=COLLECTION,
+        scroll_filter=Filter(must=[
+            FieldCondition(key="group_name", match=MatchValue(value=group_name)),
+        ]),
+        limit=10000, with_payload=["submitted_at"], with_vectors=False,
+    )
+    stamps = [p.payload.get("submitted_at") for p in points if p.payload.get("submitted_at")]
+    return max(stamps) if stamps else None

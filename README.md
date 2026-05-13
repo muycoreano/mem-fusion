@@ -17,25 +17,27 @@ Both installers are AI-native: paste the markdown into a Claude Code session and
 ### 1. Personal memory (required, ~10 min)
 
 1. Open Claude Code in a terminal.
-2. Open [`INSTALL_MEM_FUSION.md`](INSTALL_MEM_FUSION.md), copy the entire file, paste it as your first message.
-3. Approve the commands through the 15 steps.
+2. Copy contents of INSTALL_MEM_FUSION.md
+3. Paste into Claude Code and approve all subsequent steps
 
-Installs Qdrant 1.13.4, Ollama + `nomic-embed-text`, the Mem-Fusion MCP server, 4 Claude Code hooks, and the `/remember` skill. ~200 MB on disk.
+This will install Qdrant 1.13.4, Ollama + `nomic-embed-text`, the Mem-Fusion MCP server, 4 Claude Code hooks, and the `/remember` skill. ~200 MB on disk.
 
-### 2. Group memory across machines (optional, ~5 min per peer)
+### 2. Shared group memory (optional, ~5 min per peer)
 
 Install Mem-Fusion first on each machine. Then on each one:
 
-1. Open [`INSTALL_CONSTELLATION.md`](INSTALL_CONSTELLATION.md), copy, paste into Claude Code.
-2. Approve the steps. Every peer joins as a symmetric mesh participant — nothing to designate, no central node, no special configuration per machine.
+1. Copy contents of INSTALL_CONSTELLATION.md
+2. Paste into Claude Code and approve all subsequent steps
 
-Constellation runs as a persistent HTTP MCP daemon (port 7533) alongside Mem-Fusion. Federation entries land in the same Qdrant collection as your local memories, tagged `source=federation`.
+Constellation runs as a persistent HTTP MCP daemon (port 7533). Memories from the group will now be accessible automatically as if they were local.
 
-> v0.3.0 ships **auto-promote** by default — every locally-stored memory propagates to the rest of the mesh. A human-review / apprenticeship loop is deferred to post-MVP.
+
+Both INSTALL_MEM_FUSION.md and INSTALL_CONSTELLATION.md will instruct you on additions for CLAUDE.md during install.
+
 
 ---
 
-## How it works
+## How it works - Mem-Fusion
 
 ```
    ┌──────────────────────────────────────────────────────┐
@@ -62,12 +64,43 @@ Constellation runs as a persistent HTTP MCP daemon (port 7533) alongside Mem-Fus
 
 Three storage layers fused into one substrate: in-context working memory ↔ MCP server ↔ Qdrant (vector / episodic / semantic) + markdown files (procedural / operating-principle). The hooks make memory invisible by default — you don't have to explicitly recall or store; the system does it. Manual `/remember` for high-importance items remains available.
 
-With Constellation enabled, a second daemon federates memory across peers via HTTP, using the same Qdrant collection with a `source` payload tag distinguishing local from federated entries.
+---
+
+## How it works - Constellation
+
+```
+   ┌──────────────────────────────────────────────────────┐
+   │              PEER A (your laptop)                    │
+   │   Mem-Fusion + Constellation + local Qdrant          │
+   │   ─────────────────────────────────────────────      │
+   │   store_memory(...)  →  source=local entry           │
+   └────────────────────────┬─────────────────────────────┘
+                            │
+                  POST /memory/put
+                  (HTTP fan-out, no relays,
+                   no central node)
+                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+   ┌─────────────────────┐    ┌──────────────────────┐
+   │  PEER B (desktop)   │◄──►│  PEER C (teammate)   │
+   │                     │    │                      │
+   │  same stack         │    │  same stack          │
+   │  insert as          │    │  insert as           │
+   │  source=group       │    │  source=group        │
+   └─────────────────────┘    └──────────────────────┘
+```
+
+Every peer runs the same stack: Mem-Fusion + Constellation daemon + local Qdrant. When you store a memory on Peer A, Constellation sends the full record (content + 768-dim vector + `content_hash`) over HTTP to every other peer in the group. Receivers insert into their own Qdrant tagged `source=group`; they don't re-send (no amplification, no N² traffic).
+
+Because group-shared entries live in the same Qdrant collection as your local memories, they surface through the same Mem-Fusion MCP tools — your Claude sees a teammate's stored decision as just another memory, with the original `origin_node` available on inspection. There's no orchestrator, no privileged peer, no hub: every peer is symmetric. Trust is by group membership, agreed out-of-band.
+
+---
 
 For full architectural detail:
 
 - [`docs/MEM_FUSION_ARCHITECTURE.md`](docs/MEM_FUSION_ARCHITECTURE.md) — single-node design (storage model, MCP tool surface, hooks, lifecycle)
-- [`docs/CONSTELLATION_ARCHITECTURE.md`](docs/CONSTELLATION_ARCHITECTURE.md) — federation design (mesh topology, peer protocol, source tagging)
+- [`docs/CONSTELLATION_ARCHITECTURE.md`](docs/CONSTELLATION_ARCHITECTURE.md) — group sharing design (peer protocol, source tagging)
 - [`CHANGELOG.md`](CHANGELOG.md) — what's in each version
 
 ---
@@ -94,39 +127,6 @@ Importance: 1 (trivial) → 5 (user-curated, highest priority).
 
 ---
 
-## Configure Claude to use it
-
-Paste this into `~/CLAUDE.md` (or a project-level `CLAUDE.md`) so Claude calls the tools at the right moments:
-
-````markdown
-## Vector Memory System
-
-Connected to a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on localhost).
-Check at session start: `memory_stats()`.
-
-### When to search
-- Session start: `search_memory(query="<current task>", top_k=8)`
-- Before architectural decisions: search for prior decisions on the same topic
-- On recurring errors: search prior resolutions
-- Unsure about a user preference: search type="preference"
-
-### When to store
-- Decision made: `store_memory(content, type="decision", importance=4, project="<name>")`
-- Novel error resolved: `store_memory(..., type="error", importance=3)`
-- User reveals a preference: `store_memory(..., type="preference", importance=4)`
-- Important context learned: `store_memory(..., type="context", importance=3)`
-- User explicitly asks to remember: use `/remember` → importance=5
-
-### What NOT to store
-Trivial facts, transient state, things derivable from code or `git log`.
-
-### Verification rule
-Memories are point-in-time observations. Before recommending a file/function/flag named in a memory, verify it still exists in the current code.
-````
-
-INSTALL_CONSTELLATION.md adds further CLAUDE.md content for federation — the install prompt drops it in automatically.
-
----
 
 ## Uninstall
 

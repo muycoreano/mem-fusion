@@ -13,7 +13,7 @@
 - **Across sessions** — Tuesday's decision surfaces in Friday's session, automatically.
 - **Across cognitive layers** — episodic, semantic, procedural, and working memory unified into one substrate via 9 MCP tools and 4 automatic Claude Code hooks.
 
-Mem-Fusion is the *personal memory* foundation. The optional Constellation extension (separate daemon, same Qdrant instance, disjoint collection) adds the *across machines* axis for federated group memory.
+Mem-Fusion is the *personal memory* foundation. The optional Constellation extension (separate daemon, same Qdrant collection, same machine) adds the *across machines* axis for group-shared memory.
 
 ---
 
@@ -26,7 +26,7 @@ Mem-Fusion ships with two memory stores that serve different purposes. They are 
 | **Vector memory** (Qdrant + Ollama embeddings) | Episodic and semantic memory — decisions, context, preferences, errors, references. Searchable by semantic similarity. | On-demand via `search_memory(...)` and automatically by the UserPromptSubmit hook. | Mostly automatic (via hooks + `/remember`); MCP tools allow manual curation. |
 | **File-based memory** (`~/.claude/projects/.../memory/` tree) | Behavioral rules, always-loaded context, durable instructions. Loaded at session start by Claude's built-in mechanism. | Loaded at session start; not searched. | User-curated; rules are explicit. |
 
-**Vector memory** is what Constellation federates across machines. **File-based memory** stays per-machine, personal, and is never shared via Constellation — rules and personal preferences shouldn't auto-sync to teammates' Claudes.
+**Vector memory** is what Constellation shares across machines. **File-based memory** stays per-machine, personal, and is never sent to peers — rules and personal preferences shouldn't auto-sync to teammates' Claudes.
 
 The rest of this document describes the vector memory layer, the MCP server, and the four hooks. File-based memory is a Claude Code feature; Mem-Fusion is the vector-memory implementation.
 
@@ -296,22 +296,22 @@ If Ollama is unreachable when `store_memory` is called, the memory is written as
 
 ## 11. Relationship to Constellation
 
-Constellation is an **optional companion daemon** for group memory federation. It's bundled in the same repo (`src/constellation.py`) but runs as a separate process with its own MCP server, its own Qdrant collection, and its own network endpoint.
+Constellation is an **optional companion daemon** for group memory sharing. It's bundled in the same repo (`src/constellation.py`) but runs as a separate process with its own MCP server and its own network endpoint.
 
 | Aspect | Mem-Fusion | Constellation |
 |---|---|---|
 | Purpose | Personal memory (one machine, one user) | Group memory (across machines) |
 | Transport | stdio MCP, ephemeral per session | HTTP MCP, persistent daemon |
-| Network exposure | Localhost only | Network-bound for inter-peer reachability |
-| Qdrant collection | `mem_fusion_memories` | `mem_fusion_canonical_memories` (disjoint) |
+| Network exposure | Localhost only | Network-bound for peer-to-peer reachability |
+| Qdrant collection | `cowork_memories` | `cowork_memories` (same collection; entries tagged `source=group`) |
 | Lifecycle | Per-Claude-session subprocess | launchd-managed always-on |
 | Required? | Yes (base install) | No — optional add-on |
 
-The two daemons share Qdrant + Ollama infrastructure but operate on **disjoint collections**. Constellation has no privileged access to Mem-Fusion's local memory; cross-process boundaries enforce isolation. There is no API path from "remote peer makes a request" to "local Mem-Fusion memory store."
+The two daemons share the same Qdrant collection but write entries with distinct `source` tags (`local` vs. `group`). Process isolation is what keeps them separate: Constellation has no privileged access to Mem-Fusion's in-memory state, and the only path from "remote peer makes a request" to "local memory store" goes through Constellation inserting a new row tagged `source=group`.
 
-The one bridge: `export_record(id)` in Mem-Fusion returns a complete Qdrant record (with vector) for a given memory. Constellation uses this to faithfully promote a local memory to a group canonical — the vector is copied verbatim, no re-embedding, so semantic equivalence is preserved across the federation hop.
+The bridge between the two: `export_record(id)` in Mem-Fusion returns a complete Qdrant record (with vector) for a given memory. Constellation uses this to send a local memory to peers in a group — the vector is copied verbatim, no re-embedding, so semantic equivalence is preserved when the memory arrives at the other end.
 
-**Critical safety property:** the `content_hash` function is **byte-identical** in Mem-Fusion and Constellation. This means a memory stored locally and then promoted to a group canonical has the same hash in both stores, enabling dedup and integrity verification.
+**Critical safety property:** the `content_hash` function is **byte-identical** in Mem-Fusion and Constellation. This means a memory stored locally and then sent to peers has the same hash in every peer's store, enabling dedup and integrity verification.
 
 ---
 
@@ -359,7 +359,7 @@ The MVP that ships in v0.3.0 covers:
 - ✅ Constellation-compatible `export_record` tool
 - ✅ Build-from-source distribution model (`build_install.sh` packager → paste-into-Claude `INSTALL_*.md` artifacts)
 
-Optionally: Constellation extension adds group-memory federation on top. See [`CONSTELLATION_ARCHITECTURE.md`](CONSTELLATION_ARCHITECTURE.md).
+Optionally: Constellation extension adds group memory sharing on top. See [`CONSTELLATION_ARCHITECTURE.md`](CONSTELLATION_ARCHITECTURE.md).
 
 ---
 
@@ -370,7 +370,7 @@ Optionally: Constellation extension adds group-memory federation on top. See [`C
 - **Not encrypted at rest.** Qdrant storage is plaintext on disk. The threat model is "trust your local filesystem."
 - **Not a database.** Mem-Fusion is a memory layer for Claude. It doesn't expose direct SQL/Qdrant access to applications; everything flows through the MCP tool surface.
 - **Not a cloud service.** Localhost only. No data leaves the machine without explicit user action (Constellation does, but only to nodes the user has configured).
-- **Not a replication system.** Even with Constellation, the model is **selective propagation between sovereign stores**, not replication. Each Qdrant collection is its own source of truth.
+- **Not a replication system.** Even with Constellation, peers selectively send writes to each other; they don't replicate the whole store. Each peer's Qdrant is its own source of truth.
 - **Not a substitute for file-based MEMORY.** Vector memory is for searchable episodic/semantic content. Behavioral rules belong in the file-based MEMORY tree where they're always loaded.
 
 ---

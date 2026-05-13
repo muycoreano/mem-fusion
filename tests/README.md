@@ -10,7 +10,7 @@ tests/
 ├── lib/common.sh
 ├── setup-peer.sh, start-peer.sh, stop-peer.sh, restart-peer.sh,
 │   teardown-peer.sh, status-peers.sh, logs-peer.sh, logs-all.sh
-├── constellation/                  ← multi-peer federation tests (needs dev peers running)
+├── constellation/                  ← multi-peer group-sharing tests (needs dev peers running)
 │   ├── preload-memories.py         ← seeds peer-b and peer-c via core.store_memory
 │   ├── test-promotion.py           ← peer promotes via /memory/put, reads back via /memory/get
 │   └── test-directory.py           ← /peers and /peers/self aggregation

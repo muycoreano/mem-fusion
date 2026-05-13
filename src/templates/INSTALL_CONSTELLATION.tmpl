@@ -6,10 +6,10 @@
 
 ## What this builds
 
-A persistent HTTP MCP daemon that federates group memory across multiple Mem-Fusion peers. Constellation runs alongside Mem-Fusion, sharing the same Qdrant collection (`cowork_memories`); federation entries are tagged `source=federation` to distinguish them from locally-originated memories.
+A persistent HTTP MCP daemon that shares group memory across Mem-Fusion peers. Constellation runs alongside Mem-Fusion, sharing the same Qdrant collection (`cowork_memories`); group-shared entries are tagged `source=group` to distinguish them from locally-originated memories.
 
 - **HTTP MCP daemon** on port 7533 (separate from Mem-Fusion's stdio MCP)
-- **Shared Qdrant collection** (`cowork_memories`) — federation entries carry `source=federation`, `origin_node`, `group_name` tags
+- **Shared Qdrant collection** (`cowork_memories`) — group-shared entries carry `source=group`, `origin_node`, `group_name` tags
 - **launchd service** (`com.branchapp.memfusion.constellation`) — KeepAlive, RunAtLoad
 - **4 MCP tools**: `memory/put`, `memory/get`, `peers`, `peers/self`
 
@@ -123,7 +123,7 @@ Print this snippet and instruct the user to paste it into `~/CLAUDE.md`:
 ```markdown
 ## Group Memory (Constellation)
 
-Connected to a local `constellation` MCP server (HTTP, port 7533) that federates
+Connected to a local `constellation` MCP server (HTTP, port 7533) that shares
 group memory across machines.
 
 ### When to propagate a memory to the group
@@ -131,9 +131,9 @@ On user "remember X" (the `/remember` skill flow), after `store_memory` returns
 a local ID, also call:
 1. `mem-fusion/export_record(id=<local_id>)` — returns the full record incl. vector
 2. `constellation/memory/put(group_name=<group>, memory_record=<record>, provenance=<...>)`
-   — propagates the entry to the rest of the mesh
+   — shares the entry with the rest of the group
 
-Every peer is symmetric. Any peer in the group can accept the propagation; other
+Every peer is symmetric. Any peer in the group can accept the share; other
 peers in the same group can retrieve via
 `constellation/memory/get(group_name=..., query=...)`.
 
@@ -175,4 +175,4 @@ read -p "Delete the Constellation install directory? [y/N] " yn
 
 When all 7 steps + smoke test pass, tell the user:
 
-> Constellation is live on this peer. **Restart your Claude Code session** so the new MCP server is visible. Paste the CLAUDE.md snippet from Step 8 into your `~/CLAUDE.md` so Claude knows when to propagate memories to the group. To test the federation, have another peer install Constellation pointing at the same `group_name`, then say *"remember that we picked Qdrant for v0.3.0"* — the memory will land locally and propagate across the mesh, retrievable from the other peer via `constellation/memory/get`.
+> Constellation is live on this peer. **Restart your Claude Code session** so the new MCP server is visible. Paste the CLAUDE.md snippet from Step 8 into your `~/CLAUDE.md` so Claude knows when to share memories with the group. To test group sharing, have another peer install Constellation pointing at the same `group_name`, then say *"remember that we picked Qdrant for v0.3.0"* — the memory will land locally and be shared with the rest of the group, retrievable from another peer via `constellation/memory/get`.

@@ -7,7 +7,7 @@ orchestrator stores it; peer reads it back and verifies byte-identity
 Drives the rewritten stack:
   - Peer-side data access:        core.export_record (via core.qdrant rebound
                                   to peer-b's port)
-  - Federation transport:         constellation.py HTTP /memory/put + /memory/get
+  - Group-sharing transport:      constellation.py HTTP /memory/put + /memory/get
   - Orchestrator-side dedup:      constellation.py against its Qdrant on :6433
 
 mem_fusion.py (the stdio MCP for Claude) is *not* exercised here — peer-to-peer

@@ -311,8 +311,8 @@ QDRANT_URL  = os.getenv("QDRANT_URL",  "http://127.0.0.1:6333")
 OLLAMA_URL  = os.getenv("OLLAMA_URL",  "http://127.0.0.1:11434")
 # The collection name is invariant. Mem-fusion fuses cowork-memory entries
 # from ephemeral file storage into persistent vector storage; the collection
-# *is* the cowork-memory store. Federation, local, preload distinctions live
-# in the `source` payload field, never in the collection name.
+# *is* the cowork-memory store. Group-shared, local, preload distinctions
+# live in the `source` payload field, never in the collection name.
 COLLECTION  = "cowork_memories"
 EMBED_MODEL = "nomic-embed-text"
 VECTOR_SIZE = 768
@@ -640,9 +640,9 @@ async def memory_stats(args: dict) -> dict:
 async def export_record(args: dict) -> dict:
     """Return the full Qdrant record (including vector) for a memory by id.
 
-    Enables Constellation and other federation clients to extract a complete
-    record for faithful propagation across nodes — vector copied verbatim
-    rather than re-embedded.
+    Enables Constellation and other group-sharing clients to extract a
+    complete record for faithful sending across peers — vector copied
+    verbatim rather than re-embedded.
     """
     memory_id = args["id"]
     points = qdrant.retrieve(collection_name=COLLECTION, ids=[memory_id],

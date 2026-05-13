@@ -6,10 +6,10 @@
 
 ## What this builds
 
-A persistent HTTP MCP daemon that federates group memory across multiple Mem-Fusion peers. Constellation runs alongside Mem-Fusion, sharing the same Qdrant collection (`cowork_memories`); federation entries are tagged `source=federation` to distinguish them from locally-originated memories.
+A persistent HTTP MCP daemon that shares group memory across Mem-Fusion peers. Constellation runs alongside Mem-Fusion, sharing the same Qdrant collection (`cowork_memories`); group-shared entries are tagged `source=group` to distinguish them from locally-originated memories.
 
 - **HTTP MCP daemon** on port 7533 (separate from Mem-Fusion's stdio MCP)
-- **Shared Qdrant collection** (`cowork_memories`) — federation entries carry `source=federation`, `origin_node`, `group_name` tags
+- **Shared Qdrant collection** (`cowork_memories`) — group-shared entries carry `source=group`, `origin_node`, `group_name` tags
 - **launchd service** (`com.branchapp.memfusion.constellation`) — KeepAlive, RunAtLoad
 - **4 MCP tools**: `memory/put`, `memory/get`, `peers`, `peers/self`
 
@@ -68,15 +68,15 @@ mem-fusion owns the private stdio surface to Claude.
 Storage model:
   - One Qdrant collection per peer (shared with mem-fusion via core).
   - Memories originated locally:    source="local"
-  - Memories received from peers:   source="federation" (carries origin_node,
-                                                          group_name, received_at)
+  - Memories received from peers:   source="group" (carries origin_node,
+                                                     group_name, received_at)
   - dedup key:                       content_hash (byte-identical across daemons)
 
 HTTP surface (MVP — no SSE yet):
   GET  /health                            — liveness
   POST /memory/put                        — accept a memory from a peer
-  GET  /memory/get?group_name=...&id=...  — fetch federation entries
-  GET  /peers?group_name=...              — directory inferred from federation
+  GET  /memory/get?group_name=...&id=...  — fetch group-shared memories
+  GET  /peers?group_name=...              — directory inferred from group-shared
                                             entries' origin_node
   GET  /peers/self                        — this node's identity + memberships
 
@@ -137,7 +137,7 @@ def scroll_all(collection: str, scroll_filter, payload_keys, page_size: int = SC
 
 
 def point_to_record(p) -> dict:
-    """Wire shape for a federation entry returned by /memory/get."""
+    """Wire shape for a group-shared entry returned by /memory/get."""
     pl = p.payload or {}
     return {
         "canonical_id":         str(p.id),
@@ -161,10 +161,10 @@ def point_to_record(p) -> dict:
 def load_config(path: Path) -> dict:
     """Load and validate the daemon's config. Raises ValueError on invalid schema.
 
-    Every peer in the mesh is symmetric — no orchestrator/peer role distinction.
+    Every peer in a group is symmetric — no orchestrator/peer role distinction.
     A peer that lists a group in `memberships` is a full participant in that
-    group's mesh: it can accept federation entries (POST /memory/put), serve
-    reads (GET /memory/get), and report the directory (GET /peers).
+    group: it can accept group-shared entries (POST /memory/put), serve reads
+    (GET /memory/get), and report the directory (GET /peers).
 
     The Qdrant collection is fixed at `core.COLLECTION`. Isolation between
     peers in dev comes from distinct Qdrant ports, not names.
@@ -198,7 +198,7 @@ def load_config(path: Path) -> dict:
 def init_collection(collection_name: str, log):
     """Ensure the shared collection exists with the payload indexes we need.
 
-    Same collection as mem-fusion. Adding indexes is idempotent; the federation
+    Same collection as mem-fusion. Adding indexes is idempotent; the group-share
     payload fields (origin_node, group_name, received_at) get their own indexes
     so /peers and /memory/get scrolls stay efficient.
     """
@@ -327,15 +327,15 @@ class ConstellationHandler(BaseHTTPRequestHandler):
                 "received_type":      type(vec).__name__,
             })
 
-        # Dedup on content_hash + group_name + source=federation.
+        # Dedup on content_hash + group_name + source=group.
         # Locally-originated rows with the same hash are not duplicates from a
-        # federation perspective; the peer asked us to record an inbound copy.
+        # group-sharing perspective; the peer asked us to record an inbound copy.
         existing, _ = core.qdrant.scroll(
             collection_name=collection,
             scroll_filter=Filter(must=[
                 FieldCondition(key="content_hash", match=MatchValue(value=record["content_hash"])),
                 FieldCondition(key="group_name",   match=MatchValue(value=group_name)),
-                FieldCondition(key="source",       match=MatchValue(value="federation")),
+                FieldCondition(key="source",       match=MatchValue(value="group")),
             ]),
             limit=1, with_payload=False,
         )
@@ -358,7 +358,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             "importance":         record["importance"],
             "original_timestamp": record["original_timestamp"],
             "group_name":         group_name,
-            "source":             "federation",
+            "source":             "group",
             "origin_node":        provenance.get("origin_node", ""),
             "origin_local_id":    provenance.get("origin_local_id", ""),
             "submitted_at":       provenance.get("submitted_at", ""),
@@ -366,7 +366,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             "received_at":        received_at,
             "received_by":        cfg["node_name"],
             # `timestamp` mirrors `received_at` so mem-fusion's `search_recent`
-            # (which filters on `timestamp`) surfaces federation entries naturally.
+            # (which filters on `timestamp`) surfaces group-shared entries naturally.
             "timestamp":          received_at,
         }
         core.qdrant.upsert(
@@ -384,7 +384,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             "received_at":   received_at,
         })
 
-    # ── /memory/get — fetch federation entries from this node ─────────────
+    # ── /memory/get — fetch group-shared entries from this node ──────────
     def _handle_memory_get(self):
         cfg = self.daemon_state["config"]
         log = self.daemon_state["log"]
@@ -414,9 +414,9 @@ class ConstellationHandler(BaseHTTPRequestHandler):
                 return self._send_json(HTTP_NOT_FOUND, {"error": f"memory {memory_id} not found"})
             p = points[0]
             pl = p.payload or {}
-            if pl.get("group_name") != group_name or pl.get("source") != "federation":
+            if pl.get("group_name") != group_name or pl.get("source") != "group":
                 return self._send_json(HTTP_NOT_FOUND, {
-                    "error":     f"memory {memory_id} not a federation entry in group {group_name!r}",
+                    "error":     f"memory {memory_id} not a group-shared entry in {group_name!r}",
                 })
             log.info("GET by-id: group=%s id=%s", group_name, memory_id)
             return self._send_json(HTTP_OK, {"count": 1, "memories": [point_to_record(p)]})
@@ -425,7 +425,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             collection_name=collection,
             scroll_filter=Filter(must=[
                 FieldCondition(key="group_name", match=MatchValue(value=group_name)),
-                FieldCondition(key="source",     match=MatchValue(value="federation")),
+                FieldCondition(key="source",     match=MatchValue(value="group")),
             ]),
             limit=limit, with_payload=True, with_vectors=True,
         )
@@ -435,9 +435,9 @@ class ConstellationHandler(BaseHTTPRequestHandler):
             "memories": [point_to_record(p) for p in points],
         })
 
-    # ── /peers — directory inferred from federation entries' origin_node ──
+    # ── /peers — directory inferred from group-shared entries' origin_node ─
     def _handle_peers_list(self):
-        """Aggregate origin_node stats from federation entries in this group.
+        """Aggregate origin_node stats from group-shared entries in this group.
 
         v0.3.0 has no registration step — peers are inferred from submission
         activity. A node that has never PUT is not listed. Adequate for the
@@ -461,7 +461,7 @@ class ConstellationHandler(BaseHTTPRequestHandler):
 
         group_filter = Filter(must=[
             FieldCondition(key="group_name", match=MatchValue(value=group_name)),
-            FieldCondition(key="source",     match=MatchValue(value="federation")),
+            FieldCondition(key="source",     match=MatchValue(value="group")),
         ])
         peers: dict = {}
         for p in scroll_all(collection, group_filter,
@@ -704,7 +704,7 @@ Print this snippet and instruct the user to paste it into `~/CLAUDE.md`:
 ```markdown
 ## Group Memory (Constellation)
 
-Connected to a local `constellation` MCP server (HTTP, port 7533) that federates
+Connected to a local `constellation` MCP server (HTTP, port 7533) that shares
 group memory across machines.
 
 ### When to propagate a memory to the group
@@ -712,9 +712,9 @@ On user "remember X" (the `/remember` skill flow), after `store_memory` returns
 a local ID, also call:
 1. `mem-fusion/export_record(id=<local_id>)` — returns the full record incl. vector
 2. `constellation/memory/put(group_name=<group>, memory_record=<record>, provenance=<...>)`
-   — propagates the entry to the rest of the mesh
+   — shares the entry with the rest of the group
 
-Every peer is symmetric. Any peer in the group can accept the propagation; other
+Every peer is symmetric. Any peer in the group can accept the share; other
 peers in the same group can retrieve via
 `constellation/memory/get(group_name=..., query=...)`.
 
@@ -756,4 +756,4 @@ read -p "Delete the Constellation install directory? [y/N] " yn
 
 When all 7 steps + smoke test pass, tell the user:
 
-> Constellation is live on this peer. **Restart your Claude Code session** so the new MCP server is visible. Paste the CLAUDE.md snippet from Step 8 into your `~/CLAUDE.md` so Claude knows when to propagate memories to the group. To test the federation, have another peer install Constellation pointing at the same `group_name`, then say *"remember that we picked Qdrant for v0.3.0"* — the memory will land locally and propagate across the mesh, retrievable from the other peer via `constellation/memory/get`.
+> Constellation is live on this peer. **Restart your Claude Code session** so the new MCP server is visible. Paste the CLAUDE.md snippet from Step 8 into your `~/CLAUDE.md` so Claude knows when to share memories with the group. To test group sharing, have another peer install Constellation pointing at the same `group_name`, then say *"remember that we picked Qdrant for v0.3.0"* — the memory will land locally and be shared with the rest of the group, retrievable from another peer via `constellation/memory/get`.

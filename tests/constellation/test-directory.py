@@ -4,7 +4,7 @@ Constellation directory test: orchestrator's directory endpoints (/peers and
 /peers/self).
 
 Drives the rewritten stack — peer-side reads via core.export_record (rebound
-to each peer's Qdrant), federation via constellation.py HTTP. Confirms that
+to each peer's Qdrant), group sharing via constellation.py HTTP. Confirms that
 PUTs from multiple peers register correctly in the aggregated peer list.
 
 Prerequisite: tests/constellation/preload-memories.py has been run.
@@ -150,7 +150,7 @@ async def run_test():
     passed.append(check("self lists our group as a flat name",
                         GROUP_NAME in r["memberships"]))
 
-    print("\nSTEP 3: GET /peers with no federation entries — expect empty list")
+    print("\nSTEP 3: GET /peers with no group-shared entries — expect empty list")
     r = httpx.get(f"{DAEMON_URL}/peers",
                   params={"group_name": GROUP_NAME}, timeout=5).json()
     print(f"  response: {json.dumps(r, indent=2)}")

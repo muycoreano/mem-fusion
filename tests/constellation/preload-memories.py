@@ -73,7 +73,7 @@ PEERS = {
                 "importance": 3,
             },
             {
-                "content":    "Verbatim content plus vector preservation is the integrity invariant for memory federation between Mem-Fusion nodes.",
+                "content":    "Verbatim content plus vector preservation is the integrity invariant for memory sharing between Mem-Fusion peers.",
                 "type":       "preference",
                 "tags":       ["constellation", "integrity"],
                 "project":    "mem-fusion",

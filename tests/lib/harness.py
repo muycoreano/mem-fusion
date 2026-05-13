@@ -31,6 +31,7 @@ Importing tests:
     import core, harness
 """
 import json
+import os
 import pathlib
 import subprocess
 import time
@@ -46,6 +47,7 @@ REPO_ROOT     = pathlib.Path(__file__).resolve().parents[2]
 QDRANT_BIN    = pathlib.Path.home() / ".local/share/cowork-memory/bin/qdrant"
 VENV_PYTHON   = pathlib.Path.home() / ".local/share/cowork-memory/venv/bin/python"
 CONSTELLATION = REPO_ROOT / "src/constellation.py"
+MEM_FUSION    = REPO_ROOT / "src/mem_fusion.py"
 COLLECTION    = "cowork_memories"
 VECTOR_SIZE   = 768
 
@@ -180,3 +182,89 @@ def stop_proc(proc: subprocess.Popen | None, timeout_s: float = 3.0) -> None:
         proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         proc.kill()
+
+
+# ── Mem-Fusion MCP subprocess + JSON-RPC client ───────────────────────────
+def start_mem_fusion(qdrant_port: int, stderr_path: pathlib.Path,
+                     *, gateway_url: str | None = None) -> subprocess.Popen:
+    """Spawn `mem_fusion.py` as an MCP stdio subprocess.
+
+    `qdrant_port` becomes the QDRANT_URL the subprocess will use.
+    `gateway_url`, if given, becomes MEMFUSION_CONSTELLATION_GATEWAY — used
+    by mem-fusion's group_pull/group_push tools to find the local
+    Constellation daemon. Omit to test graceful-degradation behavior.
+    """
+    env = os.environ.copy()
+    env["QDRANT_URL"] = f"http://127.0.0.1:{qdrant_port}"
+    if gateway_url is not None:
+        env["MEMFUSION_CONSTELLATION_GATEWAY"] = gateway_url
+    return subprocess.Popen(
+        [str(VENV_PYTHON), str(MEM_FUSION)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=open(stderr_path, "w"),
+        env=env, bufsize=0,
+    )
+
+
+class MCPClient:
+    """Minimal newline-delimited JSON-RPC client for an MCP stdio server."""
+
+    def __init__(self, proc: subprocess.Popen):
+        self.proc = proc
+        self._next_id = 0
+
+    def _send(self, msg: dict) -> None:
+        line = (json.dumps(msg) + "\n").encode()
+        self.proc.stdin.write(line)
+        self.proc.stdin.flush()
+
+    def _read_response(self, expected_id: int) -> dict:
+        # Skip notifications/unrelated messages until we get a matching id.
+        while True:
+            raw = self.proc.stdout.readline()
+            if not raw:
+                raise RuntimeError("mem_fusion stdout closed unexpectedly")
+            msg = json.loads(raw)
+            if msg.get("id") == expected_id:
+                return msg
+
+    def request(self, method: str, params: dict | None = None) -> dict:
+        self._next_id += 1
+        rid = self._next_id
+        body = {"jsonrpc": "2.0", "id": rid, "method": method}
+        if params is not None:
+            body["params"] = params
+        self._send(body)
+        return self._read_response(rid)
+
+    def notify(self, method: str, params: dict | None = None) -> None:
+        body = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            body["params"] = params
+        self._send(body)
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        """Send tools/call and unwrap the double-JSON-encoded tool result.
+
+        MCP wraps tool output as TextContent(text=json.dumps(result)); the
+        actual tool dict is at response.result.content[0].text, JSON-encoded.
+        """
+        r = self.request("tools/call", {"name": name, "arguments": arguments})
+        if "error" in r:
+            raise RuntimeError(f"tool {name} JSON-RPC error: {r['error']}")
+        text = r["result"]["content"][0]["text"]
+        return json.loads(text)
+
+
+def mcp_initialize(client: MCPClient, client_name: str = "test-harness") -> dict:
+    """Perform the standard MCP handshake: initialize + notifications/initialized.
+    Returns the initialize response. Raises if it errors."""
+    r = client.request("initialize", {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": client_name, "version": "1.0"},
+    })
+    if "error" in r:
+        raise RuntimeError(f"MCP initialize failed: {r['error']}")
+    client.notify("notifications/initialized")
+    return r

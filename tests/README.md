@@ -14,7 +14,8 @@ tests/
 │   ├── test-directory.py      ← /peers + /peers/self aggregation (1 daemon, simulated peers via origin_node)
 │   └── test-pull-push.py      ← end-to-end gateway /pull + /push (2 daemons, real peer fan-out)
 └── mem_fusion/
-    └── test-mcp-tools.py      ← all 11 MCP tools (9 memory + group_pull + group_push) over stdio JSON-RPC
+    ├── test-mcp-tools.py         ← all 11 MCP tools (9 memory + group_pull + group_push) over stdio JSON-RPC (1 Qdrant + 1 mem-fusion)
+    └── test-group-roundtrip.py   ← end-to-end: Claude → mem-fusion → Constellation → peer → search (2 Qdrants + 2 Constellations + 2 mem-fusions)
 ```
 
 ## What each test exercises
@@ -22,6 +23,7 @@ tests/
 | Test | Scope |
 |---|---|
 | `test-mcp-tools.py` | Mem-fusion's stdio MCP server end-to-end — every tool, plus graceful degradation when Constellation isn't installed. |
+| `test-group-roundtrip.py` | Full chain: Claude → mem-fusion → Constellation gateway → peer's Constellation → peer's Qdrant → peer's mem-fusion finds it via `search_memory`. Push and pull directions; offline-at-push recovery via pull. |
 | `test-promotion.py` | The receive side: integrity invariants on `/memory/put` (byte-identical content + vector, content_hash recompute, group_name tagging, receiver-assigned id), duplicate detection on re-push, content_hash mismatch rejection. |
 | `test-directory.py` | The directory side: `/peers/self` shape, `/peers` aggregation (submission_count, first_seen/last_seen, sort order), negative cases (unknown group → 403, missing param → 400). |
 | `test-pull-push.py` | Two daemons talking real HTTP: push fan-out, push idempotency, pull dedup, pull-privacy (non-pushed memories stay local), pull catch-up after a drop. |
@@ -30,6 +32,7 @@ tests/
 
 ```bash
 ~/.local/share/cowork-memory/venv/bin/python tests/mem_fusion/test-mcp-tools.py
+~/.local/share/cowork-memory/venv/bin/python tests/mem_fusion/test-group-roundtrip.py
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-promotion.py
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-directory.py
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-pull-push.py
@@ -46,6 +49,8 @@ Each prints a per-step trace and a final `N/N invariants passed` line followed b
 | `test-directory.py` | 6743 | 7743 | 7744 |
 | `test-pull-push.py` (peer-a) | 6833 | 7833 | 7834 |
 | `test-pull-push.py` (peer-b) | 6933 | 7933 | 7934 |
+| `test-group-roundtrip.py` (alice) | 6843 | 7843 | 7844 |
+| `test-group-roundtrip.py` (bob) | 6943 | 7943 | 7944 |
 
 If a test crashes mid-run, the subprocess may linger and hold its port. `lsof -nP -iTCP:<port> -t | xargs kill` clears it.
 

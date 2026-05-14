@@ -1383,8 +1383,8 @@ Expect `migrated` to equal your total memory count on the first run, `0` on subs
 ## Step 7 — Swap the MCP registration
 
 ```bash
-claude mcp remove cowork-memory 2>/dev/null || true
-claude mcp add mem-fusion \
+claude mcp remove --scope user cowork-memory 2>/dev/null || true
+claude mcp add --scope user mem-fusion \
   ~/.local/share/mem-fusion/venv/bin/python \
   ~/.local/share/mem-fusion/mem_fusion.py
 
@@ -1808,8 +1808,8 @@ If anything went wrong and you want to restore cowork-memory:
 ls -t ~/.claude/settings.json.bak.* | head -1 | xargs -I {} cp {} ~/.claude/settings.json
 
 # 2. Swap MCP back
-claude mcp remove mem-fusion 2>/dev/null || true
-claude mcp add cowork-memory \
+claude mcp remove --scope user mem-fusion 2>/dev/null || true
+claude mcp add --scope user cowork-memory \
   ~/.local/share/cowork-memory/venv/bin/python \
   ~/.local/share/cowork-memory/mcp_server.py
 

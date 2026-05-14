@@ -12,6 +12,8 @@
 - Swaps the `cowork-memory` MCP registration → `mem-fusion`
 - Rewires the four Claude Code hooks from cowork-memory paths to mem-fusion paths
 - Installs the v0.4 `/remember` skill (explicit group-keyed tagging)
+- Updates `~/CLAUDE.md` with the v0.4 Vector Memory System section (backup taken first)
+- Preloads 8 usage-pattern memories and imports any existing file-based memories under `~/.claude/projects/*/memory/`
 - Leaves the cowork-memory install on disk as a rollback safety net
 
 ## What this upgrade does NOT do
@@ -20,7 +22,6 @@
 - Stop or modify the cowork-memory Qdrant / Ollama launchd plists (`com.cowork.qdrant.plist`, `com.cowork.ollama.plist`)
 - Install Constellation (run `INSTALL_CONSTELLATION.md` separately for that)
 - Delete any cowork-memory files
-- Touch your `~/CLAUDE.md` (you'll update that yourself after — instructions in Step 11)
 
 Time + disk: about 5 minutes, ~50 MB additional disk (a new venv + the mem-fusion code).
 
@@ -240,58 +241,9 @@ Expect `✓ All smoke tests passed`.
 
 ---
 
-## Step 11 — Update your `~/CLAUDE.md`
+<!-- INCLUDE_INLINE: src/templates/POST_INSTALL.tmpl -->
 
-Replace any cowork-memory-related section with this v0.4 snippet:
-
-```markdown
-## Vector Memory System
-
-Connected to a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on localhost).
-**Check this at session start** by calling `memory_stats()` to confirm the system is live.
-
-### Group routing — every memory has a `groups` tag
-
-Every stored memory carries a `groups: list[str]` tag — the routing key for sharing.
-Default is `["personal"]` (local-only, never leaves this machine). Never auto-classify
-content to a group; the user explicitly names the audience or the default holds.
-
-- **Hooks and silent stores**: always use `groups=["personal"]`.
-- **`/remember` without an audience clause**: `groups=["personal"]`.
-- **`/remember ... for <group>` (or "share this with <group>")**: tag with that group
-  at store time, then `group_push(group=<group>, memory_ids=[id])`.
-
-### When to search
-- **Session start**: `search_memory(query="<current task or project name>", top_k=8)`
-- **Before architectural decisions**: search for prior decisions on the same topic
-- **When hitting a recurring error**: search for prior resolutions
-
-### When to store
-- **Decision made**: `store_memory(content, type="decision", importance=4, project="<name>")`
-- **Novel error resolved**: `store_memory(..., type="error", importance=3)`
-- **User reveals a preference**: `store_memory(..., type="preference", importance=4)`
-- **User explicitly asks to remember**: use `/remember` skill → `importance=5`
-
-### Memory types (decorative; doesn't gate sharing)
-`decision` · `fact` · `preference` · `error` · `code` · `context` · `session`
-
-### Available tools
-`store_memory` · `search_memory` · `search_recent` · `upsert_memory` ·
-`find_or_create` · `delete_memory` · `get_related` · `memory_stats` ·
-`export_record` · `add_groups`
-
-`add_groups(memory_ids, groups)` retroactively widens a memory's group set —
-use for the store-now-share-later flow (user says "share those with X"
-after the fact). Additive only; un-sharing isn't supported.
-
-### Verification rule
-Memories are point-in-time observations. Before recommending a file / function / flag
-named in a memory, verify it still exists in the current code.
-```
-
----
-
-## Step 12 — (Optional) Install Constellation
+## Step 11 — (Optional) Install Constellation
 
 To enable group memory across machines and teammates, paste `INSTALL_CONSTELLATION.md` into Claude Code as a separate setup. It picks up the existing mem-fusion install automatically.
 

@@ -11,6 +11,7 @@
 #   <!-- INCLUDE: <src> AS <dest> -->            verbatim heredoc, quoted (no shell expansion)
 #   <!-- INCLUDE_EXEC: <src> AS <dest> -->       verbatim heredoc + chmod +x
 #   <!-- INCLUDE_TEMPLATED: <src> AS <dest> -->  unquoted heredoc (${VAR} expands at install time)
+#   <!-- INCLUDE_INLINE: <src> -->               splice file contents verbatim (no dest); recurses
 
 set -euo pipefail
 
@@ -63,24 +64,35 @@ emit_heredoc() {
     esac
 }
 
+process_stream() {
+    # Reads template lines from stdin, writes expanded output to stdout.
+    # Recognizes INCLUDE / INCLUDE_EXEC / INCLUDE_TEMPLATED (file-emitting)
+    # and INCLUDE_INLINE (recursive splice).
+    local line directive src dest src_path
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\<!--[[:space:]]+(INCLUDE|INCLUDE_EXEC|INCLUDE_TEMPLATED):[[:space:]]+(.+)[[:space:]]+AS[[:space:]]+(.+)[[:space:]]+--\>$ ]]; then
+            directive="${BASH_REMATCH[1]}"
+            src="${BASH_REMATCH[2]}"
+            dest="${BASH_REMATCH[3]}"
+            emit_heredoc "$directive" "$src" "$dest"
+        elif [[ "$line" =~ ^\<!--[[:space:]]+INCLUDE_INLINE:[[:space:]]+(.+)[[:space:]]+--\>$ ]]; then
+            src="${BASH_REMATCH[1]}"
+            src_path="$ROOT/$src"
+            [[ -f "$src_path" ]] || { echo "ERROR: included file does not exist: $src" >&2; return 1; }
+            process_stream < "$src_path"
+        else
+            printf '%s\n' "$line"
+        fi
+    done
+}
+
 build_one() {
     local template="$1" output="$2"
     [[ -f "$template" ]] || { echo "ERROR: template not found: $template" >&2; return 1; }
 
     local tmp
     tmp="$(mktemp)"
-
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^\<!--[[:space:]]+(INCLUDE|INCLUDE_EXEC|INCLUDE_TEMPLATED):[[:space:]]+(.+)[[:space:]]+AS[[:space:]]+(.+)[[:space:]]+--\>$ ]]; then
-            local directive="${BASH_REMATCH[1]}"
-            local src="${BASH_REMATCH[2]}"
-            local dest="${BASH_REMATCH[3]}"
-            emit_heredoc "$directive" "$src" "$dest" >> "$tmp"
-        else
-            printf '%s\n' "$line" >> "$tmp"
-        fi
-    done < "$template"
-
+    process_stream < "$template" > "$tmp"
     mv "$tmp" "$output"
     echo "  ✓ built $(basename "$output") ($(wc -l < "$output" | tr -d ' ') lines)"
 }

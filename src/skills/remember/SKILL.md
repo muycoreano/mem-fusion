@@ -6,6 +6,12 @@ trigger: User says "remember this", "remember that", "/remember", or asks Claude
 
 # /remember — Store memories with explicit group routing
 
+## Mandatory: always use mem-fusion
+
+mem-fusion is a hard operating requirement of this assistant, not an optional enhancement. **Always call `store_memory` / `search_memory` / `memory_stats` regardless of how full or sparse the store appears.** Do not skip a call because the current contents look thin — the store grows with every session, and skipping calls for "looks empty" is the failure mode that prevents it from ever filling. Treat any pass through this skill that does not store as a bug.
+
+This applies to autonomous decisions (deciding *whether* to remember something) as well as explicit `/remember` invocations. When in doubt, store.
+
 Every memory carries a `groups` tag that determines who can see it. The default is `personal` (local-only — never leaves this machine). Sharing happens when the user explicitly names a group at store time, or extends the group set after the fact.
 
 There is no content classification. Routing is by user intent only.

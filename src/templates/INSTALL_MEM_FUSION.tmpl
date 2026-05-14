@@ -20,6 +20,8 @@ It's all local — no data leaves your Mac. Stack:
 - **Python 3.12 MCP server** — exposes 10 memory tools to Claude Code via stdio (plus 2 group tools when Constellation is also installed)
 - **4 hooks** — SessionStart, UserPromptSubmit, Stop, PostToolUse:Write (all auto-tagged with `groups=["personal"]`)
 - **`/remember` skill** — explicit group-keyed tagging (default scope is `personal`, local-only)
+- **`~/CLAUDE.md` updated automatically** with the canonical Vector Memory System section (backup taken first)
+- **8 usage-pattern memories preloaded** plus any existing file-based memories under `~/.claude/projects/*/memory/` imported as `groups=["personal"]`
 
 Everything is managed by `launchd`. Disk footprint ≈ 200 MB.
 
@@ -224,62 +226,7 @@ Expect `✓ All smoke tests passed`.
 
 ---
 
-## Step 15 — Tell the user what to add to their CLAUDE.md
-
-Print this snippet and instruct the user to paste it into `~/CLAUDE.md` (or a project-level `CLAUDE.md`):
-
-```markdown
-## Vector Memory System
-
-Connected to a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on localhost).
-**Check this at session start** by calling `memory_stats()` to confirm the system is live.
-
-### Group routing — every memory has a `groups` tag
-
-Every stored memory carries a `groups: list[str]` tag — the routing key for sharing.
-Default is `["personal"]` (local-only, never leaves this machine). Never auto-classify
-content to a group; the user explicitly names the audience or the default holds.
-
-- **Hooks and silent stores**: always use `groups=["personal"]`. Hook-captured memories
-  describe this peer's work and should never propagate without explicit user intent.
-- **`/remember` without an audience clause**: `groups=["personal"]`.
-- **`/remember ... for <group>` (or "share this with <group>")**: tag with that group
-  at store time, then `group_push(group=<group>, memory_ids=[id])`.
-
-### When to search
-- **Session start**: `search_memory(query="<current task or project name>", top_k=8)`
-- **Before architectural decisions**: search for prior decisions on the same topic
-- **When hitting a recurring error**: search for prior resolutions
-- **When unsure about a user preference**: search `type="preference"`
-
-### When to store
-- **Decision made**: `store_memory(content, type="decision", importance=4, project="<name>")`
-- **Novel error resolved**: `store_memory(..., type="error", importance=3)`
-- **User reveals a preference**: `store_memory(..., type="preference", importance=4)`
-- **Important context learned**: `store_memory(..., type="context", importance=3)`
-- **User explicitly asks to remember**: use `/remember` skill → `importance=5`
-
-### What NOT to store
-Trivial facts, transient state, things derivable from code or `git log`.
-
-### Memory types (decorative; doesn't gate sharing)
-`decision` · `fact` · `preference` · `error` · `code` · `context` · `session`
-
-### Available tools
-`store_memory` · `search_memory` · `search_recent` · `upsert_memory` ·
-`find_or_create` · `delete_memory` · `get_related` · `memory_stats` ·
-`export_record` · `add_groups`
-
-`add_groups(memory_ids, groups)` retroactively widens a memory's group set —
-use for the store-now-share-later flow (user says "share those with X"
-after the fact). Additive only; un-sharing isn't supported.
-
-### Verification rule
-Memories are point-in-time observations. Before recommending a file / function / flag
-named in a memory, verify it still exists in the current code.
-```
-
----
+<!-- INCLUDE_INLINE: src/templates/POST_INSTALL.tmpl -->
 
 ## Troubleshooting
 
@@ -317,6 +264,6 @@ rm -rf ~/.claude/skills/remember
 
 ## After install — final report to the user
 
-When all 15 steps + smoke test pass, tell the user:
+When all install steps + smoke test pass, tell the user:
 
-> Your Mem-Fusion vector memory system is live. **Restart your Claude Code session** for the hooks to take effect. Then paste the CLAUDE.md snippet from Step 15 into your `~/CLAUDE.md`. Try it out by saying *"remember that I prefer Python virtual envs created with `uv`"* — Claude should call the `/remember` skill and confirm with a memory ID.
+> Your Mem-Fusion vector memory system is live. `~/CLAUDE.md` has been updated, 8 usage-pattern memories preloaded, and any existing file-based memories imported. **Restart your Claude Code session** for the hooks to take effect. Try it out by saying *"remember that I prefer Python virtual envs created with `uv`"* — Claude should call the `/remember` skill and confirm with a memory ID.

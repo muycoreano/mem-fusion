@@ -1,0 +1,40 @@
+## Update `~/CLAUDE.md` with the v0.4 Vector Memory System section
+
+Merges the canonical snippet into `~/CLAUDE.md`, replacing any existing `## Vector Memory System` section. Backs up to `~/CLAUDE.md.bak.<UTC-timestamp>` before any change. Idempotent.
+
+<!-- INCLUDE: src/config/claude_md_snippet.md AS ~/.local/share/mem-fusion/claude_md_snippet.md -->
+
+<!-- INCLUDE_EXEC: src/scripts/merge_claude_md.py AS ~/.local/share/mem-fusion/scripts/merge_claude_md.py -->
+
+```bash
+~/.local/share/mem-fusion/venv/bin/python \
+  ~/.local/share/mem-fusion/scripts/merge_claude_md.py
+```
+
+---
+
+## Preload mem-fusion with usage-pattern memories
+
+Stores 8 canonical usage-pattern memories (`groups=["personal"]`, tagged `["onboarding", "usage-example"]`). Idempotent via content-hash dedup.
+
+<!-- INCLUDE_EXEC: src/scripts/preload_usage_memories.py AS ~/.local/share/mem-fusion/scripts/preload_usage_memories.py -->
+
+```bash
+~/.local/share/mem-fusion/venv/bin/python \
+  ~/.local/share/mem-fusion/scripts/preload_usage_memories.py
+```
+
+---
+
+## Import existing file-based memories
+
+Scans `~/.claude/projects/*/memory/*.md` and seeds each into Qdrant as `groups=["personal"]` with `tags=["imported-from-file-memory", <name>]`. Idempotent.
+
+<!-- INCLUDE_EXEC: src/scripts/import_local_memories.py AS ~/.local/share/mem-fusion/scripts/import_local_memories.py -->
+
+```bash
+~/.local/share/mem-fusion/venv/bin/python \
+  ~/.local/share/mem-fusion/scripts/import_local_memories.py
+```
+
+---

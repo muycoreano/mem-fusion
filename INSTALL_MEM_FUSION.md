@@ -20,6 +20,8 @@ It's all local — no data leaves your Mac. Stack:
 - **Python 3.12 MCP server** — exposes 10 memory tools to Claude Code via stdio (plus 2 group tools when Constellation is also installed)
 - **4 hooks** — SessionStart, UserPromptSubmit, Stop, PostToolUse:Write (all auto-tagged with `groups=["personal"]`)
 - **`/remember` skill** — explicit group-keyed tagging (default scope is `personal`, local-only)
+- **`~/CLAUDE.md` updated automatically** with the canonical Vector Memory System section (backup taken first)
+- **8 usage-pattern memories preloaded** plus any existing file-based memories under `~/.claude/projects/*/memory/` imported as `groups=["personal"]`
 
 Everything is managed by `launchd`. Disk footprint ≈ 200 MB.
 
@@ -1664,6 +1666,12 @@ trigger: User says "remember this", "remember that", "/remember", or asks Claude
 
 # /remember — Store memories with explicit group routing
 
+## Mandatory: always use mem-fusion
+
+mem-fusion is a hard operating requirement of this assistant, not an optional enhancement. **Always call `store_memory` / `search_memory` / `memory_stats` regardless of how full or sparse the store appears.** Do not skip a call because the current contents look thin — the store grows with every session, and skipping calls for "looks empty" is the failure mode that prevents it from ever filling. Treat any pass through this skill that does not store as a bug.
+
+This applies to autonomous decisions (deciding *whether* to remember something) as well as explicit `/remember` invocations. When in doubt, store.
+
 Every memory carries a `groups` tag that determines who can see it. The default is `personal` (local-only — never leaves this machine). Sharing happens when the user explicitly names a group at store time, or extends the group set after the fact.
 
 There is no content classification. Routing is by user intent only.
@@ -1870,15 +1878,28 @@ Expect `✓ All smoke tests passed`.
 
 ---
 
-## Step 15 — Tell the user what to add to their CLAUDE.md
+## Update `~/CLAUDE.md` with the v0.4 Vector Memory System section
 
-Print this snippet and instruct the user to paste it into `~/CLAUDE.md` (or a project-level `CLAUDE.md`):
+Merges the canonical snippet into `~/CLAUDE.md`, replacing any existing `## Vector Memory System` section. Backs up to `~/CLAUDE.md.bak.<UTC-timestamp>` before any change. Idempotent.
 
-```markdown
+```bash
+cat > ~/.local/share/mem-fusion/claude_md_snippet.md <<'3BF79484F30E_EOF'
 ## Vector Memory System
 
-Connected to a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on localhost).
-**Check this at session start** by calling `memory_stats()` to confirm the system is live.
+You have a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on localhost) — your persistent semantic memory across sessions.
+
+**Always use mem-fusion, regardless of how full or sparse it appears.** Do not judge its usefulness from a single search returning few results. The store grows with every session; treating it as "empty therefore not useful" is the failure mode that prevents it from ever filling. Skipping a mem-fusion call when the situation calls for one is a bug, not a judgment call.
+
+### Mandatory operations
+
+- **Session start**: call `memory_stats()` first, then `search_memory(query="<current task or project name>", top_k=8)`. Always — even when the task seems trivial or the user just gave a one-liner.
+- **Before architectural decisions**: `search_memory(query="<topic>")` for prior decisions on the same topic.
+- **When hitting a recurring error**: `search_memory(query="<error symptom>", type="error")`.
+- **Decision made**: `store_memory(content, type="decision", importance=4, project="<name>")`.
+- **Novel error resolved**: `store_memory(..., type="error", importance=3)`.
+- **User reveals a preference**: `store_memory(..., type="preference", importance=4)`.
+- **Important context learned**: `store_memory(..., type="context", importance=3)`.
+- **User explicitly asks to remember**: use the `/remember` skill → `importance=5`.
 
 ### Group routing — every memory has a `groups` tag
 
@@ -1892,26 +1913,16 @@ content to a group; the user explicitly names the audience or the default holds.
 - **`/remember ... for <group>` (or "share this with <group>")**: tag with that group
   at store time, then `group_push(group=<group>, memory_ids=[id])`.
 
-### When to search
-- **Session start**: `search_memory(query="<current task or project name>", top_k=8)`
-- **Before architectural decisions**: search for prior decisions on the same topic
-- **When hitting a recurring error**: search for prior resolutions
-- **When unsure about a user preference**: search `type="preference"`
-
-### When to store
-- **Decision made**: `store_memory(content, type="decision", importance=4, project="<name>")`
-- **Novel error resolved**: `store_memory(..., type="error", importance=3)`
-- **User reveals a preference**: `store_memory(..., type="preference", importance=4)`
-- **Important context learned**: `store_memory(..., type="context", importance=3)`
-- **User explicitly asks to remember**: use `/remember` skill → `importance=5`
-
 ### What NOT to store
+
 Trivial facts, transient state, things derivable from code or `git log`.
 
 ### Memory types (decorative; doesn't gate sharing)
+
 `decision` · `fact` · `preference` · `error` · `code` · `context` · `session`
 
 ### Available tools
+
 `store_memory` · `search_memory` · `search_recent` · `upsert_memory` ·
 `find_or_create` · `delete_memory` · `get_related` · `memory_stats` ·
 `export_record` · `add_groups`
@@ -1921,8 +1932,407 @@ use for the store-now-share-later flow (user says "share those with X"
 after the fact). Additive only; un-sharing isn't supported.
 
 ### Verification rule
+
 Memories are point-in-time observations. Before recommending a file / function / flag
 named in a memory, verify it still exists in the current code.
+3BF79484F30E_EOF
+```
+
+```bash
+cat > ~/.local/share/mem-fusion/scripts/merge_claude_md.py <<'9F6E600D5A0A_EOF'
+#!/usr/bin/env python3
+"""
+Merge the canonical mem-fusion Vector Memory System section into ~/CLAUDE.md.
+
+Reads the snippet from MEMFUSION_SNIPPET (default: ~/.local/share/mem-fusion/
+claude_md_snippet.md), finds any existing `## Vector Memory System` section
+in ~/CLAUDE.md, replaces it with the snippet, leaves everything else untouched.
+If no such section exists, appends. If no ~/CLAUDE.md exists, creates one.
+
+Idempotent: a second run with the same inputs is a no-op.
+
+Backs up ~/CLAUDE.md to ~/CLAUDE.md.bak.<UTC-ISO-timestamp> only when content
+actually changes.
+"""
+import os
+import sys
+import datetime
+from pathlib import Path
+
+HOME            = Path.home()
+CLAUDE_MD       = HOME / "CLAUDE.md"
+DEFAULT_SNIPPET = HOME / ".local/share/mem-fusion/claude_md_snippet.md"
+SNIPPET_PATH    = Path(os.getenv("MEMFUSION_SNIPPET", str(DEFAULT_SNIPPET)))
+SECTION_HEADER  = "## Vector Memory System"
+
+
+def section_bounds(lines: list[str]) -> tuple[int, int] | None:
+    """Return (start, end_exclusive) of an existing Vector Memory System section, or None."""
+    start = None
+    for i, line in enumerate(lines):
+        if line.rstrip() == SECTION_HEADER:
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("## ") and not lines[j].startswith("### "):
+            end = j
+            break
+    return (start, end)
+
+
+def build_merged(existing: str, snippet: str) -> str:
+    snippet = snippet.rstrip() + "\n"
+    if not existing:
+        return snippet
+    lines = existing.splitlines(keepends=True)
+    bounds = section_bounds(lines)
+    if bounds is None:
+        prefix = existing if existing.endswith("\n") else existing + "\n"
+        sep = "" if prefix.endswith("\n\n") else "\n"
+        return prefix + sep + snippet
+    start, end = bounds
+    before = "".join(lines[:start])
+    after  = "".join(lines[end:])
+    if before and not before.endswith("\n"):
+        before += "\n"
+    if after and not after.startswith("\n"):
+        after = "\n" + after
+    return before + snippet + after
+
+
+def main() -> int:
+    if not SNIPPET_PATH.is_file():
+        print(f"ERROR: snippet not found at {SNIPPET_PATH}", file=sys.stderr)
+        return 1
+    snippet = SNIPPET_PATH.read_text()
+
+    existing = CLAUDE_MD.read_text() if CLAUDE_MD.exists() else ""
+    merged   = build_merged(existing, snippet)
+
+    if merged == existing:
+        print(f"~/CLAUDE.md already current — no changes.")
+        return 0
+
+    if existing:
+        ts     = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = CLAUDE_MD.with_suffix(CLAUDE_MD.suffix + f".bak.{ts}")
+        backup.write_text(existing)
+        print(f"Backed up existing ~/CLAUDE.md → {backup.name}")
+
+    CLAUDE_MD.write_text(merged)
+    action = "Created" if not existing else ("Replaced section in" if section_bounds(existing.splitlines(keepends=True)) else "Appended to")
+    print(f"{action} ~/CLAUDE.md")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+9F6E600D5A0A_EOF
+chmod +x ~/.local/share/mem-fusion/scripts/merge_claude_md.py
+```
+
+```bash
+~/.local/share/mem-fusion/venv/bin/python \
+  ~/.local/share/mem-fusion/scripts/merge_claude_md.py
+```
+
+---
+
+## Preload mem-fusion with usage-pattern memories
+
+Stores 8 canonical usage-pattern memories (`groups=["personal"]`, tagged `["onboarding", "usage-example"]`). Idempotent via content-hash dedup.
+
+```bash
+cat > ~/.local/share/mem-fusion/scripts/preload_usage_memories.py <<'846991CB78EB_EOF'
+#!/usr/bin/env python3
+"""
+Preload mem-fusion with 8 canonical usage-pattern memories so first-session
+search returns substance — breaks the cold-start usefulness deadlock where
+Claude inspects an empty store and silently routes around it.
+
+All memories: groups=["personal"], tags=["onboarding", "usage-example"].
+Idempotent: core.store_memory content-hashes on insert, so a second run
+reports each as duplicate and writes nothing new.
+
+Honors QDRANT_URL and OLLAMA_URL env vars (defaults match a standard install).
+"""
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home() / ".local/share/mem-fusion"))
+import core  # noqa: E402
+
+SEEDS = [
+    {
+        "content": (
+            "mem-fusion is the persistent semantic memory for this Claude install. "
+            "Search it at session start; store decisions, errors, and preferences as "
+            "they happen. The store grows with use — do not skip calls when it looks "
+            "sparse; that is the failure mode that prevents it from ever filling."
+        ),
+        "type": "context", "importance": 4,
+    },
+    {
+        "content": (
+            "Session-start protocol: call memory_stats() to confirm the store is live, "
+            "then search_memory(query='<current task or project name>', top_k=8) to "
+            "surface prior context. Both calls are mandatory regardless of how full "
+            "or sparse the store currently looks."
+        ),
+        "type": "context", "importance": 4,
+    },
+    {
+        "content": (
+            "store_memory importance levels: 5=explicit /remember, 4=decision or "
+            "user preference, 3=novel error resolved or important context, "
+            "2=routine context, 1=trivial. Use 3 as the default floor for "
+            "autonomous stores — anything worth remembering at all is at least a 3."
+        ),
+        "type": "decision", "importance": 4,
+    },
+    {
+        "content": (
+            "Group routing is by explicit user intent, not content classification. "
+            "Default groups=['personal'] for all hooks, silent stores, and /remember "
+            "without an audience clause. Only widen the group set when the user "
+            "explicitly names a group ('for engineering', 'share with product')."
+        ),
+        "type": "decision", "importance": 4,
+    },
+    {
+        "content": (
+            "Two-store architecture: file-based ~/.claude/projects/.../memory/*.md "
+            "holds always-loaded behavioral rules; Qdrant via mem-fusion holds "
+            "searchable semantic memory. Most content lives in one store or the "
+            "other, not both — file-based for rules Claude needs every session, "
+            "Qdrant for facts retrievable on demand."
+        ),
+        "type": "context", "importance": 4,
+    },
+    {
+        "content": (
+            "When the user says 'let's pause and reflect' or asks for a session "
+            "summary, store 3-5 memories covering decisions made, errors resolved, "
+            "preferences revealed, and context that may matter later. Default "
+            "groups=['personal']; user can widen retroactively with 'share those "
+            "with X' which triggers add_groups + group_push for that group only."
+        ),
+        "type": "preference", "importance": 4,
+    },
+    {
+        "content": (
+            "mem-fusion MCP tool surface: store_memory, search_memory, search_recent, "
+            "memory_stats, find_or_create, upsert_memory, delete_memory, get_related, "
+            "add_groups, export_record. Plus group_pull and group_push when "
+            "Constellation is installed. All tools are namespaced mcp__mem-fusion__*."
+        ),
+        "type": "context", "importance": 3,
+    },
+    {
+        "content": (
+            "Verification rule: memories are point-in-time observations. Before "
+            "recommending a file path, function name, or flag named in a recalled "
+            "memory, verify it still exists in the current code via grep or Read. "
+            "Memories can become stale; the code is authoritative."
+        ),
+        "type": "preference", "importance": 4,
+    },
+]
+
+
+async def main() -> int:
+    stored = duplicate = merged = 0
+    for seed in SEEDS:
+        args = dict(seed)
+        args["project"] = "mem-fusion-onboarding"
+        args["tags"]    = ["onboarding", "usage-example"]
+        args["groups"]  = ["personal"]
+        result = await core.store_memory(args)
+        status = result.get("status", "unknown")
+        if status == "stored":
+            stored += 1
+        elif status == "duplicate":
+            duplicate += 1
+        elif status == "merged":
+            merged += 1
+        print(f"  [{status:9s}] {seed['content'][:72]}…")
+
+    print(f"\n✓ Preload complete — {stored} stored, {duplicate} duplicate, {merged} merged (of {len(SEEDS)} seeds)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
+846991CB78EB_EOF
+chmod +x ~/.local/share/mem-fusion/scripts/preload_usage_memories.py
+```
+
+```bash
+~/.local/share/mem-fusion/venv/bin/python \
+  ~/.local/share/mem-fusion/scripts/preload_usage_memories.py
+```
+
+---
+
+## Import existing file-based memories
+
+Scans `~/.claude/projects/*/memory/*.md` and seeds each into Qdrant as `groups=["personal"]` with `tags=["imported-from-file-memory", <name>]`. Idempotent.
+
+```bash
+cat > ~/.local/share/mem-fusion/scripts/import_local_memories.py <<'EDE53AF7AD5D_EOF'
+#!/usr/bin/env python3
+"""
+Import Claude's file-based auto-memory into mem-fusion as personal memories.
+
+Scans ~/.claude/projects/*/memory/*.md for memory files (skipping MEMORY.md,
+which is an index, not a memory). Parses each file's YAML-style frontmatter
+and body. Stores each into Qdrant via core.store_memory with:
+
+  - content : the body text
+  - type    : frontmatter.metadata.type (or top-level type, fallback "context")
+  - tags    : ["imported-from-file-memory"] + the frontmatter.name as a tag
+  - project : "mem-fusion-onboarding"
+  - groups  : ["personal"]
+  - importance: 4
+
+Idempotent — core.store_memory content-hashes on insert; a re-run reports
+each as duplicate and writes nothing new.
+
+This is a one-shot bootstrap seed, not an ongoing sync. The two stores stay
+separate per the dual-memory rule; this just gives the vector DB substance
+from real personal content on first install.
+"""
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home() / ".local/share/mem-fusion"))
+import core  # noqa: E402
+
+PROJECTS_ROOT = Path.home() / ".claude/projects"
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Minimal YAML-frontmatter parser: handles `key: value` and `key:` indented blocks.
+
+    Returns (metadata_dict, body_text). If the file has no frontmatter
+    fence, returns ({}, text).
+    """
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}, text
+    block = text[4:end]
+    body  = text[end + 5:]
+
+    meta: dict = {}
+    current_parent: str | None = None
+    for raw in block.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        if raw.startswith("  ") and current_parent:
+            sub = raw.strip()
+            if ":" in sub:
+                k, _, v = sub.partition(":")
+                meta.setdefault(current_parent, {})[k.strip()] = v.strip()
+            continue
+        if ":" in raw:
+            k, _, v = raw.partition(":")
+            k = k.strip()
+            v = v.strip()
+            if v == "":
+                current_parent = k
+                meta[k] = {}
+            else:
+                current_parent = None
+                meta[k] = v
+    return meta, body
+
+
+def memory_type(meta: dict) -> str:
+    md = meta.get("metadata")
+    if isinstance(md, dict) and md.get("type"):
+        return str(md["type"])
+    if meta.get("type"):
+        return str(meta["type"])
+    return "context"
+
+
+async def main() -> int:
+    if not PROJECTS_ROOT.is_dir():
+        print(f"No {PROJECTS_ROOT} — nothing to import.")
+        return 0
+
+    md_files = []
+    for project_dir in sorted(PROJECTS_ROOT.iterdir()):
+        mem_dir = project_dir / "memory"
+        if not mem_dir.is_dir():
+            continue
+        for f in sorted(mem_dir.glob("*.md")):
+            if f.name == "MEMORY.md":
+                continue
+            md_files.append(f)
+
+    if not md_files:
+        print(f"No memory files found under {PROJECTS_ROOT}/*/memory/ — nothing to import.")
+        return 0
+
+    stored = duplicate = merged = skipped = 0
+    for f in md_files:
+        try:
+            text = f.read_text()
+        except OSError as e:
+            print(f"  [skip-read   ] {f.name}: {e}")
+            skipped += 1
+            continue
+
+        meta, body = parse_frontmatter(text)
+        body = body.strip()
+        if not body:
+            print(f"  [skip-empty  ] {f.name}: no body content")
+            skipped += 1
+            continue
+
+        name = meta.get("name", f.stem)
+        args = {
+            "content":    body,
+            "type":       memory_type(meta),
+            "importance": 4,
+            "project":    "mem-fusion-onboarding",
+            "tags":       ["imported-from-file-memory", str(name)],
+            "groups":     ["personal"],
+        }
+        result = await core.store_memory(args)
+        status = result.get("status", "unknown")
+        if status == "stored":
+            stored += 1
+        elif status == "duplicate":
+            duplicate += 1
+        elif status == "merged":
+            merged += 1
+        print(f"  [{status:9s}] {f.name}")
+
+    print(
+        f"\n✓ Import complete — {stored} stored, {duplicate} duplicate, "
+        f"{merged} merged, {skipped} skipped (of {len(md_files)} files)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
+EDE53AF7AD5D_EOF
+chmod +x ~/.local/share/mem-fusion/scripts/import_local_memories.py
+```
+
+```bash
+~/.local/share/mem-fusion/venv/bin/python \
+  ~/.local/share/mem-fusion/scripts/import_local_memories.py
 ```
 
 ---
@@ -1963,6 +2373,6 @@ rm -rf ~/.claude/skills/remember
 
 ## After install — final report to the user
 
-When all 15 steps + smoke test pass, tell the user:
+When all install steps + smoke test pass, tell the user:
 
-> Your Mem-Fusion vector memory system is live. **Restart your Claude Code session** for the hooks to take effect. Then paste the CLAUDE.md snippet from Step 15 into your `~/CLAUDE.md`. Try it out by saying *"remember that I prefer Python virtual envs created with `uv`"* — Claude should call the `/remember` skill and confirm with a memory ID.
+> Your Mem-Fusion vector memory system is live. `~/CLAUDE.md` has been updated, 8 usage-pattern memories preloaded, and any existing file-based memories imported. **Restart your Claude Code session** for the hooks to take effect. Try it out by saying *"remember that I prefer Python virtual envs created with `uv`"* — Claude should call the `/remember` skill and confirm with a memory ID.

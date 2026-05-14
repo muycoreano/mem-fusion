@@ -162,12 +162,17 @@ def store_via_api(memories, importance, project):
             (QUEUE_DIR / f"{ts}-{h}.json").write_text(json.dumps(mem))
         return
 
-    import mem_fusion as srv
+    # Hook-captured memories are always personal — they record this peer's
+    # work and should never propagate to teammates without explicit user intent.
+    import core
     stored = 0
     for mem in memories:
         try:
-            r = asyncio.run(srv.tool_store({**mem, "importance": importance, "project": project}))
-            if r.get("status") == "stored":
+            r = asyncio.run(core.store_memory({
+                **mem, "importance": importance, "project": project,
+                "groups": ["personal"],
+            }))
+            if r.get("status") in ("stored", "merged"):
                 stored += 1
         except Exception as e:
             log.error("Store failed: %s — %s", mem["content"][:40], e)

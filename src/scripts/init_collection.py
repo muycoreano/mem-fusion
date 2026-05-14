@@ -34,11 +34,16 @@ else:
 indexes = {
     "type":         PayloadSchemaType.KEYWORD,
     "project":      PayloadSchemaType.KEYWORD,
-    "source":       PayloadSchemaType.KEYWORD,
+    "groups":       PayloadSchemaType.KEYWORD,  # v0.4 list-valued routing key
+    "source":       PayloadSchemaType.KEYWORD,  # legacy v0.3, kept for migration
+    "group_name":   PayloadSchemaType.KEYWORD,  # legacy v0.3, kept for migration
     "session_id":   PayloadSchemaType.KEYWORD,
     "content_hash": PayloadSchemaType.KEYWORD,
+    "origin_node":  PayloadSchemaType.KEYWORD,
+    "tags":         PayloadSchemaType.KEYWORD,
     "importance":   PayloadSchemaType.INTEGER,
     "timestamp":    PayloadSchemaType.DATETIME,
+    "submitted_at": PayloadSchemaType.DATETIME,
 }
 for field, schema in indexes.items():
     try:

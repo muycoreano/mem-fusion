@@ -47,8 +47,9 @@ def iso_now():
 
 
 async def make_record(content, type_="decision"):
-    """Create a memory locally + return its full record. Inserts a
-    source=local entry which won't appear in /peers (no group_name)."""
+    """Create an exportable record. We delete the local copy afterward so the
+    subsequent /memory/put posting it back exercises the 'fresh receive' path
+    (otherwise v0.4's global content_hash dedup would merge instead of store)."""
     use_qdrant(RECEIVER["qdrant_port"])
     r = await core.store_memory({
         "content": content, "type": type_,
@@ -56,7 +57,9 @@ async def make_record(content, type_="decision"):
     })
     if r.get("status") != "stored":
         raise RuntimeError(f"store failed: {r}")
-    return await core.export_record({"id": r["id"]})
+    rec = await core.export_record({"id": r["id"]})
+    await core.delete_memory({"id": r["id"]})
+    return rec
 
 
 def post_put(record, *, origin_node):
@@ -69,7 +72,7 @@ def post_put(record, *, origin_node):
         "tags":         record["tags"],
         "project":      record.get("project", ""),
         "importance":   record["importance"],
-        "group_name":   GROUP_NAME,
+        "groups":       [GROUP_NAME],
         "origin_node":  origin_node,
         "submitted_at": iso_now(),
     }

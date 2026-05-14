@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-End-to-end test for `group_pull` and `group_push`: spins up two Qdrants and
-two Constellation daemons, each pointed at the other as a peer, then exercises
-the gateway endpoints directly via HTTP.
+End-to-end test for v0.4 `group_pull` and `group_push`: spins up two Qdrants
+and two Constellation daemons, each pointed at the other as a peer, then
+exercises the gateway endpoints directly via HTTP.
 
 Verifies:
-  - push: send a local memory from A to B; B inserts as source=group;
-          A's local entry gets augmented with group_name + submitted_at
-  - push idempotency: re-push returns delivery=duplicate
-  - pull dedup: pull when B already has the entry returns zero new
-  - pull privacy: A's memories without group_name are not returned via pull
+  - push: send a local memory from A's gateway to B; B inserts the entry
+          with the target group in its `groups` list
+  - push idempotency: re-push of same memory results in delivery=duplicate
+  - pull dedup: pull when B already has the entry returns zero stored,
+                merge counts allowed
+  - pull privacy: A's memories tagged personal-only are NOT returned via pull
+                  for the shared group
   - pull catch-up: push from A, drop on B, pull — B recovers the entry
+  - push-time filter: A pushes a memory tagged [personal, shared]; B only
+                      sees `groups=[shared]` (personal stripped on the wire)
 
 Self-contained — uses tests/lib/harness.py to spin up Qdrant + Constellation.
 
@@ -47,41 +51,51 @@ def use_qdrant(port):
     core.qdrant = QdrantClient(url=url, timeout=10)
 
 
-def count_in_group(port, group_name, *, source=None):
-    """Count entries in port's Qdrant matching group_name (+ optional source)."""
+def count_in_group(port, group_name):
+    """Count entries in port's Qdrant whose `groups` array contains group_name."""
     client = QdrantClient(url=f"http://127.0.0.1:{port}", timeout=10)
-    must = [FieldCondition(key="group_name", match=MatchValue(value=group_name))]
-    if source:
-        must.append(FieldCondition(key="source", match=MatchValue(value=source)))
     pts, _ = client.scroll(
         collection_name=core.COLLECTION,
-        scroll_filter=Filter(must=must),
+        scroll_filter=Filter(must=[
+            FieldCondition(key="groups", match=MatchValue(value=group_name)),
+        ]),
         limit=100, with_payload=False, with_vectors=False,
     )
     return len(pts)
 
 
-async def insert_local(qdrant_port, content, type_="decision"):
+async def insert_local(qdrant_port, content, type_="decision", groups=None):
     """Insert a fresh local memory via core.store_memory on the given Qdrant."""
     use_qdrant(qdrant_port)
-    r = await core.store_memory({
+    args = {
         "content": content, "type": type_,
         "tags": ["e2e"], "project": "pull-push-test", "importance": 4,
-    })
+    }
+    if groups is not None:
+        args["groups"] = groups
+    r = await core.store_memory(args)
     if r.get("status") != "stored":
         raise RuntimeError(f"store failed: {r}")
     return r["id"]
 
 
+def first_delivery(push_body):
+    """Pluck the first delivery row from a push response (one memory pushed)."""
+    deliveries = push_body.get("deliveries") or []
+    return deliveries[0] if deliveries else None
+
+
 async def run_tests(passed):
-    print("\nSTEP 4: insert a memory locally on peer-a and push to group")
-    a_id_1 = await insert_local(PEER_A["qdrant_port"],
-                                "gRPC for internal RPC; HTTP/JSON for public APIs.")
-    use_qdrant(PEER_A["qdrant_port"])
-    record = await core.export_record({"id": a_id_1})
+    print("\nSTEP 4: insert a memory tagged [GROUP] on peer-a and push to group")
+    a_id_1 = await insert_local(
+        PEER_A["qdrant_port"],
+        "gRPC for internal RPC; HTTP/JSON for public APIs.",
+        groups=[GROUP_NAME],
+    )
 
     r = httpx.post(f"http://127.0.0.1:{PEER_A['gateway_port']}/push",
-                   json={"record": record}, timeout=20.0)
+                   json={"group": GROUP_NAME, "memory_ids": [a_id_1]},
+                   timeout=20.0)
     passed.append(harness.check("push HTTP 200", r.status_code == 200))
     body = r.json()
     passed.append(harness.check("push response has peers list",
@@ -90,24 +104,26 @@ async def run_tests(passed):
     passed.append(harness.check("push: peer-b responsive",
                                 b_entry and b_entry["status"] == "responsive",
                                 f"got {b_entry}"))
+    deliv = b_entry and first_delivery(b_entry)
     passed.append(harness.check("push: peer-b delivery == stored",
-                                b_entry and b_entry.get("delivery") == "stored"))
+                                deliv and deliv.get("status") == "stored",
+                                f"got {deliv}"))
 
-    passed.append(harness.check("peer-b has 1 source=group entry after push",
-                                count_in_group(PEER_B["qdrant_port"], GROUP_NAME,
-                                               source="group") == 1))
-    passed.append(harness.check("peer-a's local entry now carries group_name",
-                                count_in_group(PEER_A["qdrant_port"], GROUP_NAME,
-                                               source="local") == 1))
+    passed.append(harness.check("peer-b has 1 entry tagged GROUP after push",
+                                count_in_group(PEER_B["qdrant_port"], GROUP_NAME) == 1))
+    passed.append(harness.check("peer-a's entry still tagged GROUP",
+                                count_in_group(PEER_A["qdrant_port"], GROUP_NAME) == 1))
 
     print("\nSTEP 5: push the same memory again → delivery=duplicate on peer-b")
     r = httpx.post(f"http://127.0.0.1:{PEER_A['gateway_port']}/push",
-                   json={"record": record}, timeout=20.0)
+                   json={"group": GROUP_NAME, "memory_ids": [a_id_1]},
+                   timeout=20.0)
     b_entry = next((p for p in r.json()["peers"] if p["node_name"] == PEER_B["node_name"]), None)
+    deliv = b_entry and first_delivery(b_entry)
     passed.append(harness.check("push idempotent: delivery == duplicate",
-                                b_entry and b_entry.get("delivery") == "duplicate"))
+                                deliv and deliv.get("status") == "duplicate"))
 
-    print("\nSTEP 6: pull on peer-b → zero new entries (already has it)")
+    print("\nSTEP 6: pull on peer-b → zero new entry_ids (already has it)")
     r = httpx.post(f"http://127.0.0.1:{PEER_B['gateway_port']}/pull",
                    json={}, timeout=20.0)
     passed.append(harness.check("pull HTTP 200", r.status_code == 200))
@@ -117,31 +133,37 @@ async def run_tests(passed):
     passed.append(harness.check("pull returned zero new entry_ids (dedup)",
                                 a_entry and a_entry.get("entry_ids") == []))
 
-    print("\nSTEP 7: insert a SECOND memory on A but don't push; pull on B")
-    a_id_2 = await insert_local(PEER_A["qdrant_port"],
-                                 "Quantum mechanics describes wave-particle duality.",
-                                 type_="fact")
+    print("\nSTEP 7: insert a PERSONAL-only memory on A; pull on B → not visible")
+    a_id_2 = await insert_local(
+        PEER_A["qdrant_port"],
+        "Quantum mechanics describes wave-particle duality.",
+        type_="fact", groups=["personal"],
+    )
     r = httpx.post(f"http://127.0.0.1:{PEER_B['gateway_port']}/pull",
                    json={}, timeout=20.0)
     a_entry = next((p for p in r.json()["peers"] if p["node_name"] == PEER_A["node_name"]), None)
-    passed.append(harness.check("pull skips A's non-pushed memory (no group_name yet)",
+    passed.append(harness.check("pull skips personal-only memory (privacy)",
                                 a_entry and a_entry.get("entry_ids") == []))
 
-    print("\nSTEP 8: push the second memory; drop on B; pull on B → recovers it")
+    print("\nSTEP 8: push a third memory; drop on B; pull on B → recovers it")
+    a_id_3 = await insert_local(
+        PEER_A["qdrant_port"],
+        "JSON Schema is the canonical format for our API contracts.",
+        groups=[GROUP_NAME],
+    )
     use_qdrant(PEER_A["qdrant_port"])
-    record_2 = await core.export_record({"id": a_id_2})
+    record_3 = await core.export_record({"id": a_id_3})
     httpx.post(f"http://127.0.0.1:{PEER_A['gateway_port']}/push",
-               json={"record": record_2}, timeout=20.0)
+               json={"group": GROUP_NAME, "memory_ids": [a_id_3]}, timeout=20.0)
 
-    # Simulate B missing the entry: delete it locally before pull
+    # Simulate B missing the entry: delete by content_hash before pull
     use_qdrant(PEER_B["qdrant_port"])
     client_b = QdrantClient(url=f"http://127.0.0.1:{PEER_B['qdrant_port']}", timeout=10)
     pts, _ = client_b.scroll(
         collection_name=core.COLLECTION,
         scroll_filter=Filter(must=[
             FieldCondition(key="content_hash",
-                           match=MatchValue(value=record_2["content_hash"])),
-            FieldCondition(key="group_name", match=MatchValue(value=GROUP_NAME)),
+                           match=MatchValue(value=record_3["content_hash"])),
         ]),
         limit=10, with_payload=False,
     )
@@ -154,9 +176,36 @@ async def run_tests(passed):
     passed.append(harness.check("pull recovers the dropped entry",
                                 a_entry and len(a_entry.get("entry_ids", [])) == 1,
                                 f"got {a_entry}"))
-    passed.append(harness.check("peer-b has 2 source=group entries",
-                                count_in_group(PEER_B["qdrant_port"], GROUP_NAME,
-                                               source="group") == 2))
+    passed.append(harness.check("peer-b has 2 entries tagged GROUP after pull",
+                                count_in_group(PEER_B["qdrant_port"], GROUP_NAME) == 2))
+
+    print("\nSTEP 9: push-time group filter — personal tag stripped on the wire")
+    # Insert a memory tagged [personal, GROUP] on A; push to GROUP; verify B
+    # sees ONLY groups=[GROUP] on the receiving side (personal never crosses).
+    a_id_4 = await insert_local(
+        PEER_A["qdrant_port"],
+        "A multi-group memory: personal AND shared.",
+        groups=["personal", GROUP_NAME],
+    )
+    httpx.post(f"http://127.0.0.1:{PEER_A['gateway_port']}/push",
+               json={"group": GROUP_NAME, "memory_ids": [a_id_4]}, timeout=20.0)
+    # Inspect B's record for that content_hash
+    use_qdrant(PEER_A["qdrant_port"])
+    record_4 = await core.export_record({"id": a_id_4})
+    client_b = QdrantClient(url=f"http://127.0.0.1:{PEER_B['qdrant_port']}", timeout=10)
+    pts, _ = client_b.scroll(
+        collection_name=core.COLLECTION,
+        scroll_filter=Filter(must=[
+            FieldCondition(key="content_hash",
+                           match=MatchValue(value=record_4["content_hash"])),
+        ]),
+        limit=1, with_payload=True,
+    )
+    b_groups = (pts[0].payload or {}).get("groups", []) if pts else []
+    passed.append(harness.check(
+        "B's copy carries only the shared group (personal stripped)",
+        b_groups == [GROUP_NAME], f"got groups={b_groups}",
+    ))
 
 
 def main():

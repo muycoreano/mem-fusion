@@ -56,19 +56,24 @@ def run_tests(mcp_a: harness.MCPClient, mcp_b: harness.MCPClient,
     passed.append(harness.check("both mem-fusion subprocesses initialized", True))
 
     # ── A → B: push direction ────────────────────────────────────────────
-    print("\nSTEP 4: Alice stores a memory locally")
+    print("\nSTEP 4: Alice stores a memory locally tagged for the group")
     paris = "We picked gRPC for internal RPC; HTTP/JSON for public APIs."
     r = mcp_a.call_tool("store_memory", {
         "content": paris, "type": "decision",
         "tags": ["architecture", "rpc"], "project": "roundtrip-test",
-        "importance": 4,
+        "importance": 4, "groups": [GROUP_NAME],
     })
     passed.append(harness.check("alice store: status == 'stored'",
                                 r.get("status") == "stored", f"got {r}"))
     paris_id = r.get("id")
+    passed.append(harness.check("alice store: groups tagged",
+                                r.get("groups") == [GROUP_NAME],
+                                f"got groups={r.get('groups')}"))
 
     print("\nSTEP 5: Alice pushes to the group via mem-fusion/group_push")
-    push = mcp_a.call_tool("group_push", {"id": paris_id})
+    push = mcp_a.call_tool("group_push", {
+        "group": GROUP_NAME, "memory_ids": [paris_id],
+    })
     passed.append(harness.check("push response has peers list",
                                 isinstance(push.get("peers"), list)))
     bob_entry = next((p for p in push.get("peers", [])
@@ -76,8 +81,10 @@ def run_tests(mcp_a: harness.MCPClient, mcp_b: harness.MCPClient,
     passed.append(harness.check("push: bob responsive",
                                 bob_entry and bob_entry["status"] == "responsive",
                                 f"got {bob_entry}"))
+    first_delivery = (bob_entry.get("deliveries") or [None])[0] if bob_entry else None
     passed.append(harness.check("push: delivery == 'stored'",
-                                bob_entry and bob_entry.get("delivery") == "stored"))
+                                first_delivery
+                                and first_delivery.get("status") == "stored"))
 
     print("\nSTEP 6: Bob's mem-fusion can find Alice's content via search_memory")
     r = mcp_b.call_tool("search_memory",
@@ -91,30 +98,42 @@ def run_tests(mcp_a: harness.MCPClient, mcp_b: harness.MCPClient,
         passed.append(harness.check(f"bob search: meaningful score (got {top['score']})",
                                     top["score"] > 0.5))
 
-    # ── B → A: pull direction ────────────────────────────────────────────
-    print("\nSTEP 7: Bob stores a different memory locally (no push)")
+    # ── B → A: store-then-share (v0.4 store-now-share-later path) ───────
+    print("\nSTEP 7: Bob stores a personal-only memory, then shares it via add_groups + push")
     tests_rule = "All new modules must include unit tests."
     r = mcp_b.call_tool("store_memory", {
         "content": tests_rule, "type": "preference",
         "tags": ["testing"], "project": "roundtrip-test",
         "importance": 4,
+        # default groups=[personal] — local only at first
     })
     passed.append(harness.check("bob store: status == 'stored'",
                                 r.get("status") == "stored"))
+    passed.append(harness.check("bob store: default groups=[personal]",
+                                r.get("groups") == ["personal"]))
     tests_id = r.get("id")
 
-    print("\nSTEP 8: Alice's search currently does NOT find Bob's memory (not yet shared)")
+    print("\nSTEP 8: Alice's search currently does NOT find Bob's memory (still personal)")
     r = mcp_a.call_tool("search_memory",
                        {"query": "what's our testing policy?", "top_k": 5})
     found_pre_share = any("unit tests" in res["content"] for res in r.get("results", []))
     passed.append(harness.check(
-        "alice's search misses bob's un-pushed memory",
+        "alice's search misses bob's personal-only memory",
         not found_pre_share,
         "found it before push — privacy property broken",
     ))
 
-    print("\nSTEP 9: Bob pushes the memory to the group")
-    push2 = mcp_b.call_tool("group_push", {"id": tests_id})
+    print("\nSTEP 9a: Bob calls add_groups to retroactively share with the group")
+    add = mcp_b.call_tool("add_groups", {
+        "memory_ids": [tests_id], "groups": [GROUP_NAME],
+    })
+    passed.append(harness.check("add_groups: 1 updated",
+                                len(add.get("updated", [])) == 1, f"got {add}"))
+
+    print("\nSTEP 9b: Bob pushes the memory to the group")
+    push2 = mcp_b.call_tool("group_push", {
+        "group": GROUP_NAME, "memory_ids": [tests_id],
+    })
     alice_entry = next((p for p in push2.get("peers", [])
                         if p["node_name"] == PEER_A["node_name"]), None)
     passed.append(harness.check("bob's push: alice responsive",
@@ -127,15 +146,17 @@ def run_tests(mcp_a: harness.MCPClient, mcp_b: harness.MCPClient,
     passed.append(harness.check("alice's search finds bob's content after push", found))
 
     # ── Pull path: simulate offline-at-push-time, recover via pull ──────
-    print("\nSTEP 11: Bob stores a third memory; we drop Alice's copy and pull instead")
+    print("\nSTEP 11: Bob stores a third memory tagged for the group; we drop Alice's copy and pull instead")
     schemas = "JSON Schema is the canonical format for our API contracts."
     r = mcp_b.call_tool("store_memory", {
         "content": schemas, "type": "decision",
         "tags": ["api"], "project": "roundtrip-test",
-        "importance": 3,
+        "importance": 3, "groups": [GROUP_NAME],
     })
     schemas_id = r.get("id")
-    push3 = mcp_b.call_tool("group_push", {"id": schemas_id})  # arrives at A
+    push3 = mcp_b.call_tool("group_push", {
+        "group": GROUP_NAME, "memory_ids": [schemas_id],
+    })
     alice_entry = next((p for p in push3.get("peers", [])
                         if p["node_name"] == PEER_A["node_name"]), None)
     passed.append(harness.check("third push delivers to alice",
@@ -151,8 +172,6 @@ def run_tests(mcp_a: harness.MCPClient, mcp_b: harness.MCPClient,
         scroll_filter=Filter(must=[
             FieldCondition(key="content_hash",
                            match=MatchValue(value=core.content_hash(schemas))),
-            FieldCondition(key="group_name",
-                           match=MatchValue(value=GROUP_NAME)),
         ]),
         limit=10, with_payload=False,
     )
@@ -244,10 +263,12 @@ def main():
             mcp_a_proc = harness.start_mem_fusion(
                 PEER_A["qdrant_port"], logs / "mem-fusion-a.stderr",
                 gateway_url=f"http://127.0.0.1:{PEER_A['gateway_port']}",
+                node_name=PEER_A["node_name"],
             )
             mcp_b_proc = harness.start_mem_fusion(
                 PEER_B["qdrant_port"], logs / "mem-fusion-b.stderr",
                 gateway_url=f"http://127.0.0.1:{PEER_B['gateway_port']}",
+                node_name=PEER_B["node_name"],
             )
             procs.append(mcp_a_proc)
             procs.append(mcp_b_proc)

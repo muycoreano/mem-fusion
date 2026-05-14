@@ -99,11 +99,12 @@ def init_cowork_memories(qdrant_port: int) -> None:
     indexes = {
         "type":         PayloadSchemaType.KEYWORD,
         "project":      PayloadSchemaType.KEYWORD,
-        "source":       PayloadSchemaType.KEYWORD,
+        "groups":       PayloadSchemaType.KEYWORD,
+        "source":       PayloadSchemaType.KEYWORD,  # legacy v0.3
         "session_id":   PayloadSchemaType.KEYWORD,
         "content_hash": PayloadSchemaType.KEYWORD,
         "tags":         PayloadSchemaType.KEYWORD,
-        "group_name":   PayloadSchemaType.KEYWORD,
+        "group_name":   PayloadSchemaType.KEYWORD,  # legacy v0.3
         "origin_node":  PayloadSchemaType.KEYWORD,
         "importance":   PayloadSchemaType.INTEGER,
         "timestamp":    PayloadSchemaType.DATETIME,
@@ -123,20 +124,27 @@ def write_constellation_config(path: pathlib.Path, *,
                                gateway_port: int,
                                qdrant_port: int,
                                state_dir: pathlib.Path,
-                               group_name: str,
-                               peers: list[dict] | None = None) -> None:
-    """Write a constellation daemon config.json. `peers` is a list of
-    {node_name, endpoint} dicts; defaults to empty list."""
+                               group_name: str | None = None,
+                               peers: list[dict] | None = None,
+                               memberships: list[dict] | None = None) -> None:
+    """Write a constellation daemon config.json.
+
+    Either pass `memberships` (a list of {group_name, peers} dicts — v0.4
+    multi-group form) or the singular `group_name` + `peers` shorthand for
+    one-membership tests. `peers` defaults to empty list.
+    """
+    if memberships is None:
+        if group_name is None:
+            raise ValueError("write_constellation_config: provide either "
+                             "memberships=[...] or group_name=...")
+        memberships = [{"group_name": group_name, "peers": peers or []}]
     cfg = {
         "node_name":              node_name,
         "peer_listen_address":    f"127.0.0.1:{peer_port}",
         "gateway_listen_address": f"127.0.0.1:{gateway_port}",
         "qdrant_url":             f"http://127.0.0.1:{qdrant_port}",
         "state_dir":              str(state_dir),
-        "memberships": [{
-            "group_name": group_name,
-            "peers":      peers or [],
-        }],
+        "memberships":            memberships,
     }
     path.write_text(json.dumps(cfg, indent=2))
 
@@ -186,18 +194,25 @@ def stop_proc(proc: subprocess.Popen | None, timeout_s: float = 3.0) -> None:
 
 # ── Mem-Fusion MCP subprocess + JSON-RPC client ───────────────────────────
 def start_mem_fusion(qdrant_port: int, stderr_path: pathlib.Path,
-                     *, gateway_url: str | None = None) -> subprocess.Popen:
+                     *, gateway_url: str | None = None,
+                     node_name: str | None = None) -> subprocess.Popen:
     """Spawn `mem_fusion.py` as an MCP stdio subprocess.
 
     `qdrant_port` becomes the QDRANT_URL the subprocess will use.
     `gateway_url`, if given, becomes MEMFUSION_CONSTELLATION_GATEWAY — used
     by mem-fusion's group_pull/group_push tools to find the local
     Constellation daemon. Omit to test graceful-degradation behavior.
+    `node_name`, if given, becomes MEMFUSION_NODE_NAME — the local peer's
+    identity, written into `origin_node` on locally-originated entries.
+    Multi-peer tests must set this per peer so each subprocess doesn't fall
+    back to the shared hostname.
     """
     env = os.environ.copy()
     env["QDRANT_URL"] = f"http://127.0.0.1:{qdrant_port}"
     if gateway_url is not None:
         env["MEMFUSION_CONSTELLATION_GATEWAY"] = gateway_url
+    if node_name is not None:
+        env["MEMFUSION_NODE_NAME"] = node_name
     return subprocess.Popen(
         [str(VENV_PYTHON), str(MEM_FUSION)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,

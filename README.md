@@ -43,54 +43,60 @@ Most memory operations are invisible — the four Claude Code hooks (`SessionSta
 
 `/remember` is the explicit pin — use it when you've just made a decision (or stated a preference) you want Claude to act on going forward.
 
-### Two memory stores — knowledge vs. behavior
+### Group-keyed sharing — explicit, never inferred
 
-Mem-Fusion has two memory stores that serve different purposes. The distinction matters — especially with Constellation installed.
+Every memory carries a `groups` tag (a list of group names) that determines who can see it. The default is `personal` — local-only, never leaves your machine. Sharing happens when you explicitly name a group, either at store time or after the fact.
 
-| Store | What goes there | Loaded when | Shared via Constellation? |
-|---|---|---|---|
-| **File-based memory** (`~/.claude/projects/<encoded-cwd>/memory/`) | **Behavioral rules** — how you want Claude to act. Personal preferences, conventions, style choices, workflow rules. | Always at session start | **Never** — stays on your machine, period |
-| **Vector DB** (Qdrant) | **Knowledge** — decisions, facts, observations, errors, code patterns, contextual notes. | On-demand semantic search by hooks and tools | **Yes** — `/remember` and `group_push` propagate to peers |
+There is no content classification. Mem-Fusion doesn't try to guess whether a memory should be shared based on its shape — *you* tell it the audience, and the same Qdrant collection holds everything. The `groups` field is the routing key.
 
-`/remember` figures out which store the content belongs in and writes it to the right place automatically. You don't pick — Claude classifies the content based on its shape and routes accordingly.
+| Memory's groups | Where it lives | Who sees it |
+|---|---|---|
+| `["personal"]` (default) | This machine's Qdrant only | Only your Claude on this machine. With cross-machine personal sync configured, also your other personal-group machines. |
+| `["personal", "engineering@team"]` | This machine + every engineering@team peer | Your machines + engineering teammates' machines |
+| `["engineering@team"]` (no personal) | Engineering teammates only | Skips your personal-group machines if any |
 
 ### `/remember` examples
 
-**Behavioral rule** — routed to file-based, stays local:
+**Default (local-only)** — no group named, defaults to `personal`:
 
 ```
-You:   /remember always use uv for Python environments on this machine
+You:   /remember always use uv for Python environments
 
-Claude: ✓ Pinned as a behavioral rule in preference_use-uv-for-python.md.
-        Loads at every session start. Stays local, never shared.
+Claude: ✓ Stored with groups=[personal]. Stays on this machine.
 ```
 
-**Knowledge** — routed to vector DB, shared with group:
+**Explicit group at store time** — store *and* push in one call:
 
 ```
 You:   /remember We standardized on PostgreSQL 16 with logical replication
-       for the auth service.
+       for the auth service, for engineering@branch
 
-Claude: ✓ Stored as decision (id: a7e3c2d1, importance: 5, project: auth-service).
-        ✓ Shared with engineering@branch:
+Claude: ✓ Stored as decision (id: a7e3c2d1, groups=[engineering@branch]).
+        ✓ Pushed to engineering@branch:
             - alice-desktop: stored
             - bob-mac:       stored
             - carol-laptop:  unreachable (connection refused)
 ```
 
-**Ambiguous content** — Claude asks before routing:
+**Store-now-share-later** — capture during work, decide audience after:
 
 ```
-You:   /remember the deploy script uses Python 3.12
+You:   "Let's pause and store what we learned this morning."
+Claude: ✓ Stored 4 memories with groups=[personal].
 
-Claude: Quick check — is this a behavioral rule (always use Python 3.12
-        going forward, stays local) or knowledge (a fact about the
-        current deploy script, shared with your group)?
+You:   "Share those with engineering."
+Claude: ✓ Added engineering@branch to 4 memories.
+        ✓ Pushed to engineering@branch: 4 stored on bob, 4 stored on alice.
+
+You:   "Also share them with product."
+Claude: ✓ Added product@branch to 4 memories.
+        ✓ Pushed to product@branch peers ONLY: 4 stored on dave, 4 on eve.
+          (Engineering peers not re-contacted — already have them.)
 ```
 
-Why this routing matters: behavioral rules are about *how you want Claude to act* — they're personal, and shouldn't propagate to teammates' machines. File-based memory keeps them yours. Knowledge is *about your project* — sharing it with the group is the whole point of Constellation.
+**Scope rule:** push only contacts peers in the named group, even if the memory is also tagged for other groups. *"Share with product"* never reaches engineering peers. To push to multiple groups in one user turn, name them all explicitly.
 
-If Constellation isn't installed, the knowledge branch still works — entries land locally as `source=local`. The "Shared with" line is replaced with "Local only — Constellation not installed."
+If Constellation isn't installed, the `groups` tag is still recorded; the "Pushed to..." line is replaced with "Local only — Constellation not installed." Tagged memories propagate the moment Constellation comes online and another peer pulls.
 
 ### How memories surface
 
@@ -142,12 +148,13 @@ Three storage layers fused into one substrate: in-context working memory ↔ MCP
    │              PEER A (your laptop)                    │
    │   Mem-Fusion + Constellation + local Qdrant          │
    │   ─────────────────────────────────────────────      │
-   │   store_memory(...)  →  source=local entry           │
+   │   store_memory(..., groups=[engineering])            │
+   │     → local entry, origin_node=A, submitted_at=now   │
    └────────────────────────┬─────────────────────────────┘
                             │
-                  POST /memory/put
-                  (HTTP fan-out, no relays,
-                   no central node)
+                  POST /memory/put { groups: [...] }
+                  (push-time filter strips groups
+                   recipient isn't a member of)
                             │
               ┌─────────────┴─────────────┐
               ▼                           ▼
@@ -155,14 +162,16 @@ Three storage layers fused into one substrate: in-context working memory ↔ MCP
    │  PEER B (desktop)   │◄──►│  PEER C (teammate)   │
    │                     │    │                      │
    │  same stack         │    │  same stack          │
-   │  insert as          │    │  insert as           │
-   │  source=group       │    │  source=group        │
+   │  global dedup       │    │  global dedup        │
+   │  on content_hash;   │    │  on content_hash;    │
+   │  additive merge of  │    │  additive merge of   │
+   │  incoming groups    │    │  incoming groups     │
    └─────────────────────┘    └──────────────────────┘
 ```
 
-Every peer runs the same stack: Mem-Fusion + Constellation daemon + local Qdrant. When you store a memory on Peer A, Constellation sends the full record (content + 768-dim vector + `content_hash`) over HTTP to every other peer in the group. Receivers insert into their own Qdrant tagged `source=group`; they don't re-send (no amplification, no N² traffic).
+Every peer runs the same stack: Mem-Fusion + Constellation daemon + local Qdrant. When you store a memory on Peer A tagged for a shared group, Constellation sends the full record (content + 768-dim vector + `content_hash` + filtered `groups` list) over HTTP to every peer in that group. Receivers dedup globally on `content_hash` and additively merge incoming groups into existing entries — same content from a different group widens the `groups` list rather than creating a duplicate.
 
-Because group-shared entries live in the same Qdrant collection as your local memories, they surface through the same Mem-Fusion MCP tools — your Claude sees a teammate's stored decision as just another memory, with the original `origin_node` available on inspection. There's no orchestrator, no privileged peer, no hub: every peer is symmetric. Trust is by group membership, agreed out-of-band.
+Because group-shared entries live in the same Qdrant collection as your local memories, they surface through the same Mem-Fusion MCP tools — your Claude sees a teammate's stored decision as just another memory, with the original `origin_node` preserved end-to-end (a memory bob pushed and alice relayed to carol still says `origin_node=bob`). There's no orchestrator, no privileged peer, no hub: every peer is symmetric. Any responsive peer in a group can serve the full group history on `/memory/since` pull — so downtime of any single peer doesn't lose data. Trust is by group membership, agreed out-of-band.
 
 ---
 
@@ -185,6 +194,10 @@ Open it in any editor; it looks like this:
   "state_dir":  "~/.local/share/mem-fusion/constellation",
   "memberships": [
     {
+      "group_name": "personal",
+      "peers": []
+    },
+    {
       "group_name": "engineering@branch",
       "peers": [
         { "node_name": "bob-mac",      "endpoint": "http://10.0.0.5:7533" },
@@ -195,26 +208,28 @@ Open it in any editor; it looks like this:
 }
 ```
 
-### Add a peer
+Every install gets a `personal` membership pre-populated with empty peers — it's the implicit default for any memory not explicitly tagged for a shared group. To sync your own machines (laptop ↔ desktop), populate `personal.peers` with your other devices' endpoints.
 
-1. Append an entry to `memberships[0].peers[]` with the new peer's `node_name` and HTTP endpoint (their machine's IP/hostname on port 7533).
+### Add a teammate-group peer
+
+1. Append to the relevant group's `peers[]` with the new peer's `node_name` and HTTP endpoint (their machine's IP/hostname on port 7533).
 2. Restart the daemon:
    ```bash
    launchctl unload ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist
    launchctl load   ~/Library/LaunchAgents/com.branchapp.memfusion.constellation.plist
    ```
-3. Confirm: `curl http://127.0.0.1:7533/health` (should still return `ok: true`).
-4. Ask Claude to pull from the group — your existing memories will share with the new peer the next time you `/remember` something, and any memory they've already shared will land in your store on the next pull.
+3. Confirm: `curl http://127.0.0.1:7533/health` should still return `ok: true` and list every configured group in `memberships`.
+4. Ask Claude to `/remember pull` — your local store catches up on anything the new peer has already shared.
 
-**Important:** every peer needs every other peer in their config. There's no automatic discovery in MVP. If you add a 4th peer (`dave`), then alice, bob, and carol each need to add dave to their `peers[]` list, and dave needs all three of them in his.
+**Symmetric mesh:** every peer in a group needs every other peer in their `peers[]` list. There's no automatic discovery. If you add a 4th peer (`dave`), then alice, bob, and carol each add `dave` to engineering's peer list, and dave's config lists all three.
 
-### Change your group
+### Add a new group
 
-Edit `memberships[0].group_name` to a different group identifier (e.g., `team-platform@branch`) and restart. v0.3.0 supports exactly one group per peer; multi-group membership is post-MVP.
+Append a new `{group_name, peers}` entry to `memberships[]` and restart. v0.4 supports any number of memberships per peer — `personal`, one or more team groups (`engineering@branch`, `product@branch`), project-specific groups (`design-system@frontend`), whatever the organization needs.
 
 ### Remove a peer
 
-Delete the entry from `peers[]` and restart. Memories previously shared with that peer remain in your local Qdrant — removal only stops future pushes/pulls from them.
+Delete the entry from `peers[]` and restart. Memories previously shared with that peer remain in your local Qdrant — removal only stops future pushes/pulls from them. Note: there is no "un-share" — peers that already received content keep it.
 
 ### Check that it's working
 
@@ -223,7 +238,7 @@ After any config change:
 curl -s http://127.0.0.1:7533/peers/self        | python3 -m json.tool
 curl -s -X POST http://127.0.0.1:7534/pull -d '{}' -H 'Content-Type: application/json' | python3 -m json.tool
 ```
-The first shows your identity + memberships. The second pulls from every configured peer and reports per-peer status — handy for verifying a peer endpoint actually responds.
+The first shows your identity + every configured group membership. The second pulls from every group's peers and reports per-(peer, group) status — handy for verifying a peer endpoint actually responds. Pass `{"group": "engineering@branch"}` to scope to one group.
 
 ---
 
@@ -255,7 +270,9 @@ on a schedule rather than asking you ad-hoc:
    pattern, store it as its own memory with the appropriate type
    (`decision`, `error`, `code`) and importance ≥ 3.
 3. If Constellation is installed and the user wants this learning shared
-   with their group, also call `group_push(id=<the memory's id>)`.
+   with their group, first call `add_groups(memory_ids=[id],
+   groups=["<group>"])` to widen the memory's group set, then
+   `group_push(group="<group>", memory_ids=[id])`.
 
 Result: recurring tasks compound. Each run starts with what every previous
 run learned, builds on it, and leaves the next run a clearer starting point.
@@ -273,11 +290,13 @@ For full architectural detail:
 
 ---
 
-## MCP tools (9)
+## MCP tools
 
-`store_memory` · `search_memory` · `search_recent` · `upsert_memory` · `find_or_create` · `delete_memory` · `get_related` · `memory_stats` · `export_record`
+**10 local-memory tools**: `store_memory` · `search_memory` · `search_recent` · `upsert_memory` · `find_or_create` · `delete_memory` · `get_related` · `memory_stats` · `export_record` · `add_groups`
 
-`export_record` returns a memory's full Qdrant record including its 768-dim vector — used by Constellation to propagate memory across machines without re-embedding.
+**2 group tools** (require Constellation): `group_pull` · `group_push`
+
+`store_memory` accepts an optional `groups: list[str]` arg (default `["personal"]`) — the routing key for sharing. `add_groups(memory_ids, groups)` retroactively widens an existing memory's group set (additive only; un-sharing isn't supported because peers already received the content). `group_push(group, memory_ids?)` is always scoped to one group at a time — pushing to multiple groups in a single user turn is multiple calls, never an implicit fan-out. `export_record` returns a memory's full Qdrant record including its 768-dim vector — used by Constellation to propagate memory across machines without re-embedding.
 
 ## Memory types
 

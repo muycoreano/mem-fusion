@@ -57,7 +57,7 @@ def post_put(record, *, origin_node, group_name=GROUP_NAME,
         "tags":         record["tags"],
         "project":      record.get("project", ""),
         "importance":   record["importance"],
-        "group_name":   group_name,
+        "groups":       [group_name],
         "origin_node":  origin_node,
         "submitted_at": iso_now(),
     }
@@ -74,7 +74,7 @@ def get_by_id(memory_id):
 
 
 async def run_tests(passed):
-    print("\nSTEP 3: insert a memory locally (originator's side)")
+    print("\nSTEP 3: build an exportable record (insert locally, then drop it)")
     use_qdrant(RECEIVER["qdrant_port"])
     r = await core.store_memory({
         "content":    "The orchestrator role is a per-group assignment, not a per-node type.",
@@ -87,7 +87,11 @@ async def run_tests(passed):
         print(f"  ✗ store_memory failed: {r}", file=sys.stderr); sys.exit(1)
     local_id = r["id"]
     record = await core.export_record({"id": local_id})
-    print(f"  ✓ stored local id={local_id[:8]}, vector dim={len(record['vector'])}")
+    # v0.4 dedups globally on content_hash. To exercise the "receive from peer"
+    # path with a clean stored response, drop the local copy before posting.
+    await core.delete_memory({"id": local_id})
+    print(f"  ✓ prepared record (vector dim={len(record['vector'])}, "
+          f"local copy deleted for clean receive path)")
 
     print("\nSTEP 4: POST /memory/put (simulating another peer sending us this memory)")
     put = post_put(record, origin_node=SIMULATED_PEER)
@@ -95,8 +99,10 @@ async def run_tests(passed):
     passed.append(harness.check("PUT status == 'stored'",
                                 put["body"].get("status") == "stored"))
     new_id = put["body"].get("id")
-    passed.append(harness.check("PUT returns a new id (≠ originator's local id)",
-                                bool(new_id) and new_id != local_id))
+    passed.append(harness.check("PUT returns an id", bool(new_id)))
+    passed.append(harness.check("PUT response includes groups",
+                                put["body"].get("groups") == [GROUP_NAME],
+                                f"got {put['body'].get('groups')}"))
 
     print("\nSTEP 5: GET /memory/get and verify byte-identical integrity")
     got = get_by_id(new_id)
@@ -123,8 +129,8 @@ async def run_tests(passed):
                                 bool(received.get("submitted_at"))))
     passed.append(harness.check("received_at present",
                                 bool(received.get("received_at"))))
-    passed.append(harness.check("group_name attached",
-                                received["group_name"] == GROUP_NAME))
+    passed.append(harness.check("groups attached as list",
+                                received["groups"] == [GROUP_NAME]))
 
     print("\nSTEP 6: re-POST same content → expect 'duplicate'")
     put2 = post_put(record, origin_node=SIMULATED_PEER)
@@ -140,6 +146,32 @@ async def run_tests(passed):
                                 bad["status_code"] == 400))
     passed.append(harness.check("error message mentions content_hash mismatch",
                                 "content_hash mismatch" in bad["body"].get("error", "")))
+
+    print("\nSTEP 8: negative — PUT with a group this node isn't in → 403")
+    bad2 = post_put(record, origin_node=SIMULATED_PEER, group_name="unknown-group@e2e")
+    passed.append(harness.check("unknown group → HTTP 403", bad2["status_code"] == 403))
+
+    print("\nSTEP 9: v0.4 additive merge — PUT a memory we already have locally")
+    use_qdrant(RECEIVER["qdrant_port"])
+    local_r = await core.store_memory({
+        "content":    "An entry that exists on this peer before another peer pushes it.",
+        "type":       "fact",
+        "tags":       ["additive-merge"],
+        "project":    "mem-fusion",
+        "importance": 3,
+        "groups":     ["personal"],
+    })
+    local_id_2 = local_r["id"]
+    record_2   = await core.export_record({"id": local_id_2})
+    put3 = post_put(record_2, origin_node=SIMULATED_PEER)
+    passed.append(harness.check("incoming PUT for content we already have → 'merged'",
+                                put3["body"].get("status") == "merged",
+                                f"got {put3['body']}"))
+    passed.append(harness.check("merge keeps the local id, widens groups to include both",
+                                put3["body"].get("id") == local_id_2
+                                and set(put3["body"].get("groups", []))
+                                    == {"personal", GROUP_NAME},
+                                f"got {put3['body']}"))
 
 
 def main():

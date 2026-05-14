@@ -10,29 +10,35 @@ tests/
 ├── lib/
 │   └── harness.py             ← shared Qdrant + Constellation lifecycle helpers
 ├── constellation/
-│   ├── test-promotion.py      ← /memory/put + /memory/get + content_hash integrity (1 daemon, simulated peer push)
+│   ├── test-promotion.py      ← /memory/put integrity + additive-merge on hash collision (1 daemon, simulated peer push)
 │   ├── test-directory.py      ← /peers + /peers/self aggregation (1 daemon, simulated peers via origin_node)
-│   └── test-pull-push.py      ← end-to-end gateway /pull + /push (2 daemons, real peer fan-out)
+│   └── test-pull-push.py      ← end-to-end gateway /pull + /push + push-time group filter (2 daemons)
 └── mem_fusion/
-    ├── test-mcp-tools.py         ← all 11 MCP tools (9 memory + group_pull + group_push) over stdio JSON-RPC (1 Qdrant + 1 mem-fusion)
-    └── test-group-roundtrip.py   ← end-to-end: Claude → mem-fusion → Constellation → peer → search (2 Qdrants + 2 Constellations + 2 mem-fusions)
+    ├── test-mcp-tools.py             ← all 12 MCP tools (10 memory + group_pull + group_push) over stdio JSON-RPC (1 Qdrant + 1 mem-fusion)
+    ├── test-group-roundtrip.py       ← end-to-end: Claude → mem-fusion → Constellation → peer → search (2 Qdrants + 2 Constellations + 2 mem-fusions)
+    ├── test-store-now-share-later.py ← v0.4 add_groups + targeted memory_ids push + scope rule (3 Qdrants + 3 Constellations + 3 mem-fusions)
+    └── test-offline-rejoin.py        ← peer-symmetric catch-up: alice→bob (carol offline), bob→alice, bob goes offline, carol joins and pulls everything via alice
 ```
 
 ## What each test exercises
 
 | Test | Scope |
 |---|---|
-| `test-mcp-tools.py` | Mem-fusion's stdio MCP server end-to-end — every tool, plus graceful degradation when Constellation isn't installed. |
-| `test-group-roundtrip.py` | Full chain: Claude → mem-fusion → Constellation gateway → peer's Constellation → peer's Qdrant → peer's mem-fusion finds it via `search_memory`. Push and pull directions; offline-at-push recovery via pull. |
-| `test-promotion.py` | The receive side: integrity invariants on `/memory/put` (byte-identical content + vector, content_hash recompute, group_name tagging, receiver-assigned id), duplicate detection on re-push, content_hash mismatch rejection. |
+| `test-mcp-tools.py` | Mem-fusion's stdio MCP server end-to-end — every tool incl. `add_groups`, plus graceful degradation when Constellation isn't installed. |
+| `test-group-roundtrip.py` | Full chain: Claude → mem-fusion → Constellation gateway → peer's Constellation → peer's Qdrant → peer's mem-fusion finds it via `search_memory`. Covers store-then-share-via-add_groups, push and pull directions, offline-at-push recovery via pull. |
+| `test-store-now-share-later.py` | The canonical v0.4 workflow with 3 peers (alice-origin + bob-eng + carol-prod). Verifies the scope rule (product push doesn't re-contact engineering peer) and the push-time group filter (receivers never see `personal` or unrelated group tags). |
+| `test-offline-rejoin.py` | Peer-symmetric resilience with 3 engineering members where peers come online in sequence. Alice stores while bob+carol are offline → bob joins and pulls → bob stores + pushes (carol still offline) → bob goes offline → carol joins and pulls. Verifies carol gets the full 5-memory history from alice's relay despite bob being offline, with `origin_node` preserved end-to-end. |
+| `test-promotion.py` | The receive side: integrity invariants on `/memory/put` (byte-identical content + vector, content_hash recompute, `groups` list, receiver-assigned id), duplicate detection on re-push, content_hash mismatch rejection, additive merge when receiver already has the content. |
 | `test-directory.py` | The directory side: `/peers/self` shape, `/peers` aggregation (submission_count, first_seen/last_seen, sort order), negative cases (unknown group → 403, missing param → 400). |
-| `test-pull-push.py` | Two daemons talking real HTTP: push fan-out, push idempotency, pull dedup, pull-privacy (non-pushed memories stay local), pull catch-up after a drop. |
+| `test-pull-push.py` | Two daemons talking real HTTP: push fan-out, push idempotency, pull dedup, pull-privacy (personal-only memories stay local), pull catch-up after a drop, push-time group filter on the wire. |
 
 ## Run
 
 ```bash
 ~/.local/share/cowork-memory/venv/bin/python tests/mem_fusion/test-mcp-tools.py
 ~/.local/share/cowork-memory/venv/bin/python tests/mem_fusion/test-group-roundtrip.py
+~/.local/share/cowork-memory/venv/bin/python tests/mem_fusion/test-store-now-share-later.py
+~/.local/share/cowork-memory/venv/bin/python tests/mem_fusion/test-offline-rejoin.py
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-promotion.py
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-directory.py
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-pull-push.py
@@ -51,6 +57,12 @@ Each prints a per-step trace and a final `N/N invariants passed` line followed b
 | `test-pull-push.py` (peer-b) | 6933 | 7933 | 7934 |
 | `test-group-roundtrip.py` (alice) | 6843 | 7843 | 7844 |
 | `test-group-roundtrip.py` (bob) | 6943 | 7943 | 7944 |
+| `test-store-now-share-later.py` (alice) | 6473 | 7473 | 7474 |
+| `test-store-now-share-later.py` (bob)   | 6483 | 7483 | 7484 |
+| `test-store-now-share-later.py` (carol) | 6493 | 7493 | 7494 |
+| `test-offline-rejoin.py` (alice)        | 6543 | 7543 | 7544 |
+| `test-offline-rejoin.py` (bob)          | 6553 | 7553 | 7554 |
+| `test-offline-rejoin.py` (carol)        | 6563 | 7563 | 7564 |
 
 If a test crashes mid-run, the subprocess may linger and hold its port. `lsof -nP -iTCP:<port> -t | xargs kill` clears it.
 

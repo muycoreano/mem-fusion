@@ -117,46 +117,62 @@ Print this snippet and instruct the user to paste it into `~/CLAUDE.md`:
 ## Group Memory (Constellation)
 
 Local Mem-Fusion is connected to a Constellation backend that shares memory
-with other peers in your group. Two MCP tools on `mem-fusion`:
+with peers in your configured groups. Routing happens by an explicit
+`groups: list[str]` tag on every memory (never by content classification).
 
-- `group_pull` — pull new memories from all peers in your group. Returns
-  per-peer telemetry: `{peers: [{node_name, group_name, status, entry_ids?, reason?}]}`.
-  Render a per-peer natural-language summary to the user; never dump the raw JSON.
-  After pulling, use `export_record` or `search_recent` to surface specific
-  entries when the user wants to see them.
+Three MCP tools on `mem-fusion` drive group operations:
 
-- `group_push` — share a locally-stored memory with all peers in your group.
-  Call this after `store_memory` returns an `id`, on memories the user wants
-  to share. Returns per-peer delivery telemetry: `{peers: [{node_name,
-  group_name, status, delivery?, reason?}]}`. Render a per-peer summary; never
-  dump the raw JSON.
+- `add_groups(memory_ids, groups)` — additively widen the group set on
+  existing memories. Used for the store-now-share-later workflow (user
+  reflects, then says "share those with engineering" about memories
+  already stored). Never removes a group.
 
-### When to push
-The `/remember` skill handles routing internally: it sends behavioral rules
-to file-based memory (never pushed) and knowledge to the vector DB. For the
-knowledge branch, the skill already calls `group_push` after `store_memory`.
+- `group_pull(group?)` — pull new memories from peers. Omit `group` to
+  iterate every configured group; pass `group=<name>` to scope to one.
+  Returns per-peer telemetry `{peers: [{node_name, group_name, status:
+  responsive|unreachable, entry_ids?, merged_ids?, reason?}]}`. Render a
+  per-peer natural-language summary; never dump the raw JSON.
 
-You only need to invoke `group_push` directly outside the `/remember` flow —
-for example, if the user says *"share this with the group"* about a memory
-they stored earlier, or if a hook captured something worth propagating:
-1. Call `mem-fusion/group_push(id=<local_id>)`.
-2. Render a per-peer summary: "Shared with N peers. Peer-X unreachable: <reason>".
-   Never dump the raw JSON.
+- `group_push(group, memory_ids?)` — share local memories with one group's
+  peers. Always scoped to a single group per call. Pass `memory_ids` for
+  targeted pushes (the share-after-the-fact case after `add_groups`); omit
+  for bulk push of every entry tagged with that group. Returns per-peer
+  delivery telemetry. Render a per-peer summary; never dump JSON.
+
+### Scope rule (load-bearing)
+`group_push` contacts only peers in the named group — even if the memory
+is also tagged for other groups. *"Share with product"* never reaches
+engineering peers. To push to multiple groups in one user turn, name them
+all explicitly and make multiple `group_push` calls (one per group).
+
+### When the user says "share those with <group>"
+1. Resolve *those* from session context to a list of memory IDs.
+2. `mem-fusion/add_groups(memory_ids=[...], groups=["<group>"])` — widens
+   the memories' group set additively.
+3. `mem-fusion/group_push(group="<group>", memory_ids=[...])` — pushes
+   the named memories to that group's peers only.
+4. Render a per-peer summary: "Pushed N memories to <group>: <peer>: 4
+   stored, <peer>: unreachable (<reason>)". Never dump JSON.
+
+If the user names multiple groups in one turn ("share with engineering AND
+product"), compose: call `add_groups` once with both groups, then make one
+`group_push` per group. Each push contacts only that group's peers; the
+push-time group filter handles the wire-shape automatically.
 
 ### When NOT to push
-- **Behavioral rules and personal preferences.** These belong in file-based
-  memory (the `/remember` skill routes them there automatically). If you
-  somehow have one as a vector DB entry, don't push it.
-- Machine-specific config (paths, ports, ssh keys).
-- Anything tied to ephemeral session state.
+- Memories the user didn't tell you to share. Default scope is `personal`
+  (local-only) for a reason; the user opts in to sharing per memory.
+- Machine-specific config (paths, ports, ssh keys, env vars). Even if asked,
+  prefer keeping these in `personal`.
+- Ephemeral session state.
 
-Vector entries shared via Constellation become visible on every peer in the
-group — personal rules shouldn't propagate to teammates.
+Sharing across groups is one-way and additive: once you `group_push` a
+memory to engineering, you can't un-share it. Confirm before pushing.
 
 ### When to pull
 On `/remember pull`, or when the user asks "what's new from the group?".
 Render a per-peer summary of arrivals; surface specific entries the user
-asks about with `export_record(id)`.
+asks about with `export_record(id)` or `search_memory`.
 ```
 
 ---

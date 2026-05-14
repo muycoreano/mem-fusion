@@ -16,7 +16,7 @@ PROJECT=$(basename "$(pwd)")
 nohup $VENV - <<PYEOF >> "$LOG" 2>&1 &
 import sys, asyncio
 sys.path.insert(0, "$HOME/.local/share/mem-fusion")
-import mem_fusion as srv
+import core
 
 async def main():
     path  = """${FILE_PATH}"""
@@ -25,9 +25,10 @@ async def main():
     with open(path) as f:
         head = "".join(f.readlines()[:10]).strip()[:300]
     content = f"New file written: {path} ({lines} lines)\n\nHeader:\n{head}"
-    result = await srv.tool_store({
+    result = await core.store_memory({
         "content": content, "type": "code", "project": proj,
         "importance": 3, "tags": ["file-write"],
+        "groups": ["personal"],
     })
     print(f"capture_file_write: {result}")
 

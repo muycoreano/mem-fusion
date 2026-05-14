@@ -17,9 +17,9 @@ It's all local — no data leaves your Mac. Stack:
 
 - **Qdrant 1.13.4** — local vector database (port 6333)
 - **Ollama 0.20.5** + `nomic-embed-text` — local 768-dim embeddings (port 11434)
-- **Python 3.12 MCP server** — exposes 9 memory tools to Claude Code via stdio
-- **4 hooks** — SessionStart, UserPromptSubmit, Stop, PostToolUse:Write
-- **`/remember` skill**
+- **Python 3.12 MCP server** — exposes 10 memory tools to Claude Code via stdio (plus 2 group tools when Constellation is also installed)
+- **4 hooks** — SessionStart, UserPromptSubmit, Stop, PostToolUse:Write (all auto-tagged with `groups=["personal"]`)
+- **`/remember` skill** — explicit group-keyed tagging (default scope is `personal`, local-only)
 
 Everything is managed by `launchd`. Disk footprint ≈ 200 MB.
 
@@ -234,11 +234,23 @@ Print this snippet and instruct the user to paste it into `~/CLAUDE.md` (or a pr
 Connected to a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on localhost).
 **Check this at session start** by calling `memory_stats()` to confirm the system is live.
 
+### Group routing — every memory has a `groups` tag
+
+Every stored memory carries a `groups: list[str]` tag — the routing key for sharing.
+Default is `["personal"]` (local-only, never leaves this machine). Never auto-classify
+content to a group; the user explicitly names the audience or the default holds.
+
+- **Hooks and silent stores**: always use `groups=["personal"]`. Hook-captured memories
+  describe this peer's work and should never propagate without explicit user intent.
+- **`/remember` without an audience clause**: `groups=["personal"]`.
+- **`/remember ... for <group>` (or "share this with <group>")**: tag with that group
+  at store time, then `group_push(group=<group>, memory_ids=[id])`.
+
 ### When to search
 - **Session start**: `search_memory(query="<current task or project name>", top_k=8)`
 - **Before architectural decisions**: search for prior decisions on the same topic
 - **When hitting a recurring error**: search for prior resolutions
-- **When unsure about a user preference**: search type="preference"
+- **When unsure about a user preference**: search `type="preference"`
 
 ### When to store
 - **Decision made**: `store_memory(content, type="decision", importance=4, project="<name>")`
@@ -250,16 +262,21 @@ Connected to a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on local
 ### What NOT to store
 Trivial facts, transient state, things derivable from code or `git log`.
 
-### Memory types
+### Memory types (decorative; doesn't gate sharing)
 `decision` · `fact` · `preference` · `error` · `code` · `context` · `session`
 
 ### Available tools
 `store_memory` · `search_memory` · `search_recent` · `upsert_memory` ·
-`find_or_create` · `delete_memory` · `get_related` · `memory_stats` · `export_record`
+`find_or_create` · `delete_memory` · `get_related` · `memory_stats` ·
+`export_record` · `add_groups`
+
+`add_groups(memory_ids, groups)` retroactively widens a memory's group set —
+use for the store-now-share-later flow (user says "share those with X"
+after the fact). Additive only; un-sharing isn't supported.
 
 ### Verification rule
-Memories are point-in-time observations. Before recommending a file/function/flag named in
-a memory, verify it still exists in the current code.
+Memories are point-in-time observations. Before recommending a file / function / flag
+named in a memory, verify it still exists in the current code.
 ```
 
 ---

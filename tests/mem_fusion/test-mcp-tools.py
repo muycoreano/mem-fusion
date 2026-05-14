@@ -25,11 +25,11 @@ import harness   # noqa: E402
 
 QDRANT_PORT = 6733
 
-# Tool list expected from mem_fusion.py — 9 local + 2 group = 11 total.
+# Tool list expected from mem_fusion.py — 10 local + 2 group = 12 total.
 EXPECTED_TOOLS = {
     "store_memory", "search_memory", "search_recent", "upsert_memory",
     "find_or_create", "delete_memory", "get_related", "memory_stats",
-    "export_record",
+    "export_record", "add_groups",
     "group_pull", "group_push",
 }
 
@@ -44,11 +44,11 @@ def run_tests(mcp: harness.MCPClient) -> tuple[int, int]:
                                 r["result"]["serverInfo"]["name"] == "mem-fusion",
                                 f"got {r['result'].get('serverInfo')}"))
 
-    print("\nSTEP 4: tools/list returns all 11 tools (9 memory + 2 group)")
+    print("\nSTEP 4: tools/list returns all 12 tools (10 memory + 2 group)")
     r = mcp.request("tools/list", {})
     tool_names = {t["name"] for t in r["result"]["tools"]}
     passed.append(harness.check(
-        f"all 11 expected tools present ({len(tool_names)} total)",
+        f"all 12 expected tools present ({len(tool_names)} total)",
         EXPECTED_TOOLS.issubset(tool_names),
         f"missing: {EXPECTED_TOOLS - tool_names}",
     ))
@@ -86,8 +86,10 @@ def run_tests(mcp: harness.MCPClient) -> tuple[int, int]:
     r3 = mcp.call_tool("store_memory", {"content": paris, "type": "fact"})
     passed.append(harness.check("duplicate detected",
                                 r3.get("status") == "duplicate"))
-    passed.append(harness.check("duplicate returns existing_id matching original",
-                                r3.get("existing_id") == paris_id))
+    passed.append(harness.check("duplicate returns id matching original",
+                                r3.get("id") == paris_id))
+    passed.append(harness.check("default groups == [personal]",
+                                r1.get("groups") == ["personal"], f"got {r1}"))
 
     print("\nSTEP 9: memory_stats reflects 2 stored")
     stats = mcp.call_tool("memory_stats", {})
@@ -117,7 +119,10 @@ def run_tests(mcp: harness.MCPClient) -> tuple[int, int]:
     passed.append(harness.check("export: content matches", rec["content"] == paris))
     passed.append(harness.check("export: vector len == 768",
                                 isinstance(rec["vector"], list) and len(rec["vector"]) == 768))
-    passed.append(harness.check("export: source == 'local'", rec["source"] == "local"))
+    passed.append(harness.check("export: groups == [personal] (v0.4 default)",
+                                rec.get("groups") == ["personal"], f"got {rec.get('groups')}"))
+    passed.append(harness.check("export: origin_node set", bool(rec.get("origin_node"))))
+    passed.append(harness.check("export: submitted_at set", bool(rec.get("submitted_at"))))
 
     print("\nSTEP 13: find_or_create — same content returns 'found'")
     r = mcp.call_tool("find_or_create",
@@ -155,6 +160,28 @@ def run_tests(mcp: harness.MCPClient) -> tuple[int, int]:
     passed.append(harness.check(f"search_recent: 3 entries (got {r['count']})",
                                 r["count"] == 3))
 
+    print("\nSTEP 17b: add_groups — additively widens a memory's groups")
+    r = mcp.call_tool("add_groups", {
+        "memory_ids": [paris_id], "groups": ["engineering@test"],
+    })
+    passed.append(harness.check("add_groups: 1 updated, 0 no_op, 0 errors",
+                                len(r.get("updated", [])) == 1
+                                and not r.get("no_op")
+                                and not r.get("errors"),
+                                f"got {r}"))
+    if r.get("updated"):
+        passed.append(harness.check(
+            "add_groups: union includes both personal and engineering@test",
+            set(r["updated"][0]["groups"]) == {"personal", "engineering@test"},
+            f"got {r['updated'][0]}"))
+
+    print("\nSTEP 17c: add_groups again with same group → no_op")
+    r = mcp.call_tool("add_groups", {
+        "memory_ids": [paris_id], "groups": ["engineering@test"],
+    })
+    passed.append(harness.check("add_groups idempotent: no_op == 1",
+                                len(r.get("no_op", [])) == 1, f"got {r}"))
+
     print("\nSTEP 18: group_pull — no Constellation gateway → graceful error")
     r = mcp.call_tool("group_pull", {})
     passed.append(harness.check(
@@ -164,7 +191,7 @@ def run_tests(mcp: harness.MCPClient) -> tuple[int, int]:
     ))
 
     print("\nSTEP 19: group_push — no Constellation gateway → graceful error")
-    r = mcp.call_tool("group_push", {"id": paris_id})
+    r = mcp.call_tool("group_push", {"group": "engineering@test"})
     passed.append(harness.check(
         "group_push returns constellation_not_installed",
         r.get("error") == "constellation_not_installed",

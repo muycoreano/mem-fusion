@@ -7,9 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased] — planned for v0.3.0
+## [Unreleased] — v0.4.0 (current on `main`)
 
-Design locked; implementation in progress. v0.3.0 is the next release after v0.1.0 — purely additive (no breaking changes to existing tool names, hooks, or storage format). v0.1.0 users will upgrade by re-pasting the updated `INSTALL.md` prompt into Claude Code; the upgrade detects the existing v0.1.0 install and patches it in place. The Constellation daemon installs as an opt-in companion.
+v0.4 is a routing-model simplification of v0.3 — same two-process architecture, same Qdrant collection, same MCP transport — but the dual-store / content-classification approach is replaced by **explicit group-keyed sharing**. Every memory carries a `groups: list[str]` payload; the default is `["personal"]` (local-only). Sharing happens when the user explicitly names a group. There is no longer any heuristic that tries to guess whether a memory should leave the machine.
+
+Design doc: [`docs/v0.4_MEMORY_ARCHITECTURE.md`](docs/v0.4_MEMORY_ARCHITECTURE.md). 164/164 test invariants pass across the seven self-contained tests in `tests/`.
+
+### Added
+
+- **`groups: list[str]` payload field** on every memory — the routing key for sharing. Default `["personal"]`. A memory can belong to any number of groups simultaneously (multi-group membership), enabling cross-team sharing without duplicating storage.
+- **`add_groups(memory_ids, groups)` MCP tool** — additively widens a memory's group set after the fact. Powers the "store now, share later" workflow: capture memories during work with `groups=["personal"]`, then later say *"share those with engineering"* and Claude calls `add_groups` followed by a targeted `group_push`. Additive only — un-sharing isn't supported (peers in a removed group already have the content).
+- **`group_push(group, memory_ids?)` — optional `memory_ids` filter** for surgical pushes. Pass IDs for share-after-the-fact flows; omit for bulk push of every entry tagged with that group. Scope rule: push contacts only peers in the named group, even if the memory is also tagged for other groups.
+- **Push-time group filter** — when shipping a memory to peer P, the wire-shape `groups` field is intersected with the set of groups P is a member of (from sender's view). The sender's `personal` tag is stripped on the wire — recipients never see a group they aren't part of.
+- **Multi-membership configs** — Constellation's `memberships[]` accepts any number of entries. Every install gets a `personal` membership pre-populated with empty peers; users add teammate groups alongside.
+- **Additive dedup-merge on receive** — `/memory/put` and `/pull` merge an incoming memory's `groups` into the existing local entry's `groups` when the `content_hash` matches. The local entry's group set never shrinks.
+- **Three-tier node identity resolution** in `core.py`: `MEMFUSION_NODE_NAME` env var → `node_name` from Constellation's `config.json` → hostname fallback. Eliminates a class of install-time inconsistency bugs.
+- **Backward-compat fallback** for v0.3 entries — entries lacking a `groups` field are read as `["personal"]`; v0.3 group entries (`source=group` + `group_name=X`) read as `[X]`. Optional one-shot migration runs at daemon startup.
+- **Seventh test: `test-offline-rejoin.py`** — three peers (alice/bob/carol) come online in sequence with bob going offline mid-test; verifies peer-symmetric resilience (carol gets bob's memories via alice's relay).
+- **Sixth test: `test-store-now-share-later.py`** — three peers (alice/bob/carol) exercise the canonical T1→T2→T3 user workflow from the design doc; verifies the scope rule (product push doesn't re-contact engineering peer) and push-time group filter.
+
+### Changed
+
+- **`/remember` skill rewrite** — drops v0.3's content-classification logic. Default scope is `personal` (local-only). Explicit `for <group>` syntax stores + pushes in one call. Natural-language *"share those with X"* maps to `add_groups` + targeted `group_push`.
+- **Hooks default to `groups=["personal"]`** — Stop, PostToolUse:Write, and any future store-side hook tag captured memories as personal. The v0.3 risk of a hook auto-extracting a behavioral rule and propagating it via Constellation is structurally eliminated.
+- **`store_memory` return shape** — `{status: stored|merged|duplicate, id, groups}`. Duplicate hits now return `id` (matching the existing entry) instead of `existing_id`. Merge happens when `content_hash` matches but the caller's groups widen the existing set.
+- **`group_push` signature** — `{id}` → `{group, memory_ids?}`. Always scoped to one group per call; multi-group push is multiple calls from the caller. Breaking change vs. v0.3.
+- **`group_pull` accepts optional `group` arg** — omit to iterate every configured group with peers; pass `group=<name>` to scope to one.
+- **`/memory/put` wire shape** — receives `groups: list[str]` (already filtered by sender's push-time filter) instead of singular `group_name`. Validates that every incoming group is one this node is a member of.
+- **`/memory/since`** — wire-shape carries `groups: [<requested_group>]` only; multi-group entries reconstruct on the caller's side via additive merge across separate pull calls.
+- **`group_name` payload field deprecated** in writes. Reads still tolerate it via the v0.3 backward-compat fallback.
+
+### Removed
+
+- **`source=local` / `source=group` distinction** — there's one kind of entry now, distinguished only by which group(s) it belongs to. The `source` field is no longer written; reads tolerate legacy values via the fallback.
+- **Single-membership constraint** on Constellation configs. v0.3 capped `memberships` at length 1; v0.4 lifts that.
+- **Dual-routing classification logic** in `/remember`. There's no rule-vs-knowledge heuristic anymore; routing is by the explicit `groups` tag the user sets.
+- **The file-mirror layer floated mid-design**. Briefly considered as a resilience backup; dropped because Qdrant's native snapshots cover durability without coordination cost.
+
+### Fixed
+
+- **`MEMFUSION_NODE_NAME` resolution** — `core.NODE_NAME` previously fell back to `socket.gethostname()` unconditionally. Now reads Constellation's `config.json` `node_name` field when available, eliminating divergence between the two processes' notion of peer identity.
+- **`capture_file_write.sh` and `ingest_session.py`** — both hooks called a `srv.tool_store` function that never existed on `mem_fusion.py`'s module surface. Now call `core.store_memory` directly with explicit `groups=["personal"]`.
+
+---
+
+## [0.3.1] — 2026-05-13
+
+Maintenance tag on the v0.3 line. Cuts the v0.3.x branch as the long-term-support fork; future bug fixes against the v0.3 routing model go there. `main` moves on to v0.4.
+
+---
+
+## [0.3.0] — 2026-05-12
+
+Constellation lands as an opt-in companion to Mem-Fusion: peers share memory across machines and across teammates via HTTP fan-out. Mem-Fusion stays single-machine and fully local; Constellation handles the cross-peer traffic when installed. Purely additive vs. v0.1.0 — no breaking changes to existing tool names, hooks, or storage format. v0.1.0 users upgrade by re-pasting the updated `INSTALL_MEM_FUSION.md` prompt into Claude Code.
 
 ### Implementation updates since design lock
 
@@ -112,5 +162,7 @@ Three layers fused via automatic hooks:
 
 ---
 
-[Unreleased]: https://github.com/muycoreano/mem-fusion/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/muycoreano/mem-fusion/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/muycoreano/mem-fusion/releases/tag/v0.3.1
+[0.3.0]: https://github.com/muycoreano/mem-fusion/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/muycoreano/mem-fusion/releases/tag/v0.1.0

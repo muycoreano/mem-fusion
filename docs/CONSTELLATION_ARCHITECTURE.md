@@ -1,6 +1,8 @@
 # Constellation — Architecture
 
-**Status:** Current as of 2026-05-12. Reflects what v0.3.0 ships.
+> **⚠ Superseded by v0.4** — The wire format and routing described below (singular `group_name` payload, `source=local`/`source=group` tags, single-membership-per-node, push augments the local entry in place) were replaced in v0.4 by a `groups: list[str]` payload, multi-membership configs, push-time group filtering, additive dedup-merge, and a new `group_push(group, memory_ids?)` signature. See [`v0.4_MEMORY_ARCHITECTURE.md`](v0.4_MEMORY_ARCHITECTURE.md) §6–§7 for the live protocol. This document remains as a historical record of the v0.3 design path.
+
+**Status:** v0.3.0 architecture (historical); v0.4 is the current design.
 
 Constellation lets Mem-Fusion peers share memory with each other. Where Mem-Fusion keeps memory on one machine, Constellation sends new memories to every other peer in the same group so they all see the same thing. It runs as a sibling daemon to Mem-Fusion: same machine, same Qdrant collection, separate HTTP MCP surface.
 

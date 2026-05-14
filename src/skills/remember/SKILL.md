@@ -1,133 +1,148 @@
 ---
 name: remember
-description: Pin information to persistent memory. Routes behavioral rules and personal preferences to file-based memory (always loaded, never shared); routes knowledge and context to the vector DB (semantically searchable, optionally shared via Constellation).
-trigger: User says "remember this", "remember that", "/remember", or asks Claude to save something for future sessions
+description: Pin information to persistent memory with explicit group-keyed sharing. Default scope is `personal` (local-only). Sharing happens by group tag — never by content classification.
+trigger: User says "remember this", "remember that", "/remember", or asks Claude to save or share something for future sessions
 ---
 
-# /remember — Route to the right memory layer
+# /remember — Store memories with explicit group routing
 
-Two memory stores serve different purposes. `/remember` decides which one the content belongs in and writes it there.
+Every memory carries a `groups` tag that determines who can see it. The default is `personal` (local-only — never leaves this machine). Sharing happens when the user explicitly names a group at store time, or extends the group set after the fact.
 
-| Destination | What goes there | Loaded when | Shared with group? |
-|---|---|---|---|
-| **File-based memory** (`~/.claude/projects/<encoded-cwd>/memory/`) | Behavioral rules, preferences, conventions, meta-instructions about how Claude should act | Always at session start | **Never** |
-| **Vector DB** (`mem-fusion/store_memory`) | Knowledge, decisions, facts, errors, code patterns, contextual observations | On-demand semantic search | **Yes** if Constellation is installed |
+There is no content classification. Routing is by user intent only.
 
-The destination matters for both relevance *and* privacy — behavioral rules are personal and shouldn't propagate to teammates' machines.
+## Command surface
+
+```
+/remember <content>                              → store with groups=[personal]
+/remember <content> for <group>                  → store with groups=[<group>] + push
+/remember <content> for <g1>, <g2>, …            → store with groups=[g1,g2,…] + push each
+/remember push                                   → bulk push every configured group
+/remember push <group>                           → bulk push one group's memories
+/remember pull                                   → bulk pull every configured group
+/remember pull <group>                           → pull one group's peers
+```
+
+Plus the natural-language path Claude handles via reasoning:
+
+| User phrase | Action |
+|---|---|
+| *"share those memories with `<group>`"* | Resolve *those* from session context, call `add_groups(ids, [group])`, then `group_push(group, memory_ids=ids)`. |
+| *"also share them with `<group>`"* | Add the new group, push **only** to that group. Don't re-push prior groups — they already have it. |
+| *"make sure all your groups have these"* | For each group in the memory's `groups` list, call `group_push(group, memory_ids=ids)`. |
 
 ## Protocol
 
 ### 1. Identify what to remember
 
 - If the user specified content explicitly, use that verbatim.
-- If the user said "remember this" without specifying content, summarize the current conversation context into a clear, self-contained statement.
+- If the user said *"remember this"* without specifying content, summarize the current conversation context into a clear, self-contained statement.
 
-### 2. Classify the content
+### 2. Pick the type (decorative, doesn't gate sharing)
 
-**Behavioral rule** — content tells Claude *how to act going forward*. Signals:
-- Starts with "always", "never", "I prefer", "make sure", "don't", "should/shouldn't"
-- Is a personal preference, convention, style choice, or workflow rule
-- Examples: *"I prefer concise responses"*, *"always run tests before commits"*, *"use uv for Python environments"*, *"never push directly to main"*
+Classify into one of: `decision`, `fact`, `preference`, `error`, `code`, `context`. (Don't use `session` — reserved for the Stop hook.) The type is a filter for recall, not a routing key.
 
-**Knowledge** — content describes *facts, decisions, events, or observations*. Signals:
-- Records a project decision, architectural choice, or trade-off
-- Captures an error and its fix, or a stable code pattern
-- Notes a fact about the system, codebase, or environment
-- Examples: *"we picked Postgres 16 for the auth service"*, *"the cache invalidation bug was caused by stale TTLs"*, *"the new SSO endpoint is /v2/sso/init"*
+### 3. Pick the groups
 
-**Ambiguous** — if it could plausibly be either, ask the user:
+- If the user said *"for `<group>`"* (or *"for `<g1>`, `<g2>`"*): use those.
+- Otherwise: `["personal"]`.
 
-> *"Is this a behavioral rule for how I should act (stays local, never shared) — or knowledge to remember and share with your group?"*
+Never invent group names. If the user says *"share with engineering"* and you don't know whether that's `engineering`, `engineering@branch`, or `eng-team`, ask. Cost of asking is low; cost of pushing to the wrong group is a wrong-audience leak.
 
-Don't guess. The cost of asking is low; the cost of mis-routing a personal preference into the vector DB (which then auto-pushes to teammates) is a privacy leak.
-
-### 3a. Behavioral rule → file-based memory
-
-Write a new memory file in your auto-memory directory (the same directory Claude Code loaded `MEMORY.md` from at session start — typically `~/.claude/projects/<encoded-cwd>/memory/`).
-
-**File:** `preference_<kebab-case-slug>.md` in that directory.
-
-**Frontmatter + body:**
-```markdown
----
-name: <short human-readable name>
-description: <one-line summary of when this rule applies>
-type: preference
----
-**Rule:** <the full rule, verbatim or lightly polished>
-
-**Why:** <reason if user gave one; omit if not>
-
-**How to apply:** <when/where this rule kicks in>
-```
-
-**Index:** Add a one-line pointer to the same directory's `MEMORY.md` under an appropriate section (create a `## User preferences` section if none fits):
-
-```markdown
-- [<name>](preference_<slug>.md) — <description>
-```
-
-**Confirm to user:**
-> ✓ Pinned as a behavioral rule in `preference_<slug>.md`.
-> Loads at every session start. Stays local, never shared with the group.
-
-### 3b. Knowledge → vector DB
-
-Classify the memory type from this set: `decision`, `fact`, `error`, `code`, `context`. (Don't use `preference` — that's routed to file-based above. Don't use `session` — that's reserved for the Stop hook.)
+### 4. Store
 
 Call `mem-fusion/store_memory` with:
 - `content`: the content
 - `type`: classified above
 - `importance: 5` (always for `/remember`)
-- `project`: inferred from current conversation context
+- `project`: inferred from current context
 - `tags`: inferred from content topic
+- `groups`: from step 3
 
-If Constellation is installed, also call `mem-fusion/group_push(id=<returned id>)` to share with the group. (If Constellation isn't installed, `group_push` returns `{"error": "constellation_not_installed"}` — that's expected, not an error worth reporting.)
+Returns `{status: "stored"|"merged"|"duplicate", id, groups}`.
 
-**Confirm to user:**
+### 5. Push (only if groups other than `personal` were set)
+
+For each non-`personal` group `G` in the memory's groups, call `mem-fusion/group_push(group=G, memory_ids=[id])`.
+
+This is one call per group. Each call only contacts peers in that group. *"Share with product"* never reaches engineering peers, even if the memory is also tagged engineering.
+
+### 6. Confirm to user
+
+Render per-peer prose. Never dump JSON. Example:
+
 ```
-✓ Stored as <type> (id: <short id>, importance: 5, project: <project>).
-✓ Shared with <group_name>:
-    - <peer>: stored | duplicate
-    - <peer>: unreachable (<reason>)
-```
-
-If Constellation isn't installed, replace the "Shared with" lines with:
-> Local only — Constellation not installed.
-
-## Examples
-
-**Behavioral rule:**
-```
-User:   /remember always use uv for Python environments on this machine
-
-Claude: ✓ Pinned as a behavioral rule in preference_use-uv-for-python.md.
-        Loads at every session start. Stays local, never shared.
+✓ Stored as decision (id: a7e3c2d1, groups: [personal, engineering@branch]).
+✓ Pushed to engineering@branch:
+    - bob-mac:       stored
+    - alice-desktop: stored
+    - carol-laptop:  unreachable (connection refused)
 ```
 
-**Knowledge:**
-```
-User:   /remember we picked Postgres 16 with logical replication for the auth service
+If Constellation isn't installed (`group_push` returns `constellation_not_installed`), say so once and continue — local-only is the safe fallback:
 
-Claude: ✓ Stored as decision (id: a7e3c2d1, importance: 5, project: auth-service).
-        ✓ Shared with engineering@branch:
-            - alice-desktop: stored
-            - bob-mac:       stored
-            - carol-laptop:  unreachable (connection refused)
+```
+✓ Stored as decision (id: a7e3c2d1, groups: [personal, engineering@branch]).
+ℹ Local only — Constellation not installed; the engineering tag is recorded
+   but no peers were notified. Install Constellation to enable sharing.
 ```
 
-**Ambiguous → ask:**
+## The store-now-share-later flow
+
+This is the natural workflow and it's load-bearing for v0.4. When the user reflects after work and decides to share what was just stored:
+
 ```
-User:   /remember the deploy script uses Python 3.12
+User:   "Ok, let's pause and reflect and store the memories."
+Claude: [Stores 4 memories with groups=[personal]]
+        ✓ Stored 4 memories (all groups=[personal]).
+            - decision: gRPC for internal RPC (id: a7e3)
+            - decision: Postgres 16 with logical replication (id: b8f4)
+            - error:    JWT clock-skew fix (id: c9a5)
+            - context:  Auth service migration timeline (id: d0b6)
 
-Claude: Quick check — is this a behavioral rule (always use Python 3.12
-        for the deploy script going forward, stays local) or knowledge
-        (a fact about the current deploy script, shared with your group)?
+User:   "Ok, share those with engineering."
+Claude: [Resolves "those" → the 4 ids just stored]
+        [Calls add_groups(ids, ["engineering@branch"])]
+        [Calls group_push(group="engineering@branch", memory_ids=ids)]
+        ✓ Added engineering@branch to 4 memories.
+        ✓ Pushed to engineering@branch:
+            - bob-mac:       4 stored
+            - alice-desktop: 4 stored
+
+User:   "Oh, also share them with product."
+Claude: [add_groups(ids, ["product@branch"])]
+        [group_push(group="product@branch", memory_ids=ids)]   ← product ONLY
+        ✓ Added product@branch to 4 memories.
+        ✓ Pushed to product@branch:
+            - dave-mac:      4 stored
+            - eve-laptop:    4 stored
+          (Engineering peers not re-contacted.)
 ```
 
-## Mis-routing is costly in one direction, cheap in the other
+**Scope rule:** push only to groups the user named in this turn. Don't iterate the memory's full `groups` list. *"Also share with product"* pushes to product peers only.
 
-- Mis-routing a **behavioral rule** into the vector DB → it auto-pushes to every teammate's machine. Privacy leak.
-- Mis-routing **knowledge** into file-based memory → teammates won't see it. Annoying but recoverable; the user can `/remember` it again as knowledge.
+## Bulk operations
 
-When in doubt, ask.
+- `/remember pull` — `group_pull()` with no group arg. Iterates every configured group with peers. Render per-peer-per-group prose.
+- `/remember pull <group>` — `group_pull(group=<group>)`.
+- `/remember push` — for each configured group with peers, call `group_push(group=<group>)` with no `memory_ids` (bulk push of every entry tagged with that group).
+- `/remember push <group>` — `group_push(group=<group>)` with no `memory_ids`.
+
+After pull, surface specific arrivals the user asks about with `export_record(id)` or `search_recent`.
+
+## What NOT to do
+
+- **Don't classify content to decide where it goes.** Routing is by the explicit `groups` tag, period. If the user didn't name a group, default is `personal`.
+- **Don't push to groups the user didn't name in this turn.** Even if a memory is tagged `[personal, engineering, product]`, *"share with product"* contacts product peers only.
+- **Don't invent group names.** Ask if ambiguous.
+- **Don't dump JSON to the user.** Render per-peer prose.
+- **Don't try to remove a group.** `add_groups` is additive only; subtraction isn't supported in v0.4 (un-sharing is non-trivial in distributed settings — peers already have it).
+
+## Mis-routing cost
+
+Now that routing is explicit, mis-routing is mostly user-caught:
+
+- Mis-naming a group → push lands in wrong audience (or fails forbidden). User notices immediately from the per-peer summary.
+- Defaulting to `personal` when user wanted to share → no harm; user follows up with *"share those with X"*.
+- Adding the wrong group via `add_groups` → can't easily un-share, but the per-peer confirmation surfaces it on the next push.
+
+When in doubt about group names, ask.

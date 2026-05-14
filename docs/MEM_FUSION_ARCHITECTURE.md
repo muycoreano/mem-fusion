@@ -1,6 +1,8 @@
 # Mem-Fusion v0.3.0 — Architecture
 
-**Status:** MVP architecture, current as of 2026-05-12
+> **⚠ Superseded by v0.4** — The routing model described below (dual-store classification: file-based behaviors + vector knowledge) was replaced in v0.4 by **explicit group-keyed sharing** with Qdrant as the sole source of truth. See [`v0.4_MEMORY_ARCHITECTURE.md`](v0.4_MEMORY_ARCHITECTURE.md) for the live design. This document remains as a historical record of the v0.3 design path; the dual-routing skill and `source=local` / `source=group` distinctions discussed here no longer apply on `main`.
+
+**Status:** v0.3.0 architecture (historical); v0.4 is the current design
 **Companion to:** [`CONSTELLATION_ARCHITECTURE.md`](CONSTELLATION_ARCHITECTURE.md)
 **Repository:** [github.com/muycoreano/mem-fusion](https://github.com/muycoreano/mem-fusion)
 

@@ -10,7 +10,11 @@
 
   "memberships": [
     {
-      "group_name": "<your-group-name>",
+      "group_name": "personal",
+      "peers": []
+    },
+    {
+      "group_name": "<your-team-group>",
       "peers": [
         { "node_name": "<peer-2-name>", "endpoint": "http://<peer-2-ip>:7533" },
         { "node_name": "<peer-3-name>", "endpoint": "http://<peer-3-ip>:7533" }

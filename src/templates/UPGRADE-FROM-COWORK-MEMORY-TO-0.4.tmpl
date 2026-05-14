@@ -211,8 +211,9 @@ mkdir -p ~/.claude/skills/remember
 
 ## Step 10 — Smoke test
 
+First, verify the migration count is intact. Run this **before** the smoke-test script below, which adds one new test memory:
+
 ```bash
-# Server reachable?
 ~/.local/share/mem-fusion/venv/bin/python -c "
 import sys, asyncio
 sys.path.insert(0, '$HOME/.local/share/mem-fusion')
@@ -226,6 +227,16 @@ asyncio.run(main())
 ```
 
 The total should match what Step 1 reported. If it doesn't, stop — something is off with the Qdrant connection or the collection name.
+
+Then run the end-to-end store / search / stats smoke test:
+
+<!-- INCLUDE_EXEC: src/scripts/smoke-test.sh AS ~/.local/share/mem-fusion/scripts/smoke-test.sh -->
+
+```bash
+~/.local/share/mem-fusion/scripts/smoke-test.sh
+```
+
+Expect `✓ All smoke tests passed`.
 
 ---
 

@@ -46,17 +46,21 @@ if ! "$ROOT/build_install.sh" "$TMP" > "$TMP/build.log" 2>&1; then
     echo "  $passed passed, $failed failed"
     exit 1
 fi
-if [[ -f "$TMP/INSTALL_MEM_FUSION.md" && -f "$TMP/INSTALL_CONSTELLATION.md" ]]; then
-    check_pass "build script produced both INSTALL files"
+expected_docs=(INSTALL_MEM_FUSION.md INSTALL_CONSTELLATION.md UPGRADE-FROM-COWORK-MEMORY-TO-0.4.md)
+all_present=1
+for f in "${expected_docs[@]}"; do
+    [[ -f "$TMP/$f" ]] || { all_present=0; check_fail "build script did not produce $f"; }
+done
+if [[ "$all_present" == 1 ]]; then
+    check_pass "build script produced all ${#expected_docs[@]} expected docs"
 else
-    check_fail "build script did not produce both INSTALL files"
     exit 1
 fi
 
 # ── STEP 2 — staleness check: built == committed ──────────────────────────
 echo ""
-echo "STEP 2: built docs match committed INSTALL_*.md (staleness check)"
-for f in INSTALL_MEM_FUSION.md INSTALL_CONSTELLATION.md; do
+echo "STEP 2: built docs match committed copies at repo root (staleness check)"
+for f in "${expected_docs[@]}"; do
     if [[ ! -f "$ROOT/$f" ]]; then
         check_fail "$f missing from repo root"
         continue
@@ -72,7 +76,7 @@ done
 # ── STEP 3 — bash-syntax check on every ```bash block ─────────────────────
 echo ""
 echo "STEP 3: bash code blocks in generated docs parse cleanly (bash -n)"
-for doc in INSTALL_MEM_FUSION.md INSTALL_CONSTELLATION.md; do
+for doc in "${expected_docs[@]}"; do
     n_blocks=0
     n_failed=0
     failed_blocks=""

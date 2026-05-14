@@ -88,7 +88,8 @@ build_one() {
 echo "→ building from $TEMPLATES"
 echo "→ output dir   $OUT_DIR"
 
-build_one "$TEMPLATES/INSTALL_MEM_FUSION.tmpl"    "$OUT_DIR/INSTALL_MEM_FUSION.md"
-build_one "$TEMPLATES/INSTALL_CONSTELLATION.tmpl" "$OUT_DIR/INSTALL_CONSTELLATION.md"
+build_one "$TEMPLATES/INSTALL_MEM_FUSION.tmpl"                    "$OUT_DIR/INSTALL_MEM_FUSION.md"
+build_one "$TEMPLATES/INSTALL_CONSTELLATION.tmpl"                 "$OUT_DIR/INSTALL_CONSTELLATION.md"
+build_one "$TEMPLATES/UPGRADE-FROM-COWORK-MEMORY-TO-0.4.tmpl"     "$OUT_DIR/UPGRADE-FROM-COWORK-MEMORY-TO-0.4.md"
 
 echo "→ done"

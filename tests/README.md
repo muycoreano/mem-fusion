@@ -13,11 +13,13 @@ tests/
 │   ├── test-promotion.py      ← /memory/put integrity + additive-merge on hash collision (1 daemon, simulated peer push)
 │   ├── test-directory.py      ← /peers + /peers/self aggregation (1 daemon, simulated peers via origin_node)
 │   └── test-pull-push.py      ← end-to-end gateway /pull + /push + push-time group filter (2 daemons)
-└── mem_fusion/
-    ├── test-mcp-tools.py             ← all 12 MCP tools (10 memory + group_pull + group_push) over stdio JSON-RPC (1 Qdrant + 1 mem-fusion)
-    ├── test-group-roundtrip.py       ← end-to-end: Claude → mem-fusion → Constellation → peer → search (2 Qdrants + 2 Constellations + 2 mem-fusions)
-    ├── test-store-now-share-later.py ← v0.4 add_groups + targeted memory_ids push + scope rule (3 Qdrants + 3 Constellations + 3 mem-fusions)
-    └── test-offline-rejoin.py        ← peer-symmetric catch-up: alice→bob (carol offline), bob→alice, bob goes offline, carol joins and pulls everything via alice
+├── mem_fusion/
+│   ├── test-mcp-tools.py             ← all 12 MCP tools (10 memory + group_pull + group_push) over stdio JSON-RPC (1 Qdrant + 1 mem-fusion)
+│   ├── test-group-roundtrip.py       ← end-to-end: Claude → mem-fusion → Constellation → peer → search (2 Qdrants + 2 Constellations + 2 mem-fusions)
+│   ├── test-store-now-share-later.py ← v0.4 add_groups + targeted memory_ids push + scope rule (3 Qdrants + 3 Constellations + 3 mem-fusions)
+│   └── test-offline-rejoin.py        ← peer-symmetric catch-up: alice→bob (carol offline), bob→alice, bob goes offline, carol joins and pulls everything via alice
+└── installer/
+    └── test-installers.sh            ← staleness + bash-syntax check on INSTALL_*.md (no subprocesses; pure docs pipeline)
 ```
 
 ## What each test exercises
@@ -31,6 +33,7 @@ tests/
 | `test-promotion.py` | The receive side: integrity invariants on `/memory/put` (byte-identical content + vector, content_hash recompute, `groups` list, receiver-assigned id), duplicate detection on re-push, content_hash mismatch rejection, additive merge when receiver already has the content. |
 | `test-directory.py` | The directory side: `/peers/self` shape, `/peers` aggregation (submission_count, first_seen/last_seen, sort order), negative cases (unknown group → 403, missing param → 400). |
 | `test-pull-push.py` | Two daemons talking real HTTP: push fan-out, push idempotency, pull dedup, pull-privacy (personal-only memories stay local), pull catch-up after a drop, push-time group filter on the wire. |
+| `test-installers.sh` | Build pipeline staleness check: rebuilds `INSTALL_MEM_FUSION.md` and `INSTALL_CONSTELLATION.md` from templates into a tempdir, diffs against the committed copies, then runs `bash -n` over every \`\`\`bash code block in the generated docs. Catches "forgot to rebuild after editing templates" and busted shell. |
 
 ## Run
 
@@ -42,6 +45,7 @@ tests/
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-promotion.py
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-directory.py
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-pull-push.py
+tests/installer/test-installers.sh
 ```
 
 Each prints a per-step trace and a final `N/N invariants passed` line followed by a pass/fail summary.

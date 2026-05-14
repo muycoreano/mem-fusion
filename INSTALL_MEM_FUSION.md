@@ -17,9 +17,9 @@ It's all local — no data leaves your Mac. Stack:
 
 - **Qdrant 1.13.4** — local vector database (port 6333)
 - **Ollama 0.20.5** + `nomic-embed-text` — local 768-dim embeddings (port 11434)
-- **Python 3.12 MCP server** — exposes 9 memory tools to Claude Code via stdio
-- **4 hooks** — SessionStart, UserPromptSubmit, Stop, PostToolUse:Write
-- **`/remember` skill**
+- **Python 3.12 MCP server** — exposes 10 memory tools to Claude Code via stdio (plus 2 group tools when Constellation is also installed)
+- **4 hooks** — SessionStart, UserPromptSubmit, Stop, PostToolUse:Write (all auto-tagged with `groups=["personal"]`)
+- **`/remember` skill** — explicit group-keyed tagging (default scope is `personal`, local-only)
 
 Everything is managed by `launchd`. Disk footprint ≈ 200 MB.
 
@@ -177,20 +177,25 @@ GATEWAY_TIMEOUT_S = 30.0
 
 @server.list_tools()
 async def list_tools():
+    type_enum = ["decision","fact","preference","error","code","context","session"]
     return [
         Tool(name="store_memory",
              description=("Store a new memory in the persistent vector database. "
                           "Call after any decision, discovery, user preference, error resolution, "
                           "or substantial code written. Do NOT store trivial facts or transient state. "
                           "type one of: decision, fact, preference, error, code, context, session. "
-                          "importance: 1=trivial, 3=normal, 4=important, 5=critical (user-curated only)."),
+                          "importance: 1=trivial, 3=normal, 4=important, 5=critical (user-curated only). "
+                          "groups: list of group tags for sharing — defaults to ['personal'] "
+                          "(local-only on this peer). Pass explicit groups to share with teammates."),
              inputSchema={"type": "object", "properties": {
                  "content":    {"type": "string"},
-                 "type":       {"type": "string", "enum": ["decision","fact","preference","error","code","context","session"]},
+                 "type":       {"type": "string", "enum": type_enum},
                  "tags":       {"type": "array", "items": {"type": "string"}},
                  "project":    {"type": "string"},
                  "importance": {"type": "integer", "minimum": 1, "maximum": 5, "default": 3},
                  "session_id": {"type": "string"},
+                 "groups":     {"type": "array", "items": {"type": "string"},
+                                "description": "Group tags for sharing. Default ['personal']."},
              }, "required": ["content", "type"]}),
         Tool(name="search_memory",
              description=("Semantic search across all stored memories. Call at session start with the current task, "
@@ -199,7 +204,7 @@ async def list_tools():
                  "query":          {"type": "string"},
                  "top_k":          {"type": "integer", "default": 8},
                  "project":        {"type": "string"},
-                 "type":           {"type": "string", "enum": ["decision","fact","preference","error","code","context","session"]},
+                 "type":           {"type": "string", "enum": type_enum},
                  "since":          {"type": "string", "description": "ISO date or relative '24h'/'7d'"},
                  "min_importance": {"type": "integer", "default": 1},
              }, "required": ["query"]}),
@@ -211,22 +216,24 @@ async def list_tools():
                  "top_k":   {"type": "integer", "default": 10},
              }, "required": []}),
         Tool(name="upsert_memory",
-             description="Update an existing memory by ID.",
+             description="Update an existing memory by ID. Preserves groups — use add_groups to widen sharing.",
              inputSchema={"type": "object", "properties": {
                  "id":         {"type": "string"},
                  "content":    {"type": "string"},
-                 "type":       {"type": "string", "enum": ["decision","fact","preference","error","code","context","session"]},
+                 "type":       {"type": "string", "enum": type_enum},
                  "tags":       {"type": "array", "items": {"type": "string"}},
                  "importance": {"type": "integer", "minimum": 1, "maximum": 5},
              }, "required": ["id", "content"]}),
         Tool(name="find_or_create",
-             description="Search first, store if no result above 0.82.",
+             description=("Search first, store if no result above 0.82. If found, additively merges "
+                          "the provided groups into the existing entry's groups."),
              inputSchema={"type": "object", "properties": {
                  "content":    {"type": "string"},
-                 "type":       {"type": "string", "enum": ["decision","fact","preference","error","code","context","session"]},
+                 "type":       {"type": "string", "enum": type_enum},
                  "tags":       {"type": "array", "items": {"type": "string"}},
                  "project":    {"type": "string"},
                  "importance": {"type": "integer", "minimum": 1, "maximum": 5, "default": 3},
+                 "groups":     {"type": "array", "items": {"type": "string"}},
              }, "required": ["content", "type"]}),
         Tool(name="delete_memory",
              description="Delete a memory by ID.",
@@ -250,26 +257,43 @@ async def list_tools():
              inputSchema={"type": "object", "properties": {
                  "id": {"type": "string", "description": "Memory ID from a prior store/search result"},
              }, "required": ["id"]}),
-        Tool(name="group_pull",
-             description=("Pull new memories from every peer in this node's group via the "
-                          "local Constellation daemon. Returns per-peer telemetry "
-                          "{peers: [{node_name, group_name, status: responsive|unreachable, "
-                          "entry_ids?, reason?}]}. After calling this, use export_record(id) "
-                          "or search_recent to surface the new content to the user — render "
-                          "a per-peer natural-language summary; never dump the raw JSON. "
-                          "Requires Constellation to be installed."),
-             inputSchema={"type": "object", "properties": {}, "required": []}),
-        Tool(name="group_push",
-             description=("Share a locally-stored memory with every peer in this node's group "
-                          "via the local Constellation daemon. Takes the local memory's ID "
-                          "(from a prior store_memory result). Returns per-peer delivery "
-                          "telemetry {peers: [{node_name, group_name, status, delivery?, "
-                          "reason?}]}. Render a per-peer summary to the user; never dump JSON. "
-                          "Requires Constellation to be installed."),
+        Tool(name="add_groups",
+             description=("Additively widen the group set on one or more existing memories. "
+                          "Used for the store-now-share-later workflow: store memories "
+                          "(default groups=['personal']), then later add a shared group "
+                          "before calling group_push. Never removes a group — only adds. "
+                          "Returns {updated, no_op, errors} telemetry; render a brief summary."),
              inputSchema={"type": "object", "properties": {
-                 "id": {"type": "string",
-                        "description": "Local memory ID from a prior store_memory result"},
-             }, "required": ["id"]}),
+                 "memory_ids": {"type": "array", "items": {"type": "string"},
+                                "description": "IDs from prior store_memory / search results"},
+                 "groups":     {"type": "array", "items": {"type": "string"},
+                                "description": "Groups to add (additive union)"},
+             }, "required": ["memory_ids", "groups"]}),
+        Tool(name="group_pull",
+             description=("Pull new memories from peers via the local Constellation daemon. "
+                          "Omit `group` to iterate every configured group with peers; pass "
+                          "`group=<name>` to pull from one group only. Returns per-peer telemetry "
+                          "{peers: [{node_name, group_name, status: responsive|unreachable, "
+                          "entry_ids?, merged_ids?, reason?}]}. Render a per-peer natural-language "
+                          "summary; never dump the raw JSON. Requires Constellation."),
+             inputSchema={"type": "object", "properties": {
+                 "group": {"type": "string",
+                           "description": "Optional. Limit pull to this group only."},
+             }, "required": []}),
+        Tool(name="group_push",
+             description=("Share local memories with peers in a group via the local Constellation "
+                          "daemon. Always scoped to one group per call. Pass `memory_ids` to push "
+                          "specific memories (use this for share-after-the-fact flows after add_groups); "
+                          "omit to push every local entry tagged with that group (bulk catch-up). "
+                          "Returns per-peer-per-memory telemetry; render prose, never dump JSON. "
+                          "Push scope rule: only contacts peers in the named group, even if memories "
+                          "are also tagged for other groups. Requires Constellation."),
+             inputSchema={"type": "object", "properties": {
+                 "group":      {"type": "string",
+                                "description": "Target group; must be a configured membership."},
+                 "memory_ids": {"type": "array", "items": {"type": "string"},
+                                "description": "Optional. Memory IDs to push; omit for bulk push of the whole group."},
+             }, "required": ["group"]}),
     ]
 
 
@@ -293,17 +317,18 @@ async def dispatch(name, args):
     if name == "get_related":    return await core.get_related(args)
     if name == "memory_stats":   return await core.memory_stats(args)
     if name == "export_record":  return await core.export_record(args)
+    if name == "add_groups":     return await core.add_groups(args)
     if name == "group_pull":     return await group_pull(args)
     if name == "group_push":     return await group_push(args)
     raise ValueError(f"Unknown tool: {name}")
 
 
 # ── Group tools — thin proxies to local Constellation gateway ────────────
-async def group_pull(_args):
-    """POST /pull on local Constellation gateway. Returns per-peer telemetry."""
+async def _post_gateway(path: str, body: dict) -> dict:
+    """Common error-mapping for gateway POSTs. Caller passes the body."""
     try:
         async with httpx.AsyncClient(timeout=GATEWAY_TIMEOUT_S) as client:
-            r = await client.post(f"{CONSTELLATION_GATEWAY}/pull", json={})
+            r = await client.post(f"{CONSTELLATION_GATEWAY}{path}", json=body)
         if r.status_code != 200:
             return {"error": "gateway_error",
                     "detail": f"http {r.status_code}: {r.text[:200]}"}
@@ -314,39 +339,42 @@ async def group_pull(_args):
     except httpx.TimeoutException:
         return {"error": "gateway_timeout",
                 "detail": f"gateway did not respond within {GATEWAY_TIMEOUT_S}s"}
+
+
+async def group_pull(args):
+    """POST /pull on local Constellation gateway.
+
+    Body: {group?: str}. Without `group`, pulls from every configured
+    membership with peers. With `group`, pulls only that group's peers.
+    """
+    body = {}
+    if args.get("group"):
+        body["group"] = args["group"]
+    return await _post_gateway("/pull", body)
 
 
 async def group_push(args):
-    """POST /push on local Constellation gateway. mem-fusion fetches the full
-    record via core.export_record and forwards it; the gateway handles the
-    fan-out and the local-entry augmentation.
+    """POST /push on local Constellation gateway.
+
+    Body: {group: str, memory_ids?: list[str]}. The gateway scrolls the
+    matching local entries and fans them out to the named group's peers,
+    applying the push-time group filter on the wire.
     """
-    memory_id = args.get("id")
-    if not memory_id:
-        return {"error": "missing_argument", "detail": "id is required"}
-
-    record = await core.export_record({"id": memory_id})
-    if "error" in record:
-        return {"error": "memory_not_found", "detail": record["error"]}
-
-    try:
-        async with httpx.AsyncClient(timeout=GATEWAY_TIMEOUT_S) as client:
-            r = await client.post(f"{CONSTELLATION_GATEWAY}/push",
-                                  json={"record": record})
-        if r.status_code != 200:
-            return {"error": "gateway_error",
-                    "detail": f"http {r.status_code}: {r.text[:200]}"}
-        return r.json()
-    except httpx.ConnectError:
-        return {"error": "constellation_not_installed",
-                "detail": f"could not reach gateway at {CONSTELLATION_GATEWAY}"}
-    except httpx.TimeoutException:
-        return {"error": "gateway_timeout",
-                "detail": f"gateway did not respond within {GATEWAY_TIMEOUT_S}s"}
+    group = args.get("group")
+    if not group:
+        return {"error": "missing_argument", "detail": "group is required"}
+    body = {"group": group}
+    if args.get("memory_ids"):
+        body["memory_ids"] = args["memory_ids"]
+    return await _post_gateway("/push", body)
 
 
 async def main():
     log.info("Mem-Fusion MCP Server starting")
+    try:
+        core.migrate_legacy_entries(log)
+    except Exception as e:
+        log.warning("legacy migration failed at startup (continuing): %s", e)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
@@ -375,8 +403,10 @@ If Ollama is unreachable when embedding is required, returns
 No silent queueing.
 """
 import hashlib
+import json
 import logging
 import os
+import socket
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -390,13 +420,43 @@ from qdrant_client.models import (
 # ── Constants (shared by mem_fusion.py and constellation.py) ──────────────
 QDRANT_URL  = os.getenv("QDRANT_URL",  "http://127.0.0.1:6333")
 OLLAMA_URL  = os.getenv("OLLAMA_URL",  "http://127.0.0.1:11434")
-# The collection name is invariant. Mem-fusion fuses cowork-memory entries
-# from ephemeral file storage into persistent vector storage; the collection
-# *is* the cowork-memory store. Group-shared, local, preload distinctions
-# live in the `source` payload field, never in the collection name.
+# The collection name is invariant. Every entry carries a `groups` payload
+# (list[str]); routing happens by group membership, not by collection name.
 COLLECTION  = "cowork_memories"
 EMBED_MODEL = "nomic-embed-text"
 VECTOR_SIZE = 768
+
+CONSTELLATION_CONFIG_PATH = Path(os.getenv(
+    "MEMFUSION_CONSTELLATION_CONFIG",
+    str(Path.home() / ".local/share/mem-fusion/constellation/config.json"),
+))
+
+
+def _resolve_node_name() -> str:
+    """Resolve the local peer identity for origin_node tagging.
+
+    Precedence:
+      1. MEMFUSION_NODE_NAME env var (explicit, used by tests + custom installs)
+      2. node_name from Constellation's config.json if present (single source
+         of truth for peer identity when Constellation is installed)
+      3. socket.gethostname() — safe fallback for single-node installs
+    """
+    if name := os.getenv("MEMFUSION_NODE_NAME"):
+        return name
+    if CONSTELLATION_CONFIG_PATH.exists():
+        try:
+            with open(CONSTELLATION_CONFIG_PATH) as f:
+                cfg = json.load(f)
+            if name := cfg.get("node_name"):
+                return name
+        except Exception:
+            pass
+    return socket.gethostname()
+
+
+NODE_NAME = _resolve_node_name()
+
+DEFAULT_GROUPS = ["personal"]
 
 LOG_DIR     = os.getenv("MEMFUSION_LOG_DIR",
                         str(Path.home() / ".local/share/mem-fusion/logs"))
@@ -467,18 +527,53 @@ async def embed(text: str) -> list[float] | None:
 
 
 # ── Qdrant filter helpers ─────────────────────────────────────────────────
-def find_duplicate(chash: str) -> str | None:
-    """Return existing point id if a memory with this content_hash exists, else None."""
+def entry_groups(payload: dict) -> list[str]:
+    """Read a payload's groups, applying v0.3 backward-compat fallback.
+
+    v0.4 entries carry `groups: list[str]`. Legacy v0.3 entries had either
+    `source=local` (no group) or `source=group` with a singular `group_name`.
+    This helper normalizes both shapes to the v0.4 canonical list form.
+    """
+    g = payload.get("groups")
+    if isinstance(g, list) and g:
+        return list(g)
+    legacy_group = payload.get("group_name")
+    if payload.get("source") == "group" and legacy_group:
+        return [legacy_group]
+    return list(DEFAULT_GROUPS)
+
+
+def union_groups(*group_lists) -> list[str]:
+    """Order-preserving deduplicated union across one or more group lists."""
+    seen, out = set(), []
+    for gs in group_lists:
+        for g in gs or []:
+            if g and g not in seen:
+                seen.add(g)
+                out.append(g)
+    return out
+
+
+def normalize_groups_arg(groups) -> list[str]:
+    """Coerce a caller-supplied groups arg into a clean canonical list."""
+    if not isinstance(groups, list) or not groups:
+        return list(DEFAULT_GROUPS)
+    cleaned = union_groups(groups)
+    return cleaned or list(DEFAULT_GROUPS)
+
+
+def find_existing_by_hash(chash: str) -> tuple[str, dict] | None:
+    """Return (point_id, payload) for an entry with this content_hash, else None."""
     try:
         results, _ = qdrant.scroll(
             collection_name=COLLECTION,
             scroll_filter=Filter(must=[
                 FieldCondition(key="content_hash", match=MatchValue(value=chash))
             ]),
-            limit=1, with_payload=False,
+            limit=1, with_payload=True,
         )
         if results:
-            return str(results[0].id)
+            return str(results[0].id), dict(results[0].payload or {})
     except Exception as e:
         log.warning("Duplicate check failed: %s", e)
     return None
@@ -526,14 +621,16 @@ def format_results(hits):
         "tags":       h.payload.get("tags", []),
         "importance": h.payload.get("importance", 3),
         "timestamp":  h.payload.get("timestamp", ""),
+        "groups":     entry_groups(h.payload or {}),
     } for h in hits]
 
 
 # ── Memory operations ─────────────────────────────────────────────────────
 async def store_memory(args: dict) -> dict:
-    """Embed, dedup, insert. Returns one of:
-       {status: "stored", id}            — fresh content stored
-       {status: "duplicate", existing_id} — content_hash already present
+    """Embed, dedup-merge, insert. Returns one of:
+       {status: "stored",    id, groups} — fresh content stored
+       {status: "merged",    id, groups} — content_hash hit; groups widened
+       {status: "duplicate", id, groups} — content_hash hit; nothing changed
        {error: "ollama_unreachable"}     — embed failed; caller surfaces error
     """
     content    = args["content"]
@@ -542,11 +639,19 @@ async def store_memory(args: dict) -> dict:
     project    = args.get("project", "")
     importance = int(args.get("importance", 3))
     session_id = args.get("session_id", "")
+    groups     = normalize_groups_arg(args.get("groups"))
 
-    chash   = content_hash(content)
-    dupe_id = find_duplicate(chash)
-    if dupe_id:
-        return {"status": "duplicate", "existing_id": dupe_id}
+    chash    = content_hash(content)
+    existing = find_existing_by_hash(chash)
+    if existing:
+        existing_id, payload = existing
+        current = entry_groups(payload)
+        merged  = union_groups(current, groups)
+        if merged == current:
+            return {"status": "duplicate", "id": existing_id, "groups": current}
+        qdrant.set_payload(collection_name=COLLECTION,
+                           payload={"groups": merged}, points=[existing_id])
+        return {"status": "merged", "id": existing_id, "groups": merged}
 
     vec = await embed(content)
     if vec is None:
@@ -554,15 +659,61 @@ async def store_memory(args: dict) -> dict:
                 "detail": "Local Ollama did not respond; cannot embed. Verify Ollama is running."}
 
     point_id = str(uuid.uuid4())
+    ts       = iso_now()
     qdrant.upsert(collection_name=COLLECTION, points=[PointStruct(
         id=point_id, vector=vec,
         payload={
             "content": content, "type": type_, "tags": tags, "project": project,
             "importance": importance, "session_id": session_id,
-            "content_hash": chash, "timestamp": iso_now(), "source": "local",
+            "content_hash": chash, "timestamp": ts,
+            "groups": groups, "origin_node": NODE_NAME, "submitted_at": ts,
         },
     )])
-    return {"status": "stored", "id": point_id}
+    return {"status": "stored", "id": point_id, "groups": groups}
+
+
+async def add_groups(args: dict) -> dict:
+    """Additive union of group tags on existing entries.
+
+    Inputs:  memory_ids: list[str], groups: list[str]
+    Returns: {updated: [{id, groups, added}], no_op: [{id, groups}],
+              errors: [{id, reason}]}
+
+    Additive only — never removes a group. Removal is deferred (see v0.4 §11).
+    """
+    memory_ids = args.get("memory_ids", [])
+    incoming   = args.get("groups", [])
+    if not isinstance(memory_ids, list) or not memory_ids:
+        return {"error": "missing_argument",
+                "detail": "memory_ids required (non-empty list[str])"}
+    if not isinstance(incoming, list) or not incoming:
+        return {"error": "missing_argument",
+                "detail": "groups required (non-empty list[str])"}
+    incoming = union_groups(incoming)
+
+    updated, no_op, errors = [], [], []
+    for mid in memory_ids:
+        try:
+            points = qdrant.retrieve(collection_name=COLLECTION,
+                                     ids=[mid], with_payload=True, with_vectors=False)
+        except Exception as e:
+            errors.append({"id": mid, "reason": f"retrieve_failed: {e}"})
+            continue
+        if not points:
+            errors.append({"id": mid, "reason": "not_found"})
+            continue
+        payload = dict(points[0].payload or {})
+        current = entry_groups(payload)
+        merged  = union_groups(current, incoming)
+        if merged == current:
+            no_op.append({"id": mid, "groups": current})
+            continue
+        added = [g for g in incoming if g not in current]
+        qdrant.set_payload(collection_name=COLLECTION,
+                           payload={"groups": merged}, points=[mid])
+        updated.append({"id": mid, "groups": merged, "added": added})
+
+    return {"updated": updated, "no_op": no_op, "errors": errors}
 
 
 async def search_memory(args: dict) -> dict:
@@ -610,7 +761,8 @@ async def search_recent(args: dict) -> dict:
 
 
 async def upsert_memory(args: dict) -> dict:
-    """Update an existing point by id. Re-embeds the new content."""
+    """Update an existing point by id. Re-embeds the new content. Groups are
+    preserved (use add_groups to widen sharing)."""
     memory_id  = args["id"]
     content    = args["content"]
     type_      = args.get("type")
@@ -630,22 +782,25 @@ async def upsert_memory(args: dict) -> dict:
     payload["content"]      = content
     payload["content_hash"] = content_hash(content)
     payload["timestamp"]    = iso_now()
+    payload["groups"]       = entry_groups(payload)
     if type_:      payload["type"]       = type_
     if tags:       payload["tags"]       = tags
     if importance: payload["importance"] = importance
 
     qdrant.upsert(collection_name=COLLECTION,
                   points=[PointStruct(id=memory_id, vector=vec, payload=payload)])
-    return {"status": "updated", "id": memory_id}
+    return {"status": "updated", "id": memory_id, "groups": payload["groups"]}
 
 
 async def find_or_create(args: dict) -> dict:
-    """Search for similar content first; store if no result above 0.82 similarity."""
+    """Search for similar content first; store if no result above 0.82 similarity.
+    If a near-duplicate is found, additively merges the caller's groups into it."""
     content    = args["content"]
     type_      = args["type"]
     tags       = args.get("tags", [])
     project    = args.get("project", "")
     importance = int(args.get("importance", 3))
+    groups     = normalize_groups_arg(args.get("groups"))
 
     vec = await embed(content)
     if vec is None:
@@ -654,20 +809,29 @@ async def find_or_create(args: dict) -> dict:
 
     hits = qdrant.search(collection_name=COLLECTION, query_vector=vec, limit=1, with_payload=True)
     if hits and hits[0].score > 0.82:
+        hit_id  = str(hits[0].id)
+        current = entry_groups(hits[0].payload or {})
+        merged  = union_groups(current, groups)
+        if merged != current:
+            qdrant.set_payload(collection_name=COLLECTION,
+                               payload={"groups": merged}, points=[hit_id])
         r = format_results([hits[0]])[0]
+        r["groups"] = merged
         return {"status": "found", **r}
 
     chash    = content_hash(content)
     point_id = str(uuid.uuid4())
+    ts       = iso_now()
     qdrant.upsert(collection_name=COLLECTION, points=[PointStruct(
         id=point_id, vector=vec,
         payload={
             "content": content, "type": type_, "tags": tags, "project": project,
             "importance": importance, "content_hash": chash,
-            "timestamp": iso_now(), "source": "local",
+            "timestamp": ts, "groups": groups,
+            "origin_node": NODE_NAME, "submitted_at": ts,
         },
     )])
-    return {"status": "created", "id": point_id}
+    return {"status": "created", "id": point_id, "groups": groups}
 
 
 async def delete_memory(args: dict) -> dict:
@@ -730,19 +894,22 @@ async def export_record(args: dict) -> dict:
                              with_vectors=True, with_payload=True)
     if not points:
         return {"error": f"Memory {memory_id} not found"}
-    p = points[0]
+    p  = points[0]
+    pl = p.payload or {}
     return {
         "id":           str(p.id),
         "vector":       p.vector,
-        "content":      p.payload.get("content", ""),
-        "content_hash": p.payload.get("content_hash", ""),
-        "type":         p.payload.get("type", ""),
-        "tags":         p.payload.get("tags", []),
-        "project":      p.payload.get("project", ""),
-        "importance":   p.payload.get("importance", 3),
-        "session_id":   p.payload.get("session_id", ""),
-        "timestamp":    p.payload.get("timestamp", ""),
-        "source":       p.payload.get("source", ""),
+        "content":      pl.get("content", ""),
+        "content_hash": pl.get("content_hash", ""),
+        "type":         pl.get("type", ""),
+        "tags":         pl.get("tags", []),
+        "project":      pl.get("project", ""),
+        "importance":   pl.get("importance", 3),
+        "session_id":   pl.get("session_id", ""),
+        "timestamp":    pl.get("timestamp", ""),
+        "groups":       entry_groups(pl),
+        "origin_node":  pl.get("origin_node", NODE_NAME),
+        "submitted_at": pl.get("submitted_at", pl.get("timestamp", "")),
     }
 
 
@@ -750,18 +917,23 @@ async def export_record(args: dict) -> dict:
 def get_entries_for_pull(group_name: str,
                          cursor_iso: str | None,
                          limit: int = 256) -> list[dict]:
-    """Return group entries with submitted_at > cursor_iso, sorted ascending.
+    """Return entries where `group_name` ∈ entry.groups and submitted_at > cursor.
 
     Used by constellation's GET /memory/since endpoint to answer pull queries
     from other peers. Filters on submitted_at — the originating peer's
     timestamp, which is global across the group — so cursors are comparable
     no matter which peer answers the query.
 
+    Each /memory/since call answers for a single group; the wire-shape's
+    `groups` field carries only the requested group. Multi-group entries
+    get reconstructed on the caller's side via additive dedup-merge when
+    the caller pulls other groups.
+
     Returns full memory records (including vector) so the requesting peer can
     insert them locally without a follow-up fetch and without re-embedding.
     """
     conditions = [
-        FieldCondition(key="group_name", match=MatchValue(value=group_name)),
+        FieldCondition(key="groups", match=MatchValue(value=group_name)),
     ]
     if cursor_iso:
         conditions.append(FieldCondition(
@@ -774,24 +946,24 @@ def get_entries_for_pull(group_name: str,
         scroll_filter=Filter(must=conditions),
         limit=limit, with_payload=True, with_vectors=True,
     )
-    points = sorted(points, key=lambda p: p.payload.get("submitted_at", ""))
+    points = sorted(points, key=lambda p: (p.payload or {}).get("submitted_at", ""))
     return [{
-        "content":      p.payload.get("content", ""),
-        "content_hash": p.payload.get("content_hash", ""),
+        "content":      (p.payload or {}).get("content", ""),
+        "content_hash": (p.payload or {}).get("content_hash", ""),
         "vector":       list(p.vector) if p.vector is not None else None,
-        "type":         p.payload.get("type", ""),
-        "tags":         p.payload.get("tags", []),
-        "project":      p.payload.get("project", ""),
-        "importance":   p.payload.get("importance", 3),
-        "group_name":   p.payload.get("group_name", ""),
-        "origin_node":  p.payload.get("origin_node", ""),
-        "submitted_at": p.payload.get("submitted_at", ""),
+        "type":         (p.payload or {}).get("type", ""),
+        "tags":         (p.payload or {}).get("tags", []),
+        "project":      (p.payload or {}).get("project", ""),
+        "importance":   (p.payload or {}).get("importance", 3),
+        "groups":       [group_name],
+        "origin_node":  (p.payload or {}).get("origin_node", ""),
+        "submitted_at": (p.payload or {}).get("submitted_at", ""),
     } for p in points]
 
 
 def max_submitted_at_in_group(group_name: str) -> str | None:
-    """Return the highest submitted_at currently stored locally for a group,
-    or None if no entries exist for that group yet.
+    """Return the highest submitted_at currently stored locally for the given
+    group (where the group appears in entry.groups), or None if no entries.
 
     Used by /pull on the local gateway to derive the cursor at sync time
     (no stored cursor state — derived from local Qdrant on every pull).
@@ -799,12 +971,56 @@ def max_submitted_at_in_group(group_name: str) -> str | None:
     points, _ = qdrant.scroll(
         collection_name=COLLECTION,
         scroll_filter=Filter(must=[
-            FieldCondition(key="group_name", match=MatchValue(value=group_name)),
+            FieldCondition(key="groups", match=MatchValue(value=group_name)),
         ]),
         limit=10000, with_payload=["submitted_at"], with_vectors=False,
     )
-    stamps = [p.payload.get("submitted_at") for p in points if p.payload.get("submitted_at")]
+    stamps = [(p.payload or {}).get("submitted_at") for p in points
+              if (p.payload or {}).get("submitted_at")]
     return max(stamps) if stamps else None
+
+
+# ── Legacy v0.3 → v0.4 migration (idempotent, opt-in at daemon startup) ───
+def migrate_legacy_entries(log_=None) -> dict:
+    """Scan the collection for v0.3 entries missing a `groups` payload and
+    backfill it from {source, group_name}. Idempotent — entries already
+    carrying `groups` are left alone. Runs in one pass; safe to call on
+    every daemon startup (no-op once everything is migrated).
+
+    Returns: {scanned, migrated, skipped}.
+    """
+    log_ = log_ or log
+    scanned = migrated = skipped = 0
+    offset  = None
+    while True:
+        try:
+            points, offset = qdrant.scroll(
+                collection_name=COLLECTION,
+                limit=512, offset=offset,
+                with_payload=True, with_vectors=False,
+            )
+        except Exception as e:
+            log_.warning("legacy-migration scroll failed: %s", e)
+            break
+        for p in points:
+            scanned += 1
+            pl = p.payload or {}
+            if isinstance(pl.get("groups"), list) and pl.get("groups"):
+                skipped += 1
+                continue
+            groups = entry_groups(pl)
+            try:
+                qdrant.set_payload(collection_name=COLLECTION,
+                                   payload={"groups": groups}, points=[p.id])
+                migrated += 1
+            except Exception as e:
+                log_.warning("legacy-migration failed for %s: %s", p.id, e)
+        if offset is None:
+            break
+    if migrated:
+        log_.info("legacy-migration: migrated=%d skipped=%d scanned=%d",
+                  migrated, skipped, scanned)
+    return {"scanned": scanned, "migrated": migrated, "skipped": skipped}
 3B2A2906F11A_EOF
 ```
 
@@ -850,11 +1066,16 @@ else:
 indexes = {
     "type":         PayloadSchemaType.KEYWORD,
     "project":      PayloadSchemaType.KEYWORD,
-    "source":       PayloadSchemaType.KEYWORD,
+    "groups":       PayloadSchemaType.KEYWORD,  # v0.4 list-valued routing key
+    "source":       PayloadSchemaType.KEYWORD,  # legacy v0.3, kept for migration
+    "group_name":   PayloadSchemaType.KEYWORD,  # legacy v0.3, kept for migration
     "session_id":   PayloadSchemaType.KEYWORD,
     "content_hash": PayloadSchemaType.KEYWORD,
+    "origin_node":  PayloadSchemaType.KEYWORD,
+    "tags":         PayloadSchemaType.KEYWORD,
     "importance":   PayloadSchemaType.INTEGER,
     "timestamp":    PayloadSchemaType.DATETIME,
+    "submitted_at": PayloadSchemaType.DATETIME,
 }
 for field, schema in indexes.items():
     try:
@@ -996,7 +1217,7 @@ PROJECT=$(basename "$(pwd)")
 nohup $VENV - <<PYEOF >> "$LOG" 2>&1 &
 import sys, asyncio
 sys.path.insert(0, "$HOME/.local/share/mem-fusion")
-import mem_fusion as srv
+import core
 
 async def main():
     path  = """${FILE_PATH}"""
@@ -1005,9 +1226,10 @@ async def main():
     with open(path) as f:
         head = "".join(f.readlines()[:10]).strip()[:300]
     content = f"New file written: {path} ({lines} lines)\n\nHeader:\n{head}"
-    result = await srv.tool_store({
+    result = await core.store_memory({
         "content": content, "type": "code", "project": proj,
         "importance": 3, "tags": ["file-write"],
+        "groups": ["personal"],
     })
     print(f"capture_file_write: {result}")
 
@@ -1185,12 +1407,17 @@ def store_via_api(memories, importance, project):
             (QUEUE_DIR / f"{ts}-{h}.json").write_text(json.dumps(mem))
         return
 
-    import mem_fusion as srv
+    # Hook-captured memories are always personal — they record this peer's
+    # work and should never propagate to teammates without explicit user intent.
+    import core
     stored = 0
     for mem in memories:
         try:
-            r = asyncio.run(srv.tool_store({**mem, "importance": importance, "project": project}))
-            if r.get("status") == "stored":
+            r = asyncio.run(core.store_memory({
+                **mem, "importance": importance, "project": project,
+                "groups": ["personal"],
+            }))
+            if r.get("status") in ("stored", "merged"):
                 stored += 1
         except Exception as e:
             log.error("Store failed: %s — %s", mem["content"][:40], e)
@@ -1431,137 +1658,152 @@ mkdir -p ~/.claude/skills/remember
 cat > ~/.claude/skills/remember/SKILL.md <<'BEA764C561E7_EOF'
 ---
 name: remember
-description: Pin information to persistent memory. Routes behavioral rules and personal preferences to file-based memory (always loaded, never shared); routes knowledge and context to the vector DB (semantically searchable, optionally shared via Constellation).
-trigger: User says "remember this", "remember that", "/remember", or asks Claude to save something for future sessions
+description: Pin information to persistent memory with explicit group-keyed sharing. Default scope is `personal` (local-only). Sharing happens by group tag — never by content classification.
+trigger: User says "remember this", "remember that", "/remember", or asks Claude to save or share something for future sessions
 ---
 
-# /remember — Route to the right memory layer
+# /remember — Store memories with explicit group routing
 
-Two memory stores serve different purposes. `/remember` decides which one the content belongs in and writes it there.
+Every memory carries a `groups` tag that determines who can see it. The default is `personal` (local-only — never leaves this machine). Sharing happens when the user explicitly names a group at store time, or extends the group set after the fact.
 
-| Destination | What goes there | Loaded when | Shared with group? |
-|---|---|---|---|
-| **File-based memory** (`~/.claude/projects/<encoded-cwd>/memory/`) | Behavioral rules, preferences, conventions, meta-instructions about how Claude should act | Always at session start | **Never** |
-| **Vector DB** (`mem-fusion/store_memory`) | Knowledge, decisions, facts, errors, code patterns, contextual observations | On-demand semantic search | **Yes** if Constellation is installed |
+There is no content classification. Routing is by user intent only.
 
-The destination matters for both relevance *and* privacy — behavioral rules are personal and shouldn't propagate to teammates' machines.
+## Command surface
+
+```
+/remember <content>                              → store with groups=[personal]
+/remember <content> for <group>                  → store with groups=[<group>] + push
+/remember <content> for <g1>, <g2>, …            → store with groups=[g1,g2,…] + push each
+/remember push                                   → bulk push every configured group
+/remember push <group>                           → bulk push one group's memories
+/remember pull                                   → bulk pull every configured group
+/remember pull <group>                           → pull one group's peers
+```
+
+Plus the natural-language path Claude handles via reasoning:
+
+| User phrase | Action |
+|---|---|
+| *"share those memories with `<group>`"* | Resolve *those* from session context, call `add_groups(ids, [group])`, then `group_push(group, memory_ids=ids)`. |
+| *"also share them with `<group>`"* | Add the new group, push **only** to that group. Don't re-push prior groups — they already have it. |
+| *"make sure all your groups have these"* | For each group in the memory's `groups` list, call `group_push(group, memory_ids=ids)`. |
 
 ## Protocol
 
 ### 1. Identify what to remember
 
 - If the user specified content explicitly, use that verbatim.
-- If the user said "remember this" without specifying content, summarize the current conversation context into a clear, self-contained statement.
+- If the user said *"remember this"* without specifying content, summarize the current conversation context into a clear, self-contained statement.
 
-### 2. Classify the content
+### 2. Pick the type (decorative, doesn't gate sharing)
 
-**Behavioral rule** — content tells Claude *how to act going forward*. Signals:
-- Starts with "always", "never", "I prefer", "make sure", "don't", "should/shouldn't"
-- Is a personal preference, convention, style choice, or workflow rule
-- Examples: *"I prefer concise responses"*, *"always run tests before commits"*, *"use uv for Python environments"*, *"never push directly to main"*
+Classify into one of: `decision`, `fact`, `preference`, `error`, `code`, `context`. (Don't use `session` — reserved for the Stop hook.) The type is a filter for recall, not a routing key.
 
-**Knowledge** — content describes *facts, decisions, events, or observations*. Signals:
-- Records a project decision, architectural choice, or trade-off
-- Captures an error and its fix, or a stable code pattern
-- Notes a fact about the system, codebase, or environment
-- Examples: *"we picked Postgres 16 for the auth service"*, *"the cache invalidation bug was caused by stale TTLs"*, *"the new SSO endpoint is /v2/sso/init"*
+### 3. Pick the groups
 
-**Ambiguous** — if it could plausibly be either, ask the user:
+- If the user said *"for `<group>`"* (or *"for `<g1>`, `<g2>`"*): use those.
+- Otherwise: `["personal"]`.
 
-> *"Is this a behavioral rule for how I should act (stays local, never shared) — or knowledge to remember and share with your group?"*
+Never invent group names. If the user says *"share with engineering"* and you don't know whether that's `engineering`, `engineering@branch`, or `eng-team`, ask. Cost of asking is low; cost of pushing to the wrong group is a wrong-audience leak.
 
-Don't guess. The cost of asking is low; the cost of mis-routing a personal preference into the vector DB (which then auto-pushes to teammates) is a privacy leak.
-
-### 3a. Behavioral rule → file-based memory
-
-Write a new memory file in your auto-memory directory (the same directory Claude Code loaded `MEMORY.md` from at session start — typically `~/.claude/projects/<encoded-cwd>/memory/`).
-
-**File:** `preference_<kebab-case-slug>.md` in that directory.
-
-**Frontmatter + body:**
-```markdown
----
-name: <short human-readable name>
-description: <one-line summary of when this rule applies>
-type: preference
----
-**Rule:** <the full rule, verbatim or lightly polished>
-
-**Why:** <reason if user gave one; omit if not>
-
-**How to apply:** <when/where this rule kicks in>
-```
-
-**Index:** Add a one-line pointer to the same directory's `MEMORY.md` under an appropriate section (create a `## User preferences` section if none fits):
-
-```markdown
-- [<name>](preference_<slug>.md) — <description>
-```
-
-**Confirm to user:**
-> ✓ Pinned as a behavioral rule in `preference_<slug>.md`.
-> Loads at every session start. Stays local, never shared with the group.
-
-### 3b. Knowledge → vector DB
-
-Classify the memory type from this set: `decision`, `fact`, `error`, `code`, `context`. (Don't use `preference` — that's routed to file-based above. Don't use `session` — that's reserved for the Stop hook.)
+### 4. Store
 
 Call `mem-fusion/store_memory` with:
 - `content`: the content
 - `type`: classified above
 - `importance: 5` (always for `/remember`)
-- `project`: inferred from current conversation context
+- `project`: inferred from current context
 - `tags`: inferred from content topic
+- `groups`: from step 3
 
-If Constellation is installed, also call `mem-fusion/group_push(id=<returned id>)` to share with the group. (If Constellation isn't installed, `group_push` returns `{"error": "constellation_not_installed"}` — that's expected, not an error worth reporting.)
+Returns `{status: "stored"|"merged"|"duplicate", id, groups}`.
 
-**Confirm to user:**
+### 5. Push (only if groups other than `personal` were set)
+
+For each non-`personal` group `G` in the memory's groups, call `mem-fusion/group_push(group=G, memory_ids=[id])`.
+
+This is one call per group. Each call only contacts peers in that group. *"Share with product"* never reaches engineering peers, even if the memory is also tagged engineering.
+
+### 6. Confirm to user
+
+Render per-peer prose. Never dump JSON. Example:
+
 ```
-✓ Stored as <type> (id: <short id>, importance: 5, project: <project>).
-✓ Shared with <group_name>:
-    - <peer>: stored | duplicate
-    - <peer>: unreachable (<reason>)
-```
-
-If Constellation isn't installed, replace the "Shared with" lines with:
-> Local only — Constellation not installed.
-
-## Examples
-
-**Behavioral rule:**
-```
-User:   /remember always use uv for Python environments on this machine
-
-Claude: ✓ Pinned as a behavioral rule in preference_use-uv-for-python.md.
-        Loads at every session start. Stays local, never shared.
+✓ Stored as decision (id: a7e3c2d1, groups: [personal, engineering@branch]).
+✓ Pushed to engineering@branch:
+    - bob-mac:       stored
+    - alice-desktop: stored
+    - carol-laptop:  unreachable (connection refused)
 ```
 
-**Knowledge:**
-```
-User:   /remember we picked Postgres 16 with logical replication for the auth service
+If Constellation isn't installed (`group_push` returns `constellation_not_installed`), say so once and continue — local-only is the safe fallback:
 
-Claude: ✓ Stored as decision (id: a7e3c2d1, importance: 5, project: auth-service).
-        ✓ Shared with engineering@branch:
-            - alice-desktop: stored
-            - bob-mac:       stored
-            - carol-laptop:  unreachable (connection refused)
+```
+✓ Stored as decision (id: a7e3c2d1, groups: [personal, engineering@branch]).
+ℹ Local only — Constellation not installed; the engineering tag is recorded
+   but no peers were notified. Install Constellation to enable sharing.
 ```
 
-**Ambiguous → ask:**
+## The store-now-share-later flow
+
+This is the natural workflow and it's load-bearing for v0.4. When the user reflects after work and decides to share what was just stored:
+
 ```
-User:   /remember the deploy script uses Python 3.12
+User:   "Ok, let's pause and reflect and store the memories."
+Claude: [Stores 4 memories with groups=[personal]]
+        ✓ Stored 4 memories (all groups=[personal]).
+            - decision: gRPC for internal RPC (id: a7e3)
+            - decision: Postgres 16 with logical replication (id: b8f4)
+            - error:    JWT clock-skew fix (id: c9a5)
+            - context:  Auth service migration timeline (id: d0b6)
 
-Claude: Quick check — is this a behavioral rule (always use Python 3.12
-        for the deploy script going forward, stays local) or knowledge
-        (a fact about the current deploy script, shared with your group)?
+User:   "Ok, share those with engineering."
+Claude: [Resolves "those" → the 4 ids just stored]
+        [Calls add_groups(ids, ["engineering@branch"])]
+        [Calls group_push(group="engineering@branch", memory_ids=ids)]
+        ✓ Added engineering@branch to 4 memories.
+        ✓ Pushed to engineering@branch:
+            - bob-mac:       4 stored
+            - alice-desktop: 4 stored
+
+User:   "Oh, also share them with product."
+Claude: [add_groups(ids, ["product@branch"])]
+        [group_push(group="product@branch", memory_ids=ids)]   ← product ONLY
+        ✓ Added product@branch to 4 memories.
+        ✓ Pushed to product@branch:
+            - dave-mac:      4 stored
+            - eve-laptop:    4 stored
+          (Engineering peers not re-contacted.)
 ```
 
-## Mis-routing is costly in one direction, cheap in the other
+**Scope rule:** push only to groups the user named in this turn. Don't iterate the memory's full `groups` list. *"Also share with product"* pushes to product peers only.
 
-- Mis-routing a **behavioral rule** into the vector DB → it auto-pushes to every teammate's machine. Privacy leak.
-- Mis-routing **knowledge** into file-based memory → teammates won't see it. Annoying but recoverable; the user can `/remember` it again as knowledge.
+## Bulk operations
 
-When in doubt, ask.
+- `/remember pull` — `group_pull()` with no group arg. Iterates every configured group with peers. Render per-peer-per-group prose.
+- `/remember pull <group>` — `group_pull(group=<group>)`.
+- `/remember push` — for each configured group with peers, call `group_push(group=<group>)` with no `memory_ids` (bulk push of every entry tagged with that group).
+- `/remember push <group>` — `group_push(group=<group>)` with no `memory_ids`.
+
+After pull, surface specific arrivals the user asks about with `export_record(id)` or `search_recent`.
+
+## What NOT to do
+
+- **Don't classify content to decide where it goes.** Routing is by the explicit `groups` tag, period. If the user didn't name a group, default is `personal`.
+- **Don't push to groups the user didn't name in this turn.** Even if a memory is tagged `[personal, engineering, product]`, *"share with product"* contacts product peers only.
+- **Don't invent group names.** Ask if ambiguous.
+- **Don't dump JSON to the user.** Render per-peer prose.
+- **Don't try to remove a group.** `add_groups` is additive only; subtraction isn't supported in v0.4 (un-sharing is non-trivial in distributed settings — peers already have it).
+
+## Mis-routing cost
+
+Now that routing is explicit, mis-routing is mostly user-caught:
+
+- Mis-naming a group → push lands in wrong audience (or fails forbidden). User notices immediately from the per-peer summary.
+- Defaulting to `personal` when user wanted to share → no harm; user follows up with *"share those with X"*.
+- Adding the wrong group via `add_groups` → can't easily un-share, but the per-peer confirmation surfaces it on the next push.
+
+When in doubt about group names, ask.
 BEA764C561E7_EOF
 ```
 
@@ -1625,11 +1867,23 @@ Print this snippet and instruct the user to paste it into `~/CLAUDE.md` (or a pr
 Connected to a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on localhost).
 **Check this at session start** by calling `memory_stats()` to confirm the system is live.
 
+### Group routing — every memory has a `groups` tag
+
+Every stored memory carries a `groups: list[str]` tag — the routing key for sharing.
+Default is `["personal"]` (local-only, never leaves this machine). Never auto-classify
+content to a group; the user explicitly names the audience or the default holds.
+
+- **Hooks and silent stores**: always use `groups=["personal"]`. Hook-captured memories
+  describe this peer's work and should never propagate without explicit user intent.
+- **`/remember` without an audience clause**: `groups=["personal"]`.
+- **`/remember ... for <group>` (or "share this with <group>")**: tag with that group
+  at store time, then `group_push(group=<group>, memory_ids=[id])`.
+
 ### When to search
 - **Session start**: `search_memory(query="<current task or project name>", top_k=8)`
 - **Before architectural decisions**: search for prior decisions on the same topic
 - **When hitting a recurring error**: search for prior resolutions
-- **When unsure about a user preference**: search type="preference"
+- **When unsure about a user preference**: search `type="preference"`
 
 ### When to store
 - **Decision made**: `store_memory(content, type="decision", importance=4, project="<name>")`
@@ -1641,16 +1895,21 @@ Connected to a local `mem-fusion` MCP server (Qdrant + nomic-embed-text on local
 ### What NOT to store
 Trivial facts, transient state, things derivable from code or `git log`.
 
-### Memory types
+### Memory types (decorative; doesn't gate sharing)
 `decision` · `fact` · `preference` · `error` · `code` · `context` · `session`
 
 ### Available tools
 `store_memory` · `search_memory` · `search_recent` · `upsert_memory` ·
-`find_or_create` · `delete_memory` · `get_related` · `memory_stats` · `export_record`
+`find_or_create` · `delete_memory` · `get_related` · `memory_stats` ·
+`export_record` · `add_groups`
+
+`add_groups(memory_ids, groups)` retroactively widens a memory's group set —
+use for the store-now-share-later flow (user says "share those with X"
+after the fact). Additive only; un-sharing isn't supported.
 
 ### Verification rule
-Memories are point-in-time observations. Before recommending a file/function/flag named in
-a memory, verify it still exists in the current code.
+Memories are point-in-time observations. Before recommending a file / function / flag
+named in a memory, verify it still exists in the current code.
 ```
 
 ---

@@ -3,7 +3,9 @@
 # build_install.sh — assemble the distribution INSTALL files from templates.
 #
 # Reads src/templates/INSTALL_MEM_FUSION.tmpl and INSTALL_CONSTELLATION.tmpl,
-# expands the three INCLUDE directives, writes the built artifacts at repo root.
+# expands the three INCLUDE directives, writes the built artifacts to the
+# output dir (positional arg 1; defaults to repo root for normal use, override
+# with a tempdir for staleness tests).
 #
 # Directive forms:
 #   <!-- INCLUDE: <src> AS <dest> -->            verbatim heredoc, quoted (no shell expansion)
@@ -14,6 +16,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 TEMPLATES="$ROOT/src/templates"
+OUT_DIR="${1:-$ROOT}"
+[[ -d "$OUT_DIR" ]] || { echo "ERROR: output dir does not exist: $OUT_DIR" >&2; exit 1; }
 
 emit_heredoc() {
     # $1 = directive (INCLUDE | INCLUDE_EXEC | INCLUDE_TEMPLATED)
@@ -82,8 +86,9 @@ build_one() {
 }
 
 echo "→ building from $TEMPLATES"
+echo "→ output dir   $OUT_DIR"
 
-build_one "$TEMPLATES/INSTALL_MEM_FUSION.tmpl"    "$ROOT/INSTALL_MEM_FUSION.md"
-build_one "$TEMPLATES/INSTALL_CONSTELLATION.tmpl" "$ROOT/INSTALL_CONSTELLATION.md"
+build_one "$TEMPLATES/INSTALL_MEM_FUSION.tmpl"    "$OUT_DIR/INSTALL_MEM_FUSION.md"
+build_one "$TEMPLATES/INSTALL_CONSTELLATION.tmpl" "$OUT_DIR/INSTALL_CONSTELLATION.md"
 
 echo "→ done"

@@ -5,11 +5,11 @@ VENV="$HOME/.local/share/mem-fusion/venv/bin/python"
 $VENV - <<PYEOF
 import sys, asyncio
 sys.path.insert(0, "$HOME/.local/share/mem-fusion")
-import mem_fusion as srv
+import core
 
 async def main():
-    recent = await srv.tool_search_recent({"hours": 48, "top_k": 5})
-    stats  = await srv.tool_stats({})
+    recent = await core.search_recent({"hours": 48, "top_k": 5})
+    stats  = await core.memory_stats({})
     total  = stats.get("total_memories", 0)
     last   = stats.get("last_stored", "none")
 

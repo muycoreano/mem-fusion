@@ -11,7 +11,7 @@ PROMPT=$(cat)
 $VENV - <<PYEOF
 import sys, asyncio, os
 sys.path.insert(0, "$HOME/.local/share/mem-fusion")
-import mem_fusion as srv
+import core
 
 PROMPT    = """${PROMPT//\"/\\\"}"""
 SEEN_FILE = """${SEEN_FILE}"""
@@ -26,7 +26,7 @@ async def main():
     except FileNotFoundError:
         pass
 
-    result = await srv.tool_search({"query": PROMPT, "top_k": 5, "min_importance": 2})
+    result = await core.search_memory({"query": PROMPT, "top_k": 5, "min_importance": 2})
     hits = [r for r in result.get("results", [])
             if r["score"] >= MIN_SCORE and r["id"] not in seen_ids]
     if not hits:

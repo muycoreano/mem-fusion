@@ -21,7 +21,8 @@ tests/
 ├── hooks/
 │   └── test-hooks.py                 ← compile-check + end-to-end smoke for all 4 Claude Code hooks against a fake $HOME (1 Qdrant)
 └── installer/
-    └── test-installers.sh            ← staleness + bash-syntax check on INSTALL_*.md (no subprocesses; pure docs pipeline)
+    ├── test-installers.sh            ← staleness + bash-syntax check on INSTALL_*.md (no subprocesses; pure docs pipeline)
+    └── test-smoke-test.py            ← end-to-end run of the install-path smoke-test.sh against a tempdir Qdrant + fake $HOME
 ```
 
 ## What each test exercises
@@ -37,6 +38,7 @@ tests/
 | `test-pull-push.py` | Two daemons talking real HTTP: push fan-out, push idempotency, pull dedup, pull-privacy (personal-only memories stay local), pull catch-up after a drop, push-time group filter on the wire. |
 | `test-installers.sh` | Build pipeline staleness check: rebuilds `INSTALL_MEM_FUSION.md` and `INSTALL_CONSTELLATION.md` from templates into a tempdir, diffs against the committed copies, then runs `bash -n` over every \`\`\`bash code block in the generated docs. Catches "forgot to rebuild after editing templates" and busted shell. |
 | `test-hooks.py` | All four Claude Code hooks exercised end-to-end against a fake `$HOME` staged with the mem-fusion-shaped layout (real shell → Python → core chain). Compile-checks every hook (`bash -n` / `py_compile`), runs SessionStart snapshot, UserPromptSubmit injection (matching + short + unrelated prompts), PostToolUse:Write code capture, and Stop hook session ingest including idempotent dedup. Catches the `srv.tool_*`-class regression that ships symbol references but never exercises the actual import chain. |
+| `test-smoke-test.py` | End-to-end run of `src/scripts/smoke-test.sh` (INSTALL_MEM_FUSION.md Step 14's final go/no-go check) against a tempdir Qdrant + staged fake `$HOME`. Verifies STORE / SEARCH / STATS succeed, the stored memory lands in Qdrant with `groups=[personal]`, and stdout/stderr contain no `AttributeError`, `ImportError`, or `command not found`. Same regression class as `test-hooks.py` but covering the install-time smoke runner specifically. |
 
 ## Run
 
@@ -49,6 +51,7 @@ tests/
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-directory.py
 ~/.local/share/cowork-memory/venv/bin/python tests/constellation/test-pull-push.py
 ~/.local/share/cowork-memory/venv/bin/python tests/hooks/test-hooks.py
+~/.local/share/cowork-memory/venv/bin/python tests/installer/test-smoke-test.py
 tests/installer/test-installers.sh
 ```
 
@@ -72,6 +75,7 @@ Each prints a per-step trace and a final `N/N invariants passed` line followed b
 | `test-offline-rejoin.py` (bob)          | 6553 | 7553 | 7554 |
 | `test-offline-rejoin.py` (carol)        | 6563 | 7563 | 7564 |
 | `test-hooks.py`                          | 6753 | — | — |
+| `test-smoke-test.py`                     | 6783 | — | — |
 
 If a test crashes mid-run, the subprocess may linger and hold its port. `lsof -nP -iTCP:<port> -t | xargs kill` clears it.
 

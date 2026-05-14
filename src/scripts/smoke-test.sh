@@ -1,10 +1,23 @@
 #!/usr/bin/env bash
+# Defaults match a standard install; tests override these to point at a
+# tempdir-scoped Qdrant. core.py inside the heredoc honors QDRANT_URL/OLLAMA_URL
+# the same way (module-level os.getenv with the same defaults).
 set -e
-launchctl list | grep -E "com.branchapp.memfusion" | head
-curl -s http://127.0.0.1:6333/healthz
-curl -s http://127.0.0.1:11434/api/tags | python3 -c "import sys,json; print('Ollama models:', [m['name'] for m in json.load(sys.stdin)['models']])"
+QDRANT_URL="${QDRANT_URL:-http://127.0.0.1:6333}"
+OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
 
-claude mcp list | grep mem-fusion
+launchctl list | grep -E "com.branchapp.memfusion" | head
+curl -s "$QDRANT_URL/healthz"
+curl -s "$OLLAMA_URL/api/tags" | python3 -c "import sys,json; print('Ollama models:', [m['name'] for m in json.load(sys.stdin)['models']])"
+
+# Best-effort MCP-registration check. Skipped in environments where the
+# claude CLI isn't installed (CI, tests); demoted to a warning if mem-fusion
+# isn't yet registered (which is the case during partial installs).
+if command -v claude >/dev/null 2>&1; then
+    claude mcp list | grep mem-fusion || echo "WARN: mem-fusion not registered with claude CLI"
+else
+    echo "WARN: claude CLI not found; skipping MCP registration check"
+fi
 
 ~/.local/share/mem-fusion/venv/bin/python - <<'PYEOF'
 import asyncio, sys

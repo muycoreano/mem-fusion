@@ -48,7 +48,7 @@ PEER_B = {
 
 
 def run_tests(mcp_a: harness.MCPClient, mcp_b: harness.MCPClient,
-              passed: list) -> None:
+              passed: list, tmp: pathlib.Path) -> None:
     # ── Init both MCP servers ───────────────────────────────────────────
     print("\nSTEP 3: MCP handshake on both mem-fusion subprocesses")
     harness.mcp_initialize(mcp_a, client_name="roundtrip-test-alice")
@@ -97,6 +97,32 @@ def run_tests(mcp_a: harness.MCPClient, mcp_b: harness.MCPClient,
                                     "gRPC" in top["content"]))
         passed.append(harness.check(f"bob search: meaningful score (got {top['score']})",
                                     top["score"] > 0.5))
+
+    # ── Hook firing: prompt_memory_inject.sh against Bob's install ─────────
+    # Bob now has the gRPC memory locally (received via Alice's push). When
+    # Claude Code fires the UserPromptSubmit hook with a related prompt, the
+    # hook should embed the prompt, search Bob's Qdrant, and inject the
+    # matching memory. We simulate that by running the actual hook script
+    # against a fake $HOME staged with Bob's Qdrant port.
+    print("\nSTEP 6b: prompt_memory_inject.sh fires correctly against bob's install")
+    (tmp / "bob-hook-home").mkdir(exist_ok=True)
+    bob_home = harness.stage_mem_fusion_home(tmp / "bob-hook-home")
+    rc, hook_out, hook_err = harness.run_hook(
+        bob_home / ".local/share/mem-fusion/scripts/prompt_memory_inject.sh",
+        fake_home=bob_home, qdrant_port=PEER_B["qdrant_port"],
+        stdin="What did we pick for internal RPC?",
+    )
+    passed.append(harness.check("bob hook: exit 0",
+                                rc == 0, f"stderr: {hook_err[:200]}"))
+    passed.append(harness.check("bob hook: <memory_context> emitted",
+                                "<memory_context>" in hook_out,
+                                f"out: {hook_out[:200]!r}"))
+    passed.append(harness.check("bob hook: injection includes gRPC",
+                                "gRPC" in hook_out,
+                                f"out: {hook_out[:300]!r}"))
+    passed.append(harness.check("bob hook: no AttributeError in stderr",
+                                "AttributeError" not in hook_err,
+                                f"stderr: {hook_err[:300]}"))
 
     # ── B → A: store-then-share (v0.4 store-now-share-later path) ───────
     print("\nSTEP 7: Bob stores a personal-only memory, then shares it via add_groups + push")
@@ -281,7 +307,7 @@ def main():
             mcp_b = harness.MCPClient(mcp_b_proc)
 
             passed = []
-            run_tests(mcp_a, mcp_b, passed)
+            run_tests(mcp_a, mcp_b, passed, tmp)
 
             ok, total = sum(passed), len(passed)
             print(f"\n  {ok}/{total} invariants passed")

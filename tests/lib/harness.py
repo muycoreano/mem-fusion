@@ -192,6 +192,58 @@ def stop_proc(proc: subprocess.Popen | None, timeout_s: float = 3.0) -> None:
         proc.kill()
 
 
+# ── Fake-HOME staging for hook-script tests ───────────────────────────────
+def stage_mem_fusion_home(parent: pathlib.Path) -> pathlib.Path:
+    """Build a $HOME-shaped layout under `parent/fake_home` so hook scripts
+    (which hardcode $HOME/.local/share/mem-fusion/...) can run in isolation.
+
+    Returns the staged HOME path. Inside it:
+      $HOME/.local/share/mem-fusion/core.py        ← copy from src/
+      $HOME/.local/share/mem-fusion/mem_fusion.py  ← copy from src/
+      $HOME/.local/share/mem-fusion/scripts/*      ← copy from src/scripts/
+      $HOME/.local/share/mem-fusion/venv           ← symlink to shared test venv
+      $HOME/.local/share/mem-fusion/{queue,logs}   ← mkdir
+      $HOME/.claude/sessions/                       ← mkdir (used by Stop hook)
+    """
+    home = parent / "fake_home"
+    mf   = home / ".local/share/mem-fusion"
+    mf.mkdir(parents=True)
+    (mf / "scripts").mkdir()
+    (mf / "queue").mkdir()
+    (mf / "logs").mkdir()
+    (home / ".claude/sessions").mkdir(parents=True)
+
+    for fname in ("core.py", "mem_fusion.py"):
+        (mf / fname).write_bytes((REPO_ROOT / "src" / fname).read_bytes())
+    for src in (REPO_ROOT / "src/scripts").glob("*"):
+        if not src.is_file():
+            continue
+        dst = mf / "scripts" / src.name
+        dst.write_bytes(src.read_bytes())
+        dst.chmod(0o755)
+
+    venv_src = pathlib.Path.home() / ".local/share/cowork-memory/venv"
+    (mf / "venv").symlink_to(venv_src)
+    return home
+
+
+def run_hook(script_path: pathlib.Path, *,
+             fake_home: pathlib.Path, qdrant_port: int,
+             stdin: str = "", env_extra: dict | None = None,
+             timeout_s: float = 30.0) -> tuple[int, str, str]:
+    """Run a hook script in a fake-HOME subprocess. Returns (rc, stdout, stderr)."""
+    env = os.environ.copy()
+    env["HOME"] = str(fake_home)
+    env["QDRANT_URL"] = f"http://127.0.0.1:{qdrant_port}"
+    if env_extra:
+        env.update(env_extra)
+    proc = subprocess.run(
+        [str(script_path)], input=stdin, env=env,
+        capture_output=True, text=True, timeout=timeout_s,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 # ── Mem-Fusion MCP subprocess + JSON-RPC client ───────────────────────────
 def start_mem_fusion(qdrant_port: int, stderr_path: pathlib.Path,
                      *, gateway_url: str | None = None,

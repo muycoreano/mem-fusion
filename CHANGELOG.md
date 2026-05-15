@@ -17,11 +17,20 @@ v0.5 expands Constellation into a pluggable-driver architecture so peer transpor
 - **Bare `/remember push` (no argument) now pushes the `personal` group only.** Equivalent to `/remember push personal`. This is the **privacy invariant**: non-personal groups never propagate without explicit naming. Previously bare `/remember push` was documented as a bulk push across every configured group — a privacy footgun if a memory happened to be tagged with multiple groups. (WP-1)
 - **`/remember` skill description and routing-rule wording** updated consistently in `src/skills/remember/SKILL.md` to reflect the new semantics. Hook-captured memories remain local-only by design — hooks call `store_memory` directly without triggering the auto-push flow, even when `personal` has peers.
 
+### Added
+
+- **`src/scripts/fixes/` directory** — incremental, deployable bug-fix scripts that Claude runs on instruction to remediate issues on an installed peer. Each fix is idempotent, self-contained, and named `<version>-<sequence>-<description>.sh` for deterministic ordering. See [`src/scripts/fixes/README.md`](src/scripts/fixes/README.md) for the pattern. (WP-4 substrate)
+
+### Fixed
+
+- **Qdrant `$HOME` literal expansion bug** (script: [`src/scripts/fixes/0.5.0-001-fix-qdrant-home-path.sh`](src/scripts/fixes/0.5.0-001-fix-qdrant-home-path.sh)). Qdrant does NOT expand environment variables in YAML config; earlier qdrant-config.yaml used `storage_path: $HOME/...` which Qdrant interpreted literally, creating a directory named `$HOME` inside the install location. Functionally harmless but ugly and confusing for backup. The fix script: stops Qdrant, migrates the misplaced data tree to the intended location, cleans up the literal `$HOME` placeholder, patches the deployed YAML to use the absolute path, and restarts. Idempotent. (WP-4)
+
 ### Notes
 
 - `/remember pull` semantics are unchanged. Pull is read-only inbound; the privacy invariant exists to protect outbound sharing.
 - Daemon code is unchanged in this commit — the fix is purely in the Claude-facing skill rules.
 - VERSION in `src/constellation.py` bumped from `0.4.0-alpha` to `0.5.0-alpha`. All v0.5 work targets the `v0.5` branch; `main` remains at the v0.4 line.
+- The source `src/config/qdrant-config.yaml` still contains `$HOME` — fixing it there is part of WP-2 (install.sh), which will template the YAML the same way the launchd plist is currently templated. Until WP-2 lands, the WP-4 migration script is what fixes installed peers in place.
 
 ---
 

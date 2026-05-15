@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] — v0.5.0 (current on `v0.5` branch)
+
+v0.5 expands Constellation into a pluggable-driver architecture so peer transports beyond HTTP (Slack, S3, etc.) can be wired in without changing the user-facing push/pull surface, replaces the paste-into-Claude install flow with a proper `install.sh`, and corrects the `/remember` autopush semantics around the `personal` group. Pre-alpha — work in progress on the `v0.5` branch.
+
+### Changed
+
+- **`/remember` autopush now triggers for any group with configured peers, including `personal`.** Previously the skill only auto-pushed when groups other than `personal` were named — which broke cross-machine personal sync (same user, multiple Macs): `personal`-tagged memories never propagated despite peers being configured. The skill now calls `group_push(group=G, memory_ids=[id])` for every group `G` in the memory's `groups` list that has peers in the local Constellation config. (WP-1)
+- **Bare `/remember push` (no argument) now pushes the `personal` group only.** Equivalent to `/remember push personal`. This is the **privacy invariant**: non-personal groups never propagate without explicit naming. Previously bare `/remember push` was documented as a bulk push across every configured group — a privacy footgun if a memory happened to be tagged with multiple groups. (WP-1)
+- **`/remember` skill description and routing-rule wording** updated consistently in `src/skills/remember/SKILL.md` to reflect the new semantics. Hook-captured memories remain local-only by design — hooks call `store_memory` directly without triggering the auto-push flow, even when `personal` has peers.
+
+### Notes
+
+- `/remember pull` semantics are unchanged. Pull is read-only inbound; the privacy invariant exists to protect outbound sharing.
+- Daemon code is unchanged in this commit — the fix is purely in the Claude-facing skill rules.
+- VERSION in `src/constellation.py` bumped from `0.4.0-alpha` to `0.5.0-alpha`. All v0.5 work targets the `v0.5` branch; `main` remains at the v0.4 line.
+
+---
+
 ## [Unreleased] — v0.4.0 (current on `main`)
 
 v0.4 is a routing-model simplification of v0.3 — same two-process architecture, same Qdrant collection, same MCP transport — but the dual-store / content-classification approach is replaced by **explicit group-keyed sharing**. Every memory carries a `groups: list[str]` payload; the default is `["personal"]` (local-only). Sharing happens when the user explicitly names a group. There is no longer any heuristic that tries to guess whether a memory should leave the machine.

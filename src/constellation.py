@@ -54,7 +54,7 @@ from qdrant_client.models import (
 import core
 
 
-VERSION          = "0.4.0-alpha"
+VERSION          = "0.5.0-alpha"
 DAEMON_NAME      = "constellation"
 SCROLL_PAGE_SIZE = 256
 PEER_HTTP_TIMEOUT = 10.0

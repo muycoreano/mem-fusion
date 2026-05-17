@@ -10,8 +10,15 @@ Functions return plain dicts; transport-specific serialization (MCP JSON,
 HTTP JSON, etc.) is the caller's responsibility.
 
 If Ollama is unreachable when embedding is required, returns
-{"error": "ollama_unreachable", "detail": ...}. Callers surface the error.
-No silent queueing.
+{"error": "ollama_unreachable", "detail": ...}. If Ollama is reachable but
+rejects the input (e.g., HTTP 500 because the content exceeds the model's
+context window), returns {"error": "embed_failed", "reason": ...}. Other
+unexpected failures return {"error": "embed_unexpected", ...}. Callers
+surface the error verbatim. No silent queueing.
+
+Inputs exceeding EMBED_MAX_CHARS are soft-truncated before embedding; the
+caller's stored payload retains the full content, only the vector is
+derived from the truncated text.
 """
 import hashlib
 import json
@@ -36,6 +43,10 @@ OLLAMA_URL  = os.getenv("OLLAMA_URL",  "http://127.0.0.1:11434")
 COLLECTION  = "cowork_memories"
 EMBED_MODEL = "nomic-embed-text"
 VECTOR_SIZE = 768
+# nomic-embed-text has a ~2048-token context window. ~8000 chars is the
+# practical char-equivalent ceiling; inputs beyond this are soft-truncated
+# before embedding (the full content is preserved in the stored payload).
+EMBED_MAX_CHARS = 8000
 
 CONSTELLATION_CONFIG_PATH = Path(os.getenv(
     "MEMFUSION_CONSTELLATION_CONFIG",
@@ -124,17 +135,52 @@ def iso_now() -> str:
 
 
 # ── Embedding (Ollama) ─────────────────────────────────────────────────────
-async def embed(text: str) -> list[float] | None:
-    """Generate a 768-dim vector via local Ollama. Returns None on failure."""
+async def embed(text: str) -> list[float] | dict:
+    """Generate a 768-dim vector via local Ollama.
+
+    Returns either:
+      list[float]                          — embedding on success
+      {"error": "ollama_unreachable",  …}  — connection failure (Ollama down)
+      {"error": "embed_failed",        …}  — Ollama returned non-200 (e.g., 500
+                                             for input exceeding context length)
+      {"error": "embed_unexpected",    …}  — malformed response or other failure
+
+    Soft-truncates text to EMBED_MAX_CHARS before sending. Caller preserves
+    the full content in storage; only the embedding is derived from the
+    truncated text.
+    """
+    embed_text = text[:EMBED_MAX_CHARS] if len(text) > EMBED_MAX_CHARS else text
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             r = await client.post(f"{OLLAMA_URL}/api/embeddings",
-                                  json={"model": EMBED_MODEL, "prompt": text})
-            r.raise_for_status()
-            return r.json()["embedding"]
+                                  json={"model": EMBED_MODEL, "prompt": embed_text})
+            if r.status_code != 200:
+                try:
+                    reason = r.json().get("error") or r.text[:200]
+                except Exception:
+                    reason = r.text[:200]
+                log.error("embed failed: HTTP %d — %s", r.status_code, reason)
+                return {"error": "embed_failed",
+                        "detail": f"Ollama returned HTTP {r.status_code}",
+                        "reason": reason or "unknown",
+                        "status_code": r.status_code}
+            data = r.json()
+            if "embedding" not in data:
+                log.error("embed: unexpected response shape: %s", str(data)[:200])
+                return {"error": "embed_unexpected",
+                        "detail": "Ollama response missing 'embedding' field",
+                        "reason": str(data)[:200]}
+            return data["embedding"]
+    except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as e:
+        log.error("embed: ollama unreachable — %s", e)
+        return {"error": "ollama_unreachable",
+                "detail": f"Cannot reach Ollama at {OLLAMA_URL}",
+                "reason": str(e)}
     except Exception as e:
-        log.error("embed failed: %s", e)
-        return None
+        log.error("embed: unexpected error — %s", e)
+        return {"error": "embed_unexpected",
+                "detail": "Unexpected error during embedding",
+                "reason": str(e)}
 
 
 # ── Qdrant filter helpers ─────────────────────────────────────────────────
@@ -242,7 +288,9 @@ async def store_memory(args: dict) -> dict:
        {status: "stored",    id, groups} — fresh content stored
        {status: "merged",    id, groups} — content_hash hit; groups widened
        {status: "duplicate", id, groups} — content_hash hit; nothing changed
-       {error: "ollama_unreachable"}     — embed failed; caller surfaces error
+       {error: <class>, detail, ...}     — embed failed; caller surfaces error
+                                           (class is one of ollama_unreachable,
+                                           embed_failed, embed_unexpected)
     """
     content    = args["content"]
     type_      = args["type"]
@@ -265,9 +313,8 @@ async def store_memory(args: dict) -> dict:
         return {"status": "merged", "id": existing_id, "groups": merged}
 
     vec = await embed(content)
-    if vec is None:
-        return {"error": "ollama_unreachable",
-                "detail": "Local Ollama did not respond; cannot embed. Verify Ollama is running."}
+    if isinstance(vec, dict):
+        return vec  # error from embed() — propagate verbatim (preserves error class)
 
     point_id = str(uuid.uuid4())
     ts       = iso_now()
@@ -337,9 +384,8 @@ async def search_memory(args: dict) -> dict:
     min_importance = int(args.get("min_importance", 1))
 
     vec = await embed(query)
-    if vec is None:
-        return {"error": "ollama_unreachable",
-                "detail": "Local Ollama did not respond; cannot perform semantic search."}
+    if isinstance(vec, dict):
+        return vec  # error from embed() — propagate verbatim
 
     filt = build_filter(project=project, type_=type_, since=since, min_importance=min_importance)
     hits = qdrant.search(collection_name=COLLECTION, query_vector=vec,
@@ -381,9 +427,8 @@ async def upsert_memory(args: dict) -> dict:
     importance = args.get("importance")
 
     vec = await embed(content)
-    if vec is None:
-        return {"error": "ollama_unreachable",
-                "detail": "Local Ollama did not respond; cannot re-embed for upsert."}
+    if isinstance(vec, dict):
+        return vec  # error from embed() — propagate verbatim
 
     existing = qdrant.retrieve(collection_name=COLLECTION, ids=[memory_id], with_payload=True)
     if not existing:
@@ -414,9 +459,8 @@ async def find_or_create(args: dict) -> dict:
     groups     = normalize_groups_arg(args.get("groups"))
 
     vec = await embed(content)
-    if vec is None:
-        return {"error": "ollama_unreachable",
-                "detail": "Local Ollama did not respond; cannot embed for find_or_create."}
+    if isinstance(vec, dict):
+        return vec  # error from embed() — propagate verbatim
 
     hits = qdrant.search(collection_name=COLLECTION, query_vector=vec, limit=1, with_payload=True)
     if hits and hits[0].score > 0.82:

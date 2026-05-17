@@ -83,6 +83,10 @@ def _resolve_node_name() -> str:
     return socket.gethostname()
 
 
+# NODE_NAME snapshot at module-load time — preserved for diagnostics and
+# back-compat. WRITE PATHS (store_memory, find_or_create, etc.) MUST call
+# _resolve_node_name() on every store so a freshly-installed Constellation
+# config takes effect without restarting the MCP server. See fix 0.5.0-012.
 NODE_NAME = _resolve_node_name()
 
 DEFAULT_GROUPS = ["personal"]
@@ -350,7 +354,7 @@ async def store_memory(args: dict) -> dict:
             "content": content, "type": type_, "tags": tags, "project": project,
             "importance": importance, "session_id": session_id,
             "content_hash": chash, "timestamp": ts,
-            "groups": groups, "origin_node": NODE_NAME, "submitted_at": ts,
+            "groups": groups, "origin_node": _resolve_node_name(), "submitted_at": ts,
         },
     )])
     return {"status": "stored", "id": point_id, "groups": groups}
@@ -511,7 +515,7 @@ async def find_or_create(args: dict) -> dict:
             "content": content, "type": type_, "tags": tags, "project": project,
             "importance": importance, "content_hash": chash,
             "timestamp": ts, "groups": groups,
-            "origin_node": NODE_NAME, "submitted_at": ts,
+            "origin_node": _resolve_node_name(), "submitted_at": ts,
         },
     )])
     return {"status": "created", "id": point_id, "groups": groups}
@@ -591,7 +595,7 @@ async def export_record(args: dict) -> dict:
         "session_id":   pl.get("session_id", ""),
         "timestamp":    pl.get("timestamp", ""),
         "groups":       entry_groups(pl),
-        "origin_node":  pl.get("origin_node", NODE_NAME),
+        "origin_node":  pl.get("origin_node", _resolve_node_name()),
         "submitted_at": pl.get("submitted_at", pl.get("timestamp", "")),
     }
 

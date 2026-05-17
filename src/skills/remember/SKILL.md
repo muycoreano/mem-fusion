@@ -14,9 +14,35 @@ This applies to autonomous decisions (deciding *whether* to remember something) 
 
 Every memory carries a `groups` tag that determines who can see it. The default is `personal` — local to this machine unless your `personal` membership has configured peers (cross-machine sync to your own other machines). Sharing with non-personal audiences happens only when you explicitly name a group at store time, or extend the group set after the fact.
 
-**Privacy invariant (load-bearing):** non-personal groups never propagate without explicit naming. Bare `/remember push` defaults to `personal` only — fanning out to team groups requires naming them.
+**Privacy invariant (load-bearing):** non-personal connectors and groups never propagate without explicit naming. Bare `/remember push` defaults to `personal` only — fanning out to team groups or pushing through a connector requires naming the target explicitly.
 
 There is no content classification. Routing is by user intent only.
+
+## v0.5: Connector dispatch
+
+Mem-fusion v0.5 adds **connectors** alongside the v0.4 group/peer model. A connector is a declared bridge between local mem-fusion and a productivity-tool destination (`slack` in v0.5; future: `gdrive`, `teams`, `discord`, `notion`). Connectors live in `~/.local/share/mem-fusion/connector.json`:
+
+```json
+{"connectors": [{"id": "engineering", "type": "slack", "channel": "mem_fusion_engineering"}]}
+```
+
+Memories may carry a `connector_ids: list[str]` field marking them eligible for push through named connectors. `/remember <content> for <connector-id>` stores the memory tagged with that connector and pushes immediately. Full wire format and dispatch contract: `docs/v0.5_CONNECTOR_ARCHITECTURE.md`.
+
+### Name resolution for `/remember push|pull <name>`
+
+The skill resolves `<name>` in this order:
+
+1. **Connector match** — look up `<name>` in `connector.json` connectors. If found → connector flow: format wire payload per the architecture doc, call `slack_send_message` / `slack_read_channel` MCP tools directly. There is no `connector_push` MCP tool; orchestration happens in this skill.
+2. **Constellation group match** *(transitional)* — look up `<name>` in `~/.local/share/mem-fusion/constellation/config.json` memberships. If found → existing `group_push` / `group_pull` MCP tools.
+3. **Neither** — error: *"no connector or group named `<name>`; declare in connector.json or check Constellation config."*
+
+Connector wins on collision: if a name appears in both files, v0.5 routing takes precedence.
+
+### What connectors don't do
+
+- **No daemon, no new MCP tool, no inbound network surface.** Connectors run entirely in Claude's process using existing Slack MCP tools.
+- **No `personal` fallback through a connector.** Cross-machine personal sync is achieved by declaring a private connector (e.g., `{"id": "personal-devices", "type": "slack", "channel": "mem_fusion_<userhandle>_devices"}`) and naming it explicitly. There is no `personal` pseudo-connector.
+- **No auto-push on bare `/remember <content>`.** The default is local-only. Use `for <name>` (connector or group) to propagate.
 
 ## Command surface
 

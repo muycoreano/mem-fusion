@@ -530,16 +530,21 @@ class GatewayHandler(_BaseHandler):
         for membership in memberships_to_pull:
             group_name = membership["group_name"]
             peers      = membership["peers"]
-            cursor     = core.max_submitted_at_in_group(group_name)
-            log.info("PULL start: group=%s cursor=%s peers=%d",
-                     group_name, cursor or "-", len(peers))
+            # NOTE (fix 0.5.0-013): cursor model dropped. The previous
+            # max(submitted_at)-in-group cursor was correctness-broken — it
+            # filtered out back-filled entries whose submitted_at fell below
+            # our local max (e.g., peer Y's older memory propagating through
+            # relay X after our last pull). Each pull now full-scans the
+            # peer's group; receiver-side content_hash dedup (in
+            # _merge_pulled below) handles efficiency. Revisit if any group
+            # exceeds ~50K entries.
+            log.info("PULL start: group=%s peers=%d (full-scan, no cursor)",
+                     group_name, len(peers))
 
             for peer in peers:
                 r = {"node_name": peer["node_name"], "group_name": group_name}
                 try:
                     params = {"group_name": group_name}
-                    if cursor:
-                        params["cursor"] = cursor
                     resp = httpx.get(f"{peer['endpoint']}/memory/since",
                                      params=params, timeout=PEER_HTTP_TIMEOUT)
                     if resp.status_code != HTTP_OK:

@@ -603,30 +603,42 @@ async def export_record(args: dict) -> dict:
 # ── Group pull primitive ───────────────────────────────────────────────────
 def get_entries_for_pull(group_name: str,
                          cursor_iso: str | None,
-                         limit: int = 256) -> list[dict]:
-    """Return entries where `group_name` ∈ entry.groups and submitted_at > cursor.
+                         limit: int = 10000) -> list[dict]:
+    """Return ALL entries where `group_name` ∈ entry.groups (cursor ignored).
 
     Used by constellation's GET /memory/since endpoint to answer pull queries
-    from other peers. Filters on submitted_at — the originating peer's
-    timestamp, which is global across the group — so cursors are comparable
-    no matter which peer answers the query.
+    from other peers. Returns full memory records (including vector) so the
+    requesting peer can insert them locally without a follow-up fetch and
+    without re-embedding.
+
+    HISTORY: pre-0.5.0-013, this function filtered by `submitted_at > cursor`
+    to limit response size to "new" entries. That cursor model was incorrect:
+    `submitted_at` is the originating peer's timestamp, but a back-fill
+    scenario where peer Y's older memory arrives at relay X after our last
+    pull would have `submitted_at` BELOW our cursor — and the filter would
+    silently exclude it. The bug manifested as tk421 missing 75 memories
+    despite "successful" pulls. Fix shape: drop the cursor filter; rely on
+    receiver-side content_hash dedup (already in place in /memory/put and
+    in Constellation's _merge_pulled). Cost: each pull is now O(group_size)
+    bytes on the wire. At current scale (<10K entries per group) this is
+    sub-100ms transfer + parse; revisit if Constellation scales past 50K
+    entries per group, at which point per-origin cursor or a bloom-filter
+    "what I already have" exchange becomes worthwhile.
+
+    The `cursor_iso` parameter is preserved for wire-format back-compat with
+    older clients that still send it; it is ignored server-side.
 
     Each /memory/since call answers for a single group; the wire-shape's
     `groups` field carries only the requested group. Multi-group entries
     get reconstructed on the caller's side via additive dedup-merge when
     the caller pulls other groups.
-
-    Returns full memory records (including vector) so the requesting peer can
-    insert them locally without a follow-up fetch and without re-embedding.
     """
+    # cursor_iso intentionally unused — see docstring "HISTORY" note.
+    _ = cursor_iso  # explicit silencer for linters
+
     conditions = [
         FieldCondition(key="groups", match=MatchValue(value=group_name)),
     ]
-    if cursor_iso:
-        conditions.append(FieldCondition(
-            key="submitted_at",
-            range=DatetimeRange(gt=datetime.fromisoformat(cursor_iso)),
-        ))
 
     points, _ = qdrant.scroll(
         collection_name=COLLECTION,

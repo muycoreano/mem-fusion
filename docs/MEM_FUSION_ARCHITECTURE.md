@@ -1,8 +1,8 @@
 # Mem-Fusion v0.3.0 — Architecture
 
-> **⚠ Superseded by v0.4** — The routing model described below (dual-store classification: file-based behaviors + vector knowledge) was replaced in v0.4 by **explicit group-keyed sharing** with Qdrant as the sole source of truth. See [`v0.4_MEMORY_ARCHITECTURE.md`](v0.4_MEMORY_ARCHITECTURE.md) for the live design. This document remains as a historical record of the v0.3 design path; the dual-routing skill and `source=local` / `source=group` distinctions discussed here no longer apply on `main`.
+> **⚠ Superseded** — The routing model described below (dual-store classification: file-based behaviors + vector knowledge) was replaced in v0.4 by **explicit group-keyed sharing** with Qdrant as the sole source of truth; v0.5 then introduced the **connector model** for cloud-substrate sharing (Slack first) alongside the optional Constellation P2P sibling. For the current architecture see [`v0.5_CONNECTOR_ARCHITECTURE.md`](v0.5_CONNECTOR_ARCHITECTURE.md) (connectors), [`v0.4_MEMORY_ARCHITECTURE.md`](v0.4_MEMORY_ARCHITECTURE.md) (group-keyed sharing model still operational during transition), and the top-level [`../README.md`](../README.md). This document remains as a historical record of the v0.3 design path; the dual-routing skill and `source=local` / `source=group` distinctions discussed here no longer apply on `main` or `v0.5`.
 
-**Status:** v0.3.0 architecture (historical); v0.4 is the current design
+**Status:** v0.3.0 architecture (historical); v0.5 is the current design (connectors + optional Constellation P2P sibling).
 **Companion to:** [`CONSTELLATION_ARCHITECTURE.md`](CONSTELLATION_ARCHITECTURE.md)
 **Repository:** [github.com/muycoreano/mem-fusion](https://github.com/muycoreano/mem-fusion)
 

@@ -1,8 +1,8 @@
 # Constellation — Architecture
 
-> **⚠ Superseded by v0.4** — The wire format and routing described below (singular `group_name` payload, `source=local`/`source=group` tags, single-membership-per-node, push augments the local entry in place) were replaced in v0.4 by a `groups: list[str]` payload, multi-membership configs, push-time group filtering, additive dedup-merge, and a new `group_push(group, memory_ids?)` signature. See [`v0.4_MEMORY_ARCHITECTURE.md`](v0.4_MEMORY_ARCHITECTURE.md) §6–§7 for the live protocol. This document remains as a historical record of the v0.3 design path.
+> **⚠ Superseded** — The wire format and routing described below (singular `group_name` payload, `source=local`/`source=group` tags, single-membership-per-node, push augments the local entry in place) were replaced in v0.4 by a `groups: list[str]` payload, multi-membership configs, push-time group filtering, additive dedup-merge, and a new `group_push(group, memory_ids?)` signature. v0.5 then positions Constellation as the **optional P2P sibling system** alongside the new connector model in mem-fusion native. For the current architecture see [`v0.5_CONNECTOR_ARCHITECTURE.md`](v0.5_CONNECTOR_ARCHITECTURE.md) (connectors), [`v0.4_MEMORY_ARCHITECTURE.md`](v0.4_MEMORY_ARCHITECTURE.md) §6–§7 (group-keyed wire protocol still operational during transition), and [`../constellation/README.md`](../constellation/README.md) (Constellation's role in v0.5). This document remains as a historical record of the v0.3 design path.
 
-**Status:** v0.3.0 architecture (historical); v0.4 is the current design.
+**Status:** v0.3.0 architecture (historical); v0.5 positions Constellation as the optional P2P sibling system.
 
 Constellation lets Mem-Fusion peers share memory with each other. Where Mem-Fusion keeps memory on one machine, Constellation sends new memories to every other peer in the same group so they all see the same thing. It runs as a sibling daemon to Mem-Fusion: same machine, same Qdrant collection, separate HTTP MCP surface.
 

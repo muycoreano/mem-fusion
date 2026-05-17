@@ -294,15 +294,17 @@ def build_filter(project=None, type_=None, since=None, min_importance=1):
 def format_results(hits):
     """Shape Qdrant hits into the wire-friendly result format."""
     return [{
-        "id":         str(h.id),
-        "score":      round(h.score, 4),
-        "content":    h.payload.get("content", ""),
-        "type":       h.payload.get("type", ""),
-        "project":    h.payload.get("project", ""),
-        "tags":       h.payload.get("tags", []),
-        "importance": h.payload.get("importance", 3),
-        "timestamp":  h.payload.get("timestamp", ""),
-        "groups":     entry_groups(h.payload or {}),
+        "id":          str(h.id),
+        "score":       round(h.score, 4),
+        "content":     h.payload.get("content", ""),
+        "type":        h.payload.get("type", ""),
+        "project":     h.payload.get("project", ""),
+        "tags":        h.payload.get("tags", []),
+        "importance":  h.payload.get("importance", 3),
+        "timestamp":   h.payload.get("timestamp", ""),
+        "origin_node": h.payload.get("origin_node", ""),
+        "received_at": h.payload.get("received_at", ""),
+        "groups":      entry_groups(h.payload or {}),
     } for h in hits]
 
 
@@ -437,6 +439,8 @@ async def search_recent(args: dict) -> dict:
         "type": p.payload.get("type", ""), "project": p.payload.get("project", ""),
         "importance": p.payload.get("importance", 3),
         "timestamp": p.payload.get("timestamp", ""),
+        "origin_node": p.payload.get("origin_node", ""),
+        "received_at": p.payload.get("received_at", ""),
     } for p in sorted(points, key=lambda x: x.payload.get("timestamp", ""), reverse=True)]
     return {"hours": hours, "count": len(results), "results": results}
 

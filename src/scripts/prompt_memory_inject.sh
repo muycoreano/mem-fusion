@@ -6,14 +6,41 @@
 #
 # Both passes write to stdout; Claude picks them up as context blocks.
 # Pass 1 outputs <memory_context>; pass 2 outputs <received_memories>.
+#
+# Stdin contract — Claude Code UserPromptSubmit hook (verified empirically
+# on Claude Code 2.1.141 against docs https://code.claude.com/docs/en/hooks.md):
+#   {
+#     "session_id":      "<uuid>",        # ← the session identifier
+#     "prompt":          "<user text>",    # ← the actual prompt content
+#     "transcript_path": "<path>",
+#     "cwd":             "<path>",
+#     "permission_mode": "<mode>",
+#     "hook_event_name": "UserPromptSubmit"
+#   }
+# CLAUDE_SESSION_ID env var DOES NOT exist on hook processes; session_id is
+# only available via this stdin JSON. The fallback "unknown" handles the
+# case of manual invocation (where stdin may be raw prompt text instead).
 
 VENV="$HOME/.local/share/mem-fusion/venv/bin/python"
 QUEUE="$HOME/.local/share/mem-fusion/queue"
-SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
+
+HOOK_JSON=$(cat)
+PARSED=$("$VENV" - "$HOOK_JSON" <<'PYEOF'
+import sys, json
+raw = sys.argv[1]
+try:
+    d = json.loads(raw)
+    print(d.get("session_id", "unknown") + "\t" + d.get("prompt", ""))
+except Exception:
+    # Fallback for manual / non-JSON invocation: treat raw stdin as prompt.
+    print("unknown\t" + raw)
+PYEOF
+)
+SESSION_ID="${PARSED%%$'\t'*}"
+PROMPT="${PARSED#*$'\t'}"
 SEEN_FILE="${QUEUE}/seen-${SESSION_ID}.txt"
 LAST_TS_FILE="${QUEUE}/last-prompt-ts-${SESSION_ID}.txt"
 
-PROMPT=$(cat)
 [[ ${#PROMPT} -lt 15 ]] && exit 0
 
 # --- Pass 1: relevant memory injection (unchanged behavior) ---------------

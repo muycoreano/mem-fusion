@@ -26,6 +26,7 @@ import logging
 import os
 import socket
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -47,6 +48,12 @@ VECTOR_SIZE = 768
 # practical char-equivalent ceiling; inputs beyond this are soft-truncated
 # before embedding (the full content is preserved in the stored payload).
 EMBED_MAX_CHARS = 8000
+# In-process LRU cache of embeddings, keyed by SHA-256 of the truncated
+# text actually sent to Ollama. Eliminates re-embedding cost on repeat
+# queries (session-start primers, identical search_memory calls, etc.).
+# 1000 entries × 3 KB/vector ≈ 3 MB RAM. Capacity bound; oldest evicted.
+EMBED_CACHE_CAPACITY = 1000
+_embed_cache: OrderedDict = OrderedDict()
 
 CONSTELLATION_CONFIG_PATH = Path(os.getenv(
     "MEMFUSION_CONSTELLATION_CONFIG",
@@ -148,8 +155,21 @@ async def embed(text: str) -> list[float] | dict:
     Soft-truncates text to EMBED_MAX_CHARS before sending. Caller preserves
     the full content in storage; only the embedding is derived from the
     truncated text.
+
+    Successful embeddings are cached in-process (LRU, capacity
+    EMBED_CACHE_CAPACITY). Cache key is the SHA-256 of the truncated text
+    actually sent to Ollama, so two callers passing inputs that differ
+    only past EMBED_MAX_CHARS share a cache entry (correct: Ollama would
+    produce identical vectors for them). Errors are never cached.
     """
     embed_text = text[:EMBED_MAX_CHARS] if len(text) > EMBED_MAX_CHARS else text
+
+    cache_key = hashlib.sha256(embed_text.encode("utf-8")).hexdigest()
+    cached = _embed_cache.get(cache_key)
+    if cached is not None:
+        _embed_cache.move_to_end(cache_key)
+        return cached
+
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             r = await client.post(f"{OLLAMA_URL}/api/embeddings",
@@ -170,7 +190,11 @@ async def embed(text: str) -> list[float] | dict:
                 return {"error": "embed_unexpected",
                         "detail": "Ollama response missing 'embedding' field",
                         "reason": str(data)[:200]}
-            return data["embedding"]
+            vec = data["embedding"]
+            _embed_cache[cache_key] = vec
+            if len(_embed_cache) > EMBED_CACHE_CAPACITY:
+                _embed_cache.popitem(last=False)  # evict oldest
+            return vec
     except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as e:
         log.error("embed: ollama unreachable — %s", e)
         return {"error": "ollama_unreachable",

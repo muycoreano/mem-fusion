@@ -56,6 +56,30 @@ EMBED_MAX_CHARS = 8000
 EMBED_CACHE_CAPACITY = 1000
 _embed_cache: OrderedDict = OrderedDict()
 
+# ── 0.5.0-019 chunked embedding (Marketing bug 581c761d) ──
+# nomic-embed-text's ~2048-token context can be exceeded at well under
+# EMBED_MAX_CHARS when content is markdown/code-dense. Single-vector
+# truncation loses semantic signal past the truncation point. Chunked
+# embedding embeds each ~CHUNK_CHARS slice independently and links them
+# via canonical_id, so the whole memory stays searchable.
+#
+# Content under CHUNK_THRESHOLD stays single-point (zero overhead for
+# typical short memories). Content over is chunked. Chunk 0 (canonical
+# chunk) carries the full content + standard metadata; chunks 1..N-1
+# carry only their chunk-text slice + the shared canonical_id linking
+# them back to chunk 0. Search dedupes by canonical_id and returns the
+# canonical chunk's payload.
+EMBED_CHUNK_THRESHOLD = 4000  # content below this is a single point
+EMBED_CHUNK_CHARS     = 1500  # target chunk size in chars
+EMBED_CHUNK_OVERLAP   = 200   # overlap between chunks to preserve boundary phrases
+
+# Substring nomic-embed-text returns when input exceeds ~2048-token
+# context. embed() detects this and retries with halved truncation as
+# defense-in-depth — a single chunk can still overflow on pathological
+# input even with chunking. EMBED_RETRY_MIN_CHARS is the halving floor.
+EMBED_CONTEXT_OVERFLOW_NEEDLE = "exceeds the context length"
+EMBED_RETRY_MIN_CHARS         = 1000
+
 CONSTELLATION_CONFIG_PATH = Path(os.getenv(
     "MEMFUSION_CONSTELLATION_CONFIG",
     str(Path.home() / ".local/share/mem-fusion/constellation/config.json"),
@@ -164,28 +188,46 @@ def iso_now() -> str:
 
 
 # ── Embedding (Ollama) ─────────────────────────────────────────────────────
-async def embed(text: str) -> list[float] | dict:
-    """Generate a 768-dim vector via local Ollama.
+# EMBED_CHUNK_*, EMBED_CONTEXT_OVERFLOW_NEEDLE, EMBED_RETRY_MIN_CHARS:
+# defined at the constants block above (0.5.0-019).
 
-    Returns either:
-      list[float]                          — embedding on success
-      {"error": "ollama_unreachable",  …}  — connection failure (Ollama down)
-      {"error": "embed_failed",        …}  — Ollama returned non-200 (e.g., 500
-                                             for input exceeding context length)
-      {"error": "embed_unexpected",    …}  — malformed response or other failure
 
-    Soft-truncates text to EMBED_MAX_CHARS before sending. Caller preserves
-    the full content in storage; only the embedding is derived from the
-    truncated text.
+def chunk_text(text: str,
+               chunk_chars: int = EMBED_CHUNK_CHARS,
+               overlap: int = EMBED_CHUNK_OVERLAP) -> list[str]:
+    """Split `text` into overlapping chunks for chunked embedding.
 
-    Successful embeddings are cached in-process (LRU, capacity
-    EMBED_CACHE_CAPACITY). Cache key is the SHA-256 of the truncated text
-    actually sent to Ollama, so two callers passing inputs that differ
-    only past EMBED_MAX_CHARS share a cache entry (correct: Ollama would
-    produce identical vectors for them). Errors are never cached.
+    Returns:
+      list[str] of length 1 if len(text) <= chunk_chars (degenerate case;
+        the only chunk is the full text); else multiple chunks of size
+        chunk_chars with `overlap` chars of overlap between consecutive
+        chunks. Overlap preserves phrases that span chunk boundaries so
+        semantic search doesn't miss them.
+
+    The last chunk may be shorter than chunk_chars. Empty input returns [""].
     """
-    embed_text = text[:EMBED_MAX_CHARS] if len(text) > EMBED_MAX_CHARS else text
+    if not text:
+        return [""]
+    if len(text) <= chunk_chars:
+        return [text]
+    chunks = []
+    step = max(1, chunk_chars - overlap)
+    i = 0
+    while i < len(text):
+        chunk = text[i:i + chunk_chars]
+        chunks.append(chunk)
+        if i + chunk_chars >= len(text):
+            break
+        i += step
+    return chunks
 
+
+async def _embed_once(embed_text: str) -> list[float] | dict:
+    """Single Ollama call. Cache hit / miss + classified error returns.
+
+    Extracted from `embed` so the overflow-retry loop can reuse it without
+    duplicating the cache+HTTP+error-classification logic.
+    """
     cache_key = hashlib.sha256(embed_text.encode("utf-8")).hexdigest()
     cached = _embed_cache.get(cache_key)
     if cached is not None:
@@ -227,6 +269,90 @@ async def embed(text: str) -> list[float] | dict:
         return {"error": "embed_unexpected",
                 "detail": "Unexpected error during embedding",
                 "reason": str(e)}
+
+
+async def embed_chunks(text: str) -> list[list[float]] | dict:
+    """Embed text as one or more chunks per chunked-embedding spec.
+
+    Returns:
+      list[list[float]] — N chunk vectors in order (N >= 1)
+      {"error": ...}    — propagates from embed() on any chunk failure
+
+    For content under EMBED_CHUNK_THRESHOLD this returns a single-element
+    list — equivalent to the legacy single-point path. Above the threshold,
+    chunks of EMBED_CHUNK_CHARS with EMBED_CHUNK_OVERLAP-char overlap are
+    embedded independently. Each chunk's embedding goes through embed()
+    which retains the context-overflow retry as defense-in-depth.
+
+    Idempotent under embed() caching: identical chunk-text strings share
+    cache entries.
+    """
+    if len(text) <= EMBED_CHUNK_THRESHOLD:
+        vec = await embed(text)
+        if isinstance(vec, dict):
+            return vec
+        return [vec]
+    chunks = chunk_text(text)
+    vectors: list[list[float]] = []
+    for ch in chunks:
+        v = await embed(ch)
+        if isinstance(v, dict):
+            return v  # propagate first error verbatim
+        vectors.append(v)
+    return vectors
+
+
+async def embed(text: str) -> list[float] | dict:
+    """Generate a 768-dim vector via local Ollama.
+
+    Returns either:
+      list[float]                          — embedding on success
+      {"error": "ollama_unreachable",  …}  — connection failure (Ollama down)
+      {"error": "embed_failed",        …}  — Ollama returned non-200 even
+                                             after the overflow-retry loop
+      {"error": "embed_unexpected",    …}  — malformed response or other failure
+
+    Soft-truncates text to EMBED_MAX_CHARS before sending. Caller preserves
+    the full content in storage; only the embedding is derived from the
+    truncated text.
+
+    OVERFLOW RETRY (per 0.5.0-019, Marketing bug 581c761d): nomic-embed-text's
+    ~2048-token context can be exceeded at well under EMBED_MAX_CHARS for
+    token-dense content (markdown, code blocks). On HTTP 500 whose body
+    contains EMBED_CONTEXT_OVERFLOW_NEEDLE we halve the truncation and retry,
+    stopping at EMBED_RETRY_MIN_CHARS. This is harm-reduction; the
+    architectural fix is chunked-embedding in v0.6 (canonical_id per
+    bcb8d737).
+
+    Successful embeddings are cached in-process (LRU, capacity
+    EMBED_CACHE_CAPACITY). Cache key is the SHA-256 of the truncated text
+    actually sent to Ollama, so two callers passing inputs that differ only
+    past the actually-embedded prefix share a cache entry. Errors never cached.
+    """
+    embed_text = text[:EMBED_MAX_CHARS] if len(text) > EMBED_MAX_CHARS else text
+
+    # Try with progressively-halved truncations on context-overflow errors.
+    # Stops when we either get a vector, hit a non-overflow error, or hit
+    # the minimum.
+    while True:
+        result = await _embed_once(embed_text)
+        if isinstance(result, list):
+            return result
+        # Detect context-overflow specifically; other errors propagate.
+        if (result.get("error") == "embed_failed"
+                and EMBED_CONTEXT_OVERFLOW_NEEDLE in (result.get("reason") or "")):
+            if len(embed_text) <= EMBED_RETRY_MIN_CHARS:
+                # Already at the floor; surface the error.
+                log.warning("embed: context overflow persists at %d chars; giving up",
+                            len(embed_text))
+                return result
+            new_len = max(EMBED_RETRY_MIN_CHARS, len(embed_text) // 2)
+            log.warning("embed: context overflow at %d chars; retrying at %d",
+                        len(embed_text), new_len)
+            embed_text = embed_text[:new_len]
+            continue
+        # Non-overflow error — propagate immediately.
+        return result
 
 
 # ── Qdrant filter helpers ─────────────────────────────────────────────────
@@ -365,12 +491,17 @@ def format_results(hits):
 # ── Memory operations ─────────────────────────────────────────────────────
 async def store_memory(args: dict) -> dict:
     """Embed, dedup-merge, insert. Returns one of:
-       {status: "stored",    id, groups} — fresh content stored
-       {status: "merged",    id, groups} — content_hash hit; groups widened
-       {status: "duplicate", id, groups} — content_hash hit; nothing changed
-       {error: <class>, detail, ...}     — embed failed; caller surfaces error
-                                           (class is one of ollama_unreachable,
-                                           embed_failed, embed_unexpected)
+       {status: "stored",    id, groups, [chunk_count]} — fresh content stored
+       {status: "merged",    id, groups}                 — content_hash hit; groups widened
+       {status: "duplicate", id, groups}                 — content_hash hit; nothing changed
+       {error: <class>, detail, ...}                     — embed failed; caller surfaces
+
+    CHUNKED EMBEDDING (0.5.0-019): content > EMBED_CHUNK_THRESHOLD is split
+    into ~EMBED_CHUNK_CHARS overlapping windows; each chunk embedded
+    independently. Chunk 0 (canonical chunk) carries the full content +
+    standard metadata; chunks 1..N-1 carry only chunk_text + the shared
+    canonical_id pointer. Search dedupes by canonical_id and returns the
+    canonical chunk. Resolves Marketing bug 581c761d.
     """
     content       = args["content"]
     type_         = args["type"]
@@ -398,24 +529,63 @@ async def store_memory(args: dict) -> dict:
         return {"status": "merged", "id": existing_id,
                 "groups": merged_g, "connector_ids": merged_c}
 
-    vec = await embed(content)
-    if isinstance(vec, dict):
-        return vec  # error from embed() — propagate verbatim (preserves error class)
+    vectors = await embed_chunks(content)
+    if isinstance(vectors, dict):
+        return vectors  # error from embed_chunks() — propagate verbatim
 
-    point_id = str(uuid.uuid4())
-    ts       = iso_now()
-    qdrant.upsert(collection_name=COLLECTION, points=[PointStruct(
-        id=point_id, vector=vec,
-        payload={
+    canonical_id = str(uuid.uuid4())
+    ts           = iso_now()
+    origin_node  = _resolve_node_name()
+    points: list[PointStruct] = []
+    if len(vectors) == 1:
+        # Single-point fast path — back-compat with all pre-0.5.0-019 memories.
+        points.append(PointStruct(id=canonical_id, vector=vectors[0], payload={
             "content": content, "type": type_, "tags": tags, "project": project,
             "importance": importance, "session_id": session_id,
             "content_hash": chash, "timestamp": ts,
             "groups": groups, "connector_ids": connector_ids,
-            "origin_node": _resolve_node_name(), "submitted_at": ts,
-        },
-    )])
-    return {"status": "stored", "id": point_id,
-            "groups": groups, "connector_ids": connector_ids}
+            "origin_node": origin_node, "submitted_at": ts,
+        }))
+    else:
+        # Chunked path. Chunk 0 = canonical (full content + metadata).
+        # Chunks 1..N-1 carry only their chunk text + canonical_id linkage.
+        chunks = chunk_text(content)
+        for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
+            if i == 0:
+                pid = canonical_id
+                payload = {
+                    "content": content, "type": type_, "tags": tags, "project": project,
+                    "importance": importance, "session_id": session_id,
+                    "content_hash": chash, "timestamp": ts,
+                    "groups": groups, "connector_ids": connector_ids,
+                    "origin_node": origin_node, "submitted_at": ts,
+                    "canonical_id": canonical_id,
+                    "chunk_index": 0,
+                    "chunk_count": len(chunks),
+                    "chunk_text": chunk,
+                }
+            else:
+                pid = str(uuid.uuid4())
+                payload = {
+                    # Minimal fields on non-canonical chunks. content_hash is
+                    # NOT replicated — find_existing_by_hash always reads from
+                    # the canonical chunk.
+                    "type": type_, "project": project, "importance": importance,
+                    "timestamp": ts, "groups": groups,
+                    "origin_node": origin_node, "submitted_at": ts,
+                    "canonical_id": canonical_id,
+                    "chunk_index": i,
+                    "chunk_count": len(chunks),
+                    "chunk_text": chunk,
+                }
+            points.append(PointStruct(id=pid, vector=vec, payload=payload))
+
+    qdrant.upsert(collection_name=COLLECTION, points=points)
+    result = {"status": "stored", "id": canonical_id,
+              "groups": groups, "connector_ids": connector_ids}
+    if len(vectors) > 1:
+        result["chunk_count"] = len(vectors)
+    return result
 
 
 # ── v0.5 generic envelope ingest (architecture doc §5 + §6.2) ─────────────
@@ -518,22 +688,35 @@ async def store_memory_from_envelope(envelope: dict,
                         "connector_ids": merged}
         return {"status": "duplicate", "id": existing_id}
 
-    # 5. Vector — use envelope's if shape-correct, else re-embed
-    vec_in = envelope.get("vector")
-    if isinstance(vec_in, list) and len(vec_in) == VECTOR_SIZE and \
-       all(isinstance(x, (int, float)) for x in vec_in):
-        vec = vec_in
-    else:
-        result = await embed(content)
-        if isinstance(result, dict):
-            return result  # propagate embed error class
-        vec = result
-
-    # 6. Persist
-    point_id    = str(uuid.uuid4())
+    # 5. Vector — fast path for short content with envelope vector; else
+    # chunk + embed locally. Chunking decisions are LOCAL per peer (sender
+    # may have chunked or not; receiver chunks per its own threshold).
     received_at = iso_now()
-    payload = {
-        "content":       content,
+    submitted_at = envelope.get("submitted_at", received_at)
+    short_enough_for_single_point = len(content) <= EMBED_CHUNK_THRESHOLD
+    vec_in = envelope.get("vector")
+    envelope_vector_usable = (
+        short_enough_for_single_point
+        and isinstance(vec_in, list)
+        and len(vec_in) == VECTOR_SIZE
+        and all(isinstance(x, (int, float)) for x in vec_in)
+    )
+
+    if envelope_vector_usable:
+        vec = vec_in
+        vectors = [vec]
+    else:
+        # Chunked path (or re-embed single-point). For long content we always
+        # re-embed locally; the envelope vector is only useful for single
+        # points, and senders may have chunked under a different threshold.
+        vectors_or_err = await embed_chunks(content)
+        if isinstance(vectors_or_err, dict):
+            return vectors_or_err  # propagate embed error class
+        vectors = vectors_or_err
+
+    # 6. Persist — single point or N-chunk multi-point.
+    canonical_id = str(uuid.uuid4())
+    base_payload = {
         "content_hash":  local_chash,
         "type":          envelope.get("type", ""),
         "tags":          envelope.get("tags", []),
@@ -542,17 +725,52 @@ async def store_memory_from_envelope(envelope: dict,
         "groups":        envelope.get("groups", []),
         "connector_ids": normalize_connector_ids_arg(envelope.get("connector_ids")),
         "origin_node":   origin,
-        "submitted_at":  envelope.get("submitted_at", received_at),
+        "submitted_at":  submitted_at,
         "received_at":   received_at,
         # `timestamp` mirrors `received_at` so search_recent surfaces this
         # entry to the user shortly after arrival, regardless of submitted_at.
         "timestamp":     received_at,
     }
-    qdrant.upsert(collection_name=COLLECTION, points=[PointStruct(
-        id=point_id, vector=vec, payload=payload,
-    )])
-    return {"status": "stored", "id": point_id,
-            "connector_ids": payload["connector_ids"]}
+    points: list[PointStruct] = []
+    if len(vectors) == 1:
+        # Single-point insert preserves the legacy receive shape.
+        payload = {**base_payload, "content": content}
+        points.append(PointStruct(id=canonical_id, vector=vectors[0], payload=payload))
+    else:
+        chunks = chunk_text(content)
+        for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
+            if i == 0:
+                points.append(PointStruct(
+                    id=canonical_id, vector=vec,
+                    payload={**base_payload,
+                             "content":       content,
+                             "canonical_id":  canonical_id,
+                             "chunk_index":   0,
+                             "chunk_count":   len(chunks),
+                             "chunk_text":    chunk}))
+            else:
+                # Dependent chunks carry minimal payload + the linkage.
+                points.append(PointStruct(
+                    id=str(uuid.uuid4()), vector=vec,
+                    payload={"type":         base_payload["type"],
+                             "project":      base_payload["project"],
+                             "importance":   base_payload["importance"],
+                             "groups":       base_payload["groups"],
+                             "origin_node":  origin,
+                             "submitted_at": submitted_at,
+                             "received_at":  received_at,
+                             "timestamp":    received_at,
+                             "canonical_id": canonical_id,
+                             "chunk_index":  i,
+                             "chunk_count":  len(chunks),
+                             "chunk_text":   chunk}))
+
+    qdrant.upsert(collection_name=COLLECTION, points=points)
+    result = {"status": "stored", "id": canonical_id,
+              "connector_ids": base_payload["connector_ids"]}
+    if len(vectors) > 1:
+        result["chunk_count"] = len(vectors)
+    return result
 
 
 async def add_groups(args: dict) -> dict:
@@ -1054,6 +1272,13 @@ async def search_memory(args: dict) -> dict:
 
     Optional `connector_id` filter: when set, returns only memories whose
     `connector_ids` list contains that value (Qdrant keyword-list match).
+
+    CHUNKED EMBEDDING (0.5.0-019): a memory may exist as N chunks sharing
+    a canonical_id. Internal limit is over-fetched (top_k * 3) so per-chunk
+    matches can be deduped. For each unique canonical_id, the highest-
+    scoring chunk wins; we then resolve the canonical chunk's full payload
+    so callers always see the complete memory record. Back-compat: legacy
+    single-point memories have no canonical_id and are returned as-is.
     """
     query          = args["query"]
     top_k          = min(int(args.get("top_k", 8)), 20)
@@ -1069,14 +1294,71 @@ async def search_memory(args: dict) -> dict:
 
     filt = build_filter(project=project, type_=type_, since=since,
                         min_importance=min_importance, connector_id=connector_id)
+    # Over-fetch by 3x to absorb chunked-memory dedup. Worst case: every
+    # match is from a different chunk of the same memory; dedup collapses
+    # them to one result. top_k * 3 keeps the latency bounded.
+    fetch_limit = max(top_k * 3, 24)
     hits = qdrant.search(collection_name=COLLECTION, query_vector=vec,
-                         limit=top_k, query_filter=filt, with_payload=True)
-    results = format_results(hits)
+                         limit=fetch_limit, query_filter=filt, with_payload=True)
+
+    # Dedup by canonical_id; keep the highest-scoring chunk per memory.
+    # Memories without canonical_id are legacy single-points — use their id.
+    best_by_canonical: dict[str, object] = {}
+    for h in hits:
+        pl   = h.payload or {}
+        cid  = pl.get("canonical_id") or str(h.id)
+        prev = best_by_canonical.get(cid)
+        if prev is None or h.score > prev.score:
+            best_by_canonical[cid] = h
+
+    # Order by score desc; trim to top_k; resolve canonical chunks where needed.
+    ranked = sorted(best_by_canonical.values(), key=lambda h: h.score, reverse=True)[:top_k]
+
+    # For non-canonical chunk hits (chunk_index != 0), fetch the canonical
+    # chunk's payload so callers see full content + metadata. The score
+    # carried over is the best chunk's score.
+    canonical_ids_to_fetch = [
+        h.payload.get("canonical_id") for h in ranked
+        if (h.payload or {}).get("chunk_index", 0) != 0
+        and (h.payload or {}).get("canonical_id")
+        and h.payload.get("canonical_id") != str(h.id)
+    ]
+    canonical_payloads: dict[str, dict] = {}
+    if canonical_ids_to_fetch:
+        retrieved = qdrant.retrieve(collection_name=COLLECTION,
+                                    ids=list(set(canonical_ids_to_fetch)),
+                                    with_payload=True, with_vectors=False)
+        for p in retrieved:
+            canonical_payloads[str(p.id)] = p.payload or {}
+
+    # Build the result list using format_results' shape — replace hit payloads
+    # with the canonical chunk's payload where applicable.
+    enriched = []
+    for h in ranked:
+        cid = (h.payload or {}).get("canonical_id")
+        if cid and cid != str(h.id) and cid in canonical_payloads:
+            # Use the canonical chunk's payload but keep this chunk's score.
+            class _SyntheticHit:  # minimal shape for format_results
+                pass
+            synth = _SyntheticHit()
+            synth.id = cid
+            synth.score = h.score
+            synth.payload = canonical_payloads[cid]
+            enriched.append(synth)
+        else:
+            enriched.append(h)
+
+    results = format_results(enriched)
     return {"query": query, "count": len(results), "results": results}
 
 
 async def search_recent(args: dict) -> dict:
-    """Time-filtered scroll — no vector search needed."""
+    """Time-filtered scroll — no vector search needed.
+
+    Filters out non-canonical chunks (chunk_index > 0) so the user sees one
+    record per memory, not one per chunk. Pre-0.5.0-019 memories have no
+    chunk_index field and pass through.
+    """
     hours   = float(args.get("hours", 24))
     project = args.get("project")
     top_k   = min(int(args.get("top_k", 10)), 50)
@@ -1088,7 +1370,10 @@ async def search_recent(args: dict) -> dict:
 
     points, _ = qdrant.scroll(collection_name=COLLECTION,
                               scroll_filter=Filter(must=conditions),
-                              limit=top_k, with_payload=True, with_vectors=False)
+                              limit=top_k * 3, with_payload=True, with_vectors=False)
+    # Filter out non-canonical chunks (chunk_index != 0); missing field
+    # treated as 0 for back-compat with pre-0.5.0-019 single-point memories.
+    canonical = [p for p in points if (p.payload or {}).get("chunk_index", 0) == 0]
     results = [{
         "id": str(p.id), "content": p.payload.get("content", ""),
         "type": p.payload.get("type", ""), "project": p.payload.get("project", ""),
@@ -1097,28 +1382,68 @@ async def search_recent(args: dict) -> dict:
         "origin_node": p.payload.get("origin_node", ""),
         "received_at": p.payload.get("received_at", ""),
         "connector_ids": entry_connector_ids(p.payload or {}),
-    } for p in sorted(points, key=lambda x: x.payload.get("timestamp", ""), reverse=True)]
+    } for p in sorted(canonical, key=lambda x: x.payload.get("timestamp", ""),
+                      reverse=True)[:top_k]]
     return {"hours": hours, "count": len(results), "results": results}
 
 
 async def upsert_memory(args: dict) -> dict:
     """Update an existing point by id. Re-embeds the new content. Groups are
-    preserved (use add_groups to widen sharing)."""
+    preserved (use add_groups to widen sharing).
+
+    Chunked-aware (0.5.0-019): if the existing memory has multiple chunks,
+    the dependent chunks are deleted first; the new content re-chunks
+    cleanly via the store path. Single-point memories take the fast path
+    that preserves the original point id."""
     memory_id  = args["id"]
     content    = args["content"]
     type_      = args.get("type")
     tags       = args.get("tags")
     importance = args.get("importance")
 
-    vec = await embed(content)
-    if isinstance(vec, dict):
-        return vec  # error from embed() — propagate verbatim
-
     existing = qdrant.retrieve(collection_name=COLLECTION, ids=[memory_id], with_payload=True)
     if not existing:
         return {"error": f"Memory {memory_id} not found"}
 
-    payload = dict(existing[0].payload)
+    old_payload = dict(existing[0].payload)
+    needs_chunk = len(content) > EMBED_CHUNK_THRESHOLD
+    was_chunked = old_payload.get("chunk_count", 1) > 1 if "chunk_count" in old_payload else False
+
+    if needs_chunk or was_chunked:
+        # Wipe dependent chunks, then re-store via the chunked path. Note:
+        # this changes the canonical_id (new uuid via store_memory) when
+        # the memory transitions in/out of chunked. Callers should track
+        # by content_hash, not raw id, across update cycles.
+        sibling_ids = [memory_id]
+        sib_points, _ = qdrant.scroll(
+            collection_name=COLLECTION,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="canonical_id", match=MatchValue(value=memory_id)),
+            ]),
+            limit=128, with_payload=False, with_vectors=False,
+        )
+        for p in sib_points:
+            if str(p.id) != memory_id:
+                sibling_ids.append(str(p.id))
+        qdrant.delete(collection_name=COLLECTION, points_selector=sibling_ids)
+        return await store_memory({
+            "content": content,
+            "type":       type_       or old_payload.get("type", ""),
+            "tags":       tags        if tags is not None else old_payload.get("tags", []),
+            "project":    old_payload.get("project", ""),
+            "importance": importance if importance is not None
+                          else old_payload.get("importance", 3),
+            "session_id": old_payload.get("session_id", ""),
+            "groups":     entry_groups(old_payload),
+            "connector_ids": entry_connector_ids(old_payload),
+        })
+
+    # Fast path: single-point in, single-point out — preserves the id.
+    vec = await embed(content)
+    if isinstance(vec, dict):
+        return vec
+
+    payload = old_payload
     payload["content"]      = content
     payload["content_hash"] = content_hash(content)
     payload["timestamp"]    = iso_now()
@@ -1168,26 +1493,36 @@ async def find_or_create(args: dict) -> dict:
         r["connector_ids"] = merged_c
         return {"status": "found", **r}
 
-    chash    = content_hash(content)
-    point_id = str(uuid.uuid4())
-    ts       = iso_now()
-    qdrant.upsert(collection_name=COLLECTION, points=[PointStruct(
-        id=point_id, vector=vec,
-        payload={
-            "content": content, "type": type_, "tags": tags, "project": project,
-            "importance": importance, "content_hash": chash,
-            "timestamp": ts, "groups": groups, "connector_ids": connector_ids,
-            "origin_node": _resolve_node_name(), "submitted_at": ts,
-        },
-    )])
-    return {"status": "created", "id": point_id,
-            "groups": groups, "connector_ids": connector_ids}
+    # No near-duplicate found — delegate to store_memory so chunked
+    # embedding applies uniformly. store_memory does its own content_hash
+    # check (catches exact-content matches that semantic-search missed).
+    result = await store_memory({
+        "content": content, "type": type_, "tags": tags, "project": project,
+        "importance": importance, "groups": groups, "connector_ids": connector_ids,
+    })
+    if result.get("status") == "stored":
+        return {"status": "created", **{k: v for k, v in result.items() if k != "status"}}
+    return result  # merged / duplicate / error — pass through
 
 
 async def delete_memory(args: dict) -> dict:
+    """Delete a memory by id. Also deletes all sibling chunks if the memory
+    was chunked (canonical_id-linked points)."""
     memory_id = args["id"]
-    qdrant.delete(collection_name=COLLECTION, points_selector=[memory_id])
-    return {"status": "deleted", "id": memory_id}
+    # Find all points sharing canonical_id == memory_id (chunked case).
+    sibling_ids = [memory_id]
+    points, _ = qdrant.scroll(
+        collection_name=COLLECTION,
+        scroll_filter=Filter(must=[
+            FieldCondition(key="canonical_id", match=MatchValue(value=memory_id)),
+        ]),
+        limit=128, with_payload=False, with_vectors=False,
+    )
+    for p in points:
+        if str(p.id) != memory_id:
+            sibling_ids.append(str(p.id))
+    qdrant.delete(collection_name=COLLECTION, points_selector=sibling_ids)
+    return {"status": "deleted", "id": memory_id, "chunks_deleted": len(sibling_ids)}
 
 
 async def get_related(args: dict) -> dict:

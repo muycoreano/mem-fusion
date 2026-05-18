@@ -44,6 +44,7 @@ out as a Stage 1.3 fix.
 """
 import hashlib
 import json
+import unicodedata
 
 from .base import Connector
 from .envelope import CURRENT_ENVELOPE_VERSION, Envelope, REQUIRED_FIELDS
@@ -52,12 +53,21 @@ from .envelope import CURRENT_ENVELOPE_VERSION, Envelope, REQUIRED_FIELDS
 def _wire_hash(content: str) -> str:
     """Compute the Slack §5.1 wire-format content_hash for `content`.
 
-    Single source of truth for both `verify_integrity` (receive-side
+    Per docs/v0.5_CONTENT_HASH_SPEC.md (0.5.0-015): NFC-normalize →
+    UTF-8 → SHA-256 → lowercase hex, full 64-char digest, prefixed with
+    `"sha256:"` per the §5.1 wire serialization.
+
+    Identical to `core.content_hash(content)` modulo the prefix — both
+    digest the SAME bytes, so cross-peer content has matching local
+    and wire hashes even when source editors emit different Unicode
+    normalization forms (combining vs precomposed accents, etc.).
+
+    Single source of truth for `verify_integrity` (receive-side
     verification) and `build_envelope_from_record` (sender-side
-    population). Centralized so the two stay in lock-step — changing
-    the scheme means changing one function, not two parallel call sites.
+    population); changing the scheme means changing one function.
     """
-    return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+    normalized = unicodedata.normalize("NFC", content)
+    return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 class SlackConnector(Connector):

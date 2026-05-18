@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import socket
+import unicodedata
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
@@ -136,8 +137,25 @@ qdrant = QdrantClient(url=QDRANT_URL, timeout=10)
 
 # ── Hashing + timestamps ──────────────────────────────────────────────────
 def content_hash(text: str) -> str:
-    """The dedup + integrity hash. Must be byte-identical across all daemons."""
-    return hashlib.sha256(text.strip().lower().encode()).hexdigest()[:16]
+    """Canonical content hash per docs/v0.5_CONTENT_HASH_SPEC.md.
+
+    Algorithm: NFC-normalize → encode UTF-8 (no BOM) → SHA-256 → lowercase
+    hex, full 64-char digest (no truncation). The dedup primitive; must be
+    byte-identical across all mem-fusion implementations.
+
+    Changed in 0.5.0-015 (architect-acked spec). The legacy form was
+    `sha256(text.strip().lower())[:16]` — Unicode-naive, case-folded,
+    whitespace-stripped, 64-bit truncated. Rationale for each removal
+    in the spec §4.1.
+
+    Wire-format companion: SlackConnector._wire_hash returns the same
+    digest with a `"sha256:"` prefix (the §5.1 wire serialization).
+    Both forms agree byte-for-byte on the 64 hex digits, so a peer's
+    received content has identical local hash to whatever the sender
+    computed — Unicode drift across editors no longer fragments dedup.
+    """
+    normalized = unicodedata.normalize("NFC", text)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def iso_now() -> str:

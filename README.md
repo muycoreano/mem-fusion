@@ -17,17 +17,41 @@ Both implement the same mem-fusion sharing API (push/pull/status/since). You can
 
 ## Install
 
-The installer is AI-native: paste the markdown into a Claude Code session and Claude runs the steps with your approval. Requires macOS + Homebrew + Claude Code already installed.
+One curl line. Requires macOS + Homebrew + Claude Code already installed.
 
-1. Open Claude Code in a terminal.
-2. Copy contents of [`INSTALL_MEM_FUSION.md`](INSTALL_MEM_FUSION.md).
-3. Paste into Claude Code and approve all subsequent steps.
+```bash
+curl -fsSL https://raw.githubusercontent.com/muycoreano/mem-fusion/v0.5/install.sh | bash
+```
 
-This installs Qdrant 1.13.4, Ollama + `nomic-embed-text`, the Mem-Fusion MCP server, 4 Claude Code hooks, and the `/remember` skill. ~200 MB on disk.
+Or paste into any Claude Code session:
 
-To add the optional **Constellation** P2P sibling for cross-machine sharing, see [`constellation/README.md`](constellation/README.md) — install takes ~5 min per peer.
+> *"Install mem-fusion by running: `curl -fsSL https://raw.githubusercontent.com/muycoreano/mem-fusion/v0.5/install.sh | bash`"*
 
-Both INSTALL docs will instruct you on the additions to `CLAUDE.md` during install.
+The script is idempotent — re-run it any time to upgrade. It clones to `~/dev/mem-fusion` (overridable via `MEMFUSION_CLONE_DIR`) and brings up Qdrant 1.13.4, Ollama + `nomic-embed-text`, the Mem-Fusion MCP server, 4 Claude Code hooks, and 2 skills (`remember`, `mem-fusion-slack-connector`). ~200 MB on disk.
+
+After install, restart Claude Code and ask about setting up the **mem-fusion Slack connector** if you want cross-machine memory sharing through a Slack channel. For peer-to-peer LAN sync as an alternative, see [`constellation/README.md`](constellation/README.md).
+
+### What gets installed
+
+- `~/.local/share/mem-fusion/` — Qdrant data, Python venv, the MCP server, helper scripts, fix-script artifacts.
+- `~/Library/LaunchAgents/com.branchapp.memfusion.{qdrant,ollama,constellation}.plist` — daemons.
+- `~/.claude/skills/{remember,mem-fusion-slack-connector}/` — slash-command + connector-operations skills.
+- `~/.claude/settings.json` (anchor-patched between `<!-- mem-fusion:* -->` markers) — 4 hooks.
+- `~/CLAUDE.md` (anchor-patched) — `## Vector Memory System` section telling Claude how to use the store.
+
+### Upgrade
+
+Re-run the same install command. install.sh is idempotent — fresh install, partial upgrade, and fully-current install all execute the same command and produce the right result.
+
+### Uninstall
+
+```bash
+launchctl bootout gui/$UID/com.branchapp.memfusion.{qdrant,ollama,constellation}
+rm -rf ~/Library/LaunchAgents/com.branchapp.memfusion.*.plist ~/.local/share/mem-fusion
+claude mcp remove mem-fusion
+```
+
+Then strip the `<!-- mem-fusion:* -->` blocks from `~/CLAUDE.md` and `~/.claude/settings.json`.
 
 ---
 

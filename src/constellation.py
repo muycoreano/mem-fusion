@@ -293,10 +293,21 @@ class PeerHandler(_BaseHandler):
                 "memberships":    sorted(my_groups),
             })
 
-        if core.content_hash(body["content"]) != body["content_hash"]:
-            return self._send_json(HTTP_BAD_REQUEST, {
-                "error": "content_hash mismatch — content modified in transit",
-            })
+        # Forward-compatibility for transition windows where peers run
+        # different content_hash algorithm versions (pre/post 0.5.0-015).
+        # Recompute locally; log on mismatch but accept anyway. Use the
+        # local hash for storage + dedup so this node stays internally
+        # consistent regardless of what version the sender was on. The
+        # integrity protection this check used to provide is redundant
+        # with TCP for LAN HTTP and with connector-side verify_integrity
+        # on the connector wire format; rejecting here is what broke the
+        # mesh during the 0.5.0-015 rollout.
+        local_hash = core.content_hash(body["content"])
+        wire_hash  = body["content_hash"]
+        if local_hash != wire_hash:
+            log.warning("PUT hash mismatch (accepted): wire=%s local=%s "
+                        "origin=%s — peer likely on different algorithm version",
+                        wire_hash, local_hash, body.get("origin_node", "?"))
 
         vec = body["vector"]
         if not isinstance(vec, list) or len(vec) != core.VECTOR_SIZE:
@@ -305,16 +316,19 @@ class PeerHandler(_BaseHandler):
                 "received_length": len(vec) if isinstance(vec, list) else None,
             })
 
-        # Dedup globally on content_hash. Additive merge: if we already have
-        # the content, widen its groups list with anything new from incoming.
-        existing = core.find_existing_by_hash(body["content_hash"])
+        # Dedup globally on locally-canonical content_hash. Additive merge:
+        # if we already have the content, widen its groups list with anything
+        # new from incoming. Using local_hash (not wire_hash) for the lookup
+        # keeps dedup consistent across the peer's own corpus regardless of
+        # what algorithm the sender used.
+        existing = core.find_existing_by_hash(local_hash)
         if existing:
             existing_id, existing_payload = existing
             current = core.entry_groups(existing_payload)
             merged  = core.union_groups(current, incoming_groups)
             if merged == current:
                 log.info("PUT duplicate: hash=%s existing=%s groups=%s",
-                         body["content_hash"], existing_id, current)
+                         local_hash, existing_id, current)
                 return self._send_json(HTTP_OK, {
                     "status": "duplicate", "id": existing_id, "groups": current,
                 })
@@ -323,7 +337,7 @@ class PeerHandler(_BaseHandler):
                 payload={"groups": merged}, points=[existing_id],
             )
             log.info("PUT merged: hash=%s id=%s groups=%s",
-                     body["content_hash"], existing_id, merged)
+                     local_hash, existing_id, merged)
             return self._send_json(HTTP_OK, {
                 "status": "merged", "id": existing_id, "groups": merged,
             })
@@ -332,7 +346,7 @@ class PeerHandler(_BaseHandler):
         received_at = core.iso_now()
         payload = {
             "content":      body["content"],
-            "content_hash": body["content_hash"],
+            "content_hash": local_hash,
             "type":         body["type"],
             "tags":         body.get("tags", []),
             "project":      body.get("project", ""),

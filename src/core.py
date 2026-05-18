@@ -400,6 +400,117 @@ async def store_memory(args: dict) -> dict:
             "groups": groups, "connector_ids": connector_ids}
 
 
+# ── v0.5 generic envelope ingest (architecture doc §5 + §6.2) ─────────────
+# Connector-substrate-agnostic. Operates on the canonical envelope dict
+# (whatever shape was extracted by the connector's parse_envelope).
+# The Slack-specific format_envelope / parse_envelope live in
+# src/slack_connector.py; future connectors (gdrive, teams, ...) each
+# ship their own sibling module. Once parsed, the receive flow below is
+# the same for every substrate: loopback check, integrity check, dedup,
+# vector resolution, Qdrant upsert.
+async def store_memory_from_envelope(envelope: dict) -> dict:
+    """Receive-side: ingest a memory from a parsed Slack connector envelope.
+
+    Performs (in order):
+      1. Loopback prevention — skip if origin_node == self.node_name.
+      2. Wire-format integrity — verify `sha256(envelope.content)` matches
+         the envelope's `content_hash` (after stripping the `sha256:` prefix).
+         Catches transport corruption.
+      3. Local dedup — compute local-canonical content_hash (`core.content_hash`)
+         and check against existing payloads. Returns "duplicate" on hit.
+      4. Vector resolution — use envelope.vector if present and well-formed
+         (768-dim list of floats); else re-embed locally via Ollama.
+      5. Persist — upsert into Qdrant with received_at set to now and
+         timestamp mirroring received_at (so search_recent surfaces freshly
+         received entries without code knowing they're remote).
+
+    Returns one of:
+      {"status": "stored",           "id": ..., "connector_ids": [...]}
+      {"status": "duplicate",        "id": ...}
+      {"status": "loopback_skipped"}
+      {"error":  "integrity_failed", "detail": ...}
+      {"error":  "missing_field",    "detail": ...}
+      {"error":  <embed-error-class>, ...}  — propagated from core.embed()
+    """
+    # 0. Required fields
+    for required in ("content", "content_hash", "origin_node"):
+        if required not in envelope:
+            return {"error": "missing_field",
+                    "detail": f"envelope missing required field: {required}"}
+
+    content      = envelope["content"]
+    wire_hash    = envelope["content_hash"]
+    origin       = envelope["origin_node"]
+
+    # 1. Loopback prevention
+    if origin == _resolve_node_name():
+        return {"status": "loopback_skipped",
+                "detail": f"envelope origin {origin!r} is this peer; skipping"}
+
+    # 2. Wire-format integrity
+    expected_wire = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if wire_hash != expected_wire:
+        return {"error": "integrity_failed",
+                "detail": "envelope content_hash does not match sha256(content)",
+                "expected": expected_wire, "received": wire_hash}
+
+    # 3. Local dedup via local-canonical hash
+    local_chash = content_hash(content)
+    existing = find_existing_by_hash(local_chash)
+    if existing:
+        existing_id, payload = existing
+        # Optional: additively widen connector_ids on the existing entry
+        # if the incoming envelope adds new ids. Matches the semantics of
+        # `add_connector_ids` for the through-Slack arrival path.
+        incoming_cids = envelope.get("connector_ids") or []
+        if incoming_cids:
+            current_cids = entry_connector_ids(payload)
+            merged = union_groups(current_cids, incoming_cids)
+            if merged != current_cids:
+                qdrant.set_payload(collection_name=COLLECTION,
+                                   payload={"connector_ids": merged},
+                                   points=[existing_id])
+                return {"status": "merged", "id": existing_id,
+                        "connector_ids": merged}
+        return {"status": "duplicate", "id": existing_id}
+
+    # 4. Vector — use envelope's if shape-correct, else re-embed
+    vec_in = envelope.get("vector")
+    if isinstance(vec_in, list) and len(vec_in) == VECTOR_SIZE and \
+       all(isinstance(x, (int, float)) for x in vec_in):
+        vec = vec_in
+    else:
+        result = await embed(content)
+        if isinstance(result, dict):
+            return result  # propagate embed error class
+        vec = result
+
+    # 5. Persist
+    point_id    = str(uuid.uuid4())
+    received_at = iso_now()
+    payload = {
+        "content":       content,
+        "content_hash":  local_chash,
+        "type":          envelope.get("type", ""),
+        "tags":          envelope.get("tags", []),
+        "project":       envelope.get("project", ""),
+        "importance":    envelope.get("importance", 3),
+        "groups":        envelope.get("groups", []),
+        "connector_ids": normalize_connector_ids_arg(envelope.get("connector_ids")),
+        "origin_node":   origin,
+        "submitted_at":  envelope.get("submitted_at", received_at),
+        "received_at":   received_at,
+        # `timestamp` mirrors `received_at` so search_recent surfaces this
+        # entry to the user shortly after arrival, regardless of submitted_at.
+        "timestamp":     received_at,
+    }
+    qdrant.upsert(collection_name=COLLECTION, points=[PointStruct(
+        id=point_id, vector=vec, payload=payload,
+    )])
+    return {"status": "stored", "id": point_id,
+            "connector_ids": payload["connector_ids"]}
+
+
 async def add_groups(args: dict) -> dict:
     """Additive union of group tags on existing entries.
 

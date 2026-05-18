@@ -408,53 +408,79 @@ async def store_memory(args: dict) -> dict:
 # ship their own sibling module. Once parsed, the receive flow below is
 # the same for every substrate: loopback check, integrity check, dedup,
 # vector resolution, Qdrant upsert.
-async def store_memory_from_envelope(envelope: dict) -> dict:
-    """Receive-side: ingest a memory from a parsed Slack connector envelope.
+async def store_memory_from_envelope(envelope: dict,
+                                     connector_type: str = "slack") -> dict:
+    """Receive-side: ingest a memory from a parsed connector envelope.
+
+    SUBSTRATE-AGNOSTIC. The only thing this function knows about a
+    specific connector is its `type` discriminator — used to look up the
+    Connector implementation that owns the substrate's integrity scheme.
+    Per Stage 1.1 (architect-acked staff audit, 2026-05-18), the previous
+    hardcoded `"sha256:" + sha256(content).hexdigest()` check has moved
+    onto SlackConnector.verify_integrity; future connectors may use
+    signed envelopes, HMAC-MAC, or different hash functions — all
+    invisible to this function.
 
     Performs (in order):
-      1. Loopback prevention — skip if origin_node == self.node_name.
-      2. Wire-format integrity — verify `sha256(envelope.content)` matches
-         the envelope's `content_hash` (after stripping the `sha256:` prefix).
-         Catches transport corruption.
-      3. Local dedup — compute local-canonical content_hash (`core.content_hash`)
-         and check against existing payloads. Returns "duplicate" on hit.
-      4. Vector resolution — use envelope.vector if present and well-formed
-         (768-dim list of floats); else re-embed locally via Ollama.
-      5. Persist — upsert into Qdrant with received_at set to now and
+      1. Required fields — bail with `missing_field` if absent. This is
+         a structural pre-flight; integrity verification handles missing
+         CONTENT fields, but having `origin_node` is required for the
+         loopback check that runs before integrity.
+      2. Loopback prevention — skip if origin_node == self.node_name.
+         Runs BEFORE integrity so we don't pay sha256 cost on our own
+         posts pulled back from a shared channel.
+      3. Wire-format integrity — delegate to `connector.verify_integrity`.
+         Catches transport corruption and tampering.
+      4. Local dedup — compute local-canonical content_hash and check
+         against existing payloads. Returns "duplicate" on hit (with
+         additive connector_id widening if the envelope brings new ids).
+      5. Vector resolution — use envelope.vector if present and well-formed
+         (VECTOR_SIZE list of floats); else re-embed locally via Ollama.
+      6. Persist — upsert into Qdrant with received_at set to now and
          timestamp mirroring received_at (so search_recent surfaces freshly
          received entries without code knowing they're remote).
 
     Returns one of:
       {"status": "stored",           "id": ..., "connector_ids": [...]}
+      {"status": "merged",           "id": ..., "connector_ids": [...]}
       {"status": "duplicate",        "id": ...}
-      {"status": "loopback_skipped"}
+      {"status": "loopback_skipped", "detail": ...}
       {"error":  "integrity_failed", "detail": ...}
       {"error":  "missing_field",    "detail": ...}
+      {"error":  "unknown_connector_type", "detail": ...}
       {"error":  <embed-error-class>, ...}  — propagated from core.embed()
     """
-    # 0. Required fields
+    # 0. Resolve connector implementation
+    try:
+        from connectors import get_connector
+        connector = get_connector(connector_type)
+    except ValueError as e:
+        return {"error": "unknown_connector_type",
+                "detail": str(e)}
+
+    # 1. Required fields (structural pre-flight; integrity check enforces more)
+    if not isinstance(envelope, dict):
+        return {"error": "missing_field",
+                "detail": f"envelope is not a dict: {type(envelope).__name__}"}
     for required in ("content", "content_hash", "origin_node"):
         if required not in envelope:
             return {"error": "missing_field",
                     "detail": f"envelope missing required field: {required}"}
 
-    content      = envelope["content"]
-    wire_hash    = envelope["content_hash"]
-    origin       = envelope["origin_node"]
+    content = envelope["content"]
+    origin  = envelope["origin_node"]
 
-    # 1. Loopback prevention
+    # 2. Loopback prevention
     if origin == _resolve_node_name():
         return {"status": "loopback_skipped",
                 "detail": f"envelope origin {origin!r} is this peer; skipping"}
 
-    # 2. Wire-format integrity
-    expected_wire = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
-    if wire_hash != expected_wire:
-        return {"error": "integrity_failed",
-                "detail": "envelope content_hash does not match sha256(content)",
-                "expected": expected_wire, "received": wire_hash}
+    # 3. Wire-format integrity — delegated to connector
+    ok, detail = connector.verify_integrity(envelope)
+    if not ok:
+        return {"error": "integrity_failed", "detail": detail}
 
-    # 3. Local dedup via local-canonical hash
+    # 4. Local dedup via local-canonical hash
     local_chash = content_hash(content)
     existing = find_existing_by_hash(local_chash)
     if existing:
@@ -474,7 +500,7 @@ async def store_memory_from_envelope(envelope: dict) -> dict:
                         "connector_ids": merged}
         return {"status": "duplicate", "id": existing_id}
 
-    # 4. Vector — use envelope's if shape-correct, else re-embed
+    # 5. Vector — use envelope's if shape-correct, else re-embed
     vec_in = envelope.get("vector")
     if isinstance(vec_in, list) and len(vec_in) == VECTOR_SIZE and \
        all(isinstance(x, (int, float)) for x in vec_in):
@@ -485,7 +511,7 @@ async def store_memory_from_envelope(envelope: dict) -> dict:
             return result  # propagate embed error class
         vec = result
 
-    # 5. Persist
+    # 6. Persist
     point_id    = str(uuid.uuid4())
     received_at = iso_now()
     payload = {

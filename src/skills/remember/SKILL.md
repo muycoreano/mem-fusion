@@ -123,6 +123,8 @@ When the user invokes `/remember pull <connector-id>`:
 
 4. **(Optional) bot-user invite preflight** (architect-acked at FIRST_PULL_SEMANTICS §B.2). Call `slack_list_channel_members(channel_id)` and verify the connector's bot user is a member. If not: render *"the bot user isn't a member of this channel; invite it via `/invite @<bot>` and re-run"* and abort. Converts Slack's opaque `channel_not_found` into a clear remediation hint.
 
+   **Bot-user vs. user-tier OAuth — clarification from E2E run 2026-05-18.** The current Slack MCP available to Claude posts AS the user (user-tier OAuth, e.g., `UKN4XM7T3`), not as a separate bot user. In that case the preflight is moot — the human user IS the sender and being in the channel covers both send and receive. The preflight remains the *correct conservative path* for any future setup where a separate bot user is involved (Slack app with bot token, GDrive service account, etc.). Implementations should detect whether the substrate's send-message MCP uses user-tier or bot-tier auth and skip the preflight in the user-tier case.
+
 5. **Get cursor.** `mem-fusion/get_connector_cursor(connector_id)`. `null` means first-pull.
 
 6. **Compute the `oldest` parameter** for `slack_read_channel`:
@@ -152,6 +154,19 @@ When the user invokes `/remember pull <connector-id>`:
 #### G11 smoke-test filter (receive-side)
 
 `ingest_connector_message` filters envelopes with `is_smoke_test: true` by default — the field stays in the envelope (extension-tolerant) but the receiver skips storage. Override with `include_smoke_tests=true` only when the caller IS the e2e validation against `#mf-test-connector`. Keeps the test scaffolding out of production memory stores.
+
+**Filter ordering (verified by E2E run 2026-05-18):** `ingest_connector_message` runs the G11 check BEFORE delegating to `store_memory_from_envelope`. Sequence is:
+
+```
+parse_envelope → G11 (is_smoke_test default skip)
+               → store_memory_from_envelope:
+                    loopback (origin_node == self?)
+                    → integrity (verify_integrity)
+                    → dedup (content_hash)
+                    → upsert
+```
+
+So a smoke-test envelope with self-origin reports `smoke_test_skipped`, NOT `loopback_skipped` — G11 is the higher-priority filter for `is_smoke_test` traffic. Both outcomes produce no storage side effect; the diagnostic distinction matters only when triaging "why didn't this message land?"
 
 #### First-pull semantics
 

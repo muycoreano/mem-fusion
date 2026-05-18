@@ -66,6 +66,61 @@ Plus the natural-language path Claude handles via reasoning:
 | *"also share them with `<name>`"* | Add the new connector_id / group, push **only** to that one. Don't re-push prior targets — they already have it. |
 | *"make sure all your connectors have these"* | For each connector_id in the memory's `connector_ids` list, run the per-connector push flow once. |
 
+### Connector push orchestration (`/remember push <connector-id>`)
+
+The push surface is **substrate-agnostic skill orchestration**. mem-fusion exposes composition primitives via MCP; the skill (Claude reasoning) composes them with the substrate's send-message MCP (`slack_send_message` for Slack). There is **no `connector_push` MCP tool** — keeping orchestration in the skill is what lets v0.5 add new connector types without mem-fusion churn.
+
+#### Procedure
+
+When the user invokes `/remember push <connector-id>`:
+
+1. **Load + validate config (G3).** Call `mem-fusion/load_connectors_config`. If the returned `errors` list is non-empty, render each error to the user and ABORT — do not attempt the push with an invalid config.
+
+2. **Resolve the connector.** Look for `<connector-id>` in the returned `connectors` list. If absent: error *"no connector named '<connector-id>'; available: [...]"* using the list of valid ids from the config.
+
+3. **Find eligible local memories.** Call `mem-fusion/search_memory` with `connector_id="<connector-id>"` (filter) and an appropriate query (typically broad — `"*"` not supported, so use a low-specificity term or `mem-fusion/search_recent` with no project filter). Filter to memories where `submitted_at > cursor`. Get the cursor via `mem-fusion/get_connector_cursor`.
+
+   First push (cursor is `null`): all memories tagged with `<connector-id>` are eligible.
+
+4. **For each eligible memory, in `submitted_at` order:**
+
+   a. `mem-fusion/build_connector_envelope(memory_id, connector_id)` — returns `{body, channel, type, submitted_at, body_size, envelope}`. On error (`body_too_large_for_substrate`, `build_envelope_failed`, etc.), record the per-memory failure and continue to next.
+
+   b. **Resolve the channel value to a Slack channel id** if it isn't one already. Slack channel ids match `C[A-Z0-9]{9,}`. If the connector's `channel` value doesn't match that shape, call `slack_search_channels(query=<channel>)` to resolve. If multiple matches or zero matches: record failure and continue.
+
+   c. `slack_send_message(channel_id=<resolved id>, message=<body>)` — capture the returned `message_ts`.
+
+   d. Advance cursor on success: `mem-fusion/set_connector_cursor(connector_id, iso_ts=<envelope.submitted_at>)`.
+
+5. **Render per-memory telemetry** to the user. Group by status; never dump JSON. Example:
+
+   ```
+   ✓ Pushed to connector "engineering" (channel #mem_fusion_engineering, C0XXXXXXX):
+       - 4 memories sent successfully
+       - 1 memory skipped (body too large: 41,238 chars; cap 38,000)
+   Cursor advanced to 2026-05-18T05:00:00+00:00
+   ```
+
+#### What this orchestration explicitly does NOT do
+
+- **No retry loop.** If `slack_send_message` fails (rate limit, network), surface the failure and let the user re-run `/remember push <connector-id>` — the cursor only advances on success, so re-runs naturally pick up where the last one stopped.
+- **No parallel sends.** Slack's rate-limit budget is per-app; parallel sends share the budget anyway. Sequential is simpler and deterministic.
+- **No body truncation.** A memory rendering over 38 KB is reported as a failure (`body_too_large_for_substrate`) rather than silently chopped — chopping breaks the integrity check on the receiver.
+
+### Suggest-pull-on-declare (G5)
+
+When you detect a new connector entry in `connector.json` (one where `get_connector_cursor(id)` returns `null` and the connector is otherwise newly seen this session), surface a one-line suggestion:
+
+> *"Tip: this connector has no cursor yet. Run `/remember pull <id>` to back-fill any prior memories from its channel."*
+
+**Suggest, don't auto-execute.** Auto-pulling would surprise users and could cause large first-pulls without consent. The suggestion sits on the user's screen; they decide whether to run it.
+
+### Smoke-test envelopes (G11 marker)
+
+When you post test memories to a connector (e.g., during e2e validation), set `is_smoke_test: true` on the envelope before calling `build_connector_envelope` is NOT the path — `build_connector_envelope` builds from the stored memory record. Instead, set the field on the source memory via `store_memory({content, type, tags=["is_smoke_test"], ...})` or as a payload extension. The Envelope TypedDict tolerates extension fields; receivers can filter (in 0.5.0-017 pull orchestration) by checking the parsed envelope or by tag.
+
+For pure-wire smoke tests where no local memory is being stored: pass `is_smoke_test=true` directly in the envelope dict and skip `build_connector_envelope` — that's the test-scaffold path, not the production path.
+
 ### Legacy v0.4 behaviors (preserved during transition, removed in a future cleanup)
 
 - `groups: [...]` payload field still deserializes; ignored at scope-determination. v0.4 memories continue to work; the architectural surface above is what users should reach for going forward.

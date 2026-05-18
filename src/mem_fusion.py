@@ -142,6 +142,58 @@ async def list_tools():
                                    "description": "Connector IDs to add (additive union); "
                                                   "must match an id in ~/.local/share/mem-fusion/connector.json"},
              }, "required": ["memory_ids", "connector_ids"]}),
+        Tool(name="load_connectors_config",
+             description=("Load and validate ~/.local/share/mem-fusion/connector.json. "
+                          "Returns {connectors: [...], errors: [...], warnings: [...], config_path}. "
+                          "Call FIRST in any /remember push|pull <connector-id> orchestration; "
+                          "if errors is non-empty, surface them to the user and abort — do not "
+                          "attempt to push/pull with an invalid config. Each connector entry has "
+                          "{id, type, ...type-specific-fields}; v0.5 supports type=slack with a "
+                          "`channel` field (Slack channel id like C0XXXXXXX or channel name; "
+                          "if name, resolve via slack_search_channels at orchestration time)."),
+             inputSchema={"type": "object", "properties": {
+                 "path": {"type": "string",
+                          "description": "Optional override path (tests only)."},
+             }, "required": []}),
+        Tool(name="build_connector_envelope",
+             description=("Compose a connector-substrate wire body from a local memory + "
+                          "connector_id. Powers /remember push <connector-id> orchestration. "
+                          "Combines load_connectors_config + export_record + connector ABC "
+                          "(build_envelope_from_record + format_envelope) into one call. "
+                          "Returns {body, channel, connector_id, type, submitted_at, envelope, "
+                          "body_size} on success — pass `body` as the `message` arg to "
+                          "slack_send_message; `channel` is the connector.json channel value "
+                          "(may need slack_search_channels resolution if it's a name not an id). "
+                          "Use submitted_at to advance the connector cursor on success via "
+                          "set_connector_cursor. Errors include connector_config_invalid, "
+                          "connector_not_found, memory_not_found, build_envelope_failed, and "
+                          "body_too_large_for_substrate."),
+             inputSchema={"type": "object", "properties": {
+                 "memory_id":    {"type": "string",
+                                  "description": "Local memory id (from store/search/export)."},
+                 "connector_id": {"type": "string",
+                                  "description": "Connector entry's id field in connector.json."},
+             }, "required": ["memory_id", "connector_id"]}),
+        Tool(name="get_connector_cursor",
+             description=("Read the persisted cursor (ISO timestamp) for a connector — the "
+                          "submitted_at of the latest entry successfully pushed/pulled. Returns "
+                          "{connector_id, cursor: str | null}. null means no cursor yet (first "
+                          "push/pull). Used by /remember push to filter local memories whose "
+                          "submitted_at > cursor, and by /remember pull as the substrate query "
+                          "lower bound."),
+             inputSchema={"type": "object", "properties": {
+                 "connector_id": {"type": "string"},
+             }, "required": ["connector_id"]}),
+        Tool(name="set_connector_cursor",
+             description=("Persist a cursor (ISO-8601 timestamp string) for a connector. "
+                          "Atomic write to ~/.local/share/mem-fusion/connector_cursors.json. "
+                          "Called by /remember push|pull after each successful operation. "
+                          "Idempotent. Returns {status: 'ok', connector_id, cursor}."),
+             inputSchema={"type": "object", "properties": {
+                 "connector_id": {"type": "string"},
+                 "iso_ts":       {"type": "string",
+                                  "description": "ISO-8601 timestamp (typically the memory's submitted_at)."},
+             }, "required": ["connector_id", "iso_ts"]}),
         Tool(name="group_pull",
              description=("Pull new memories from peers via the local Constellation daemon. "
                           "Omit `group` to iterate every configured group with peers; pass "
@@ -192,6 +244,10 @@ async def dispatch(name, args):
     if name == "export_record":  return await core.export_record(args)
     if name == "add_groups":         return await core.add_groups(args)
     if name == "add_connector_ids":  return await core.add_connector_ids(args)
+    if name == "load_connectors_config":   return await core.load_connectors_config_tool(args)
+    if name == "build_connector_envelope": return await core.build_connector_envelope(args)
+    if name == "get_connector_cursor":     return await core.get_connector_cursor_tool(args)
+    if name == "set_connector_cursor":     return await core.set_connector_cursor_tool(args)
     if name == "group_pull":         return await group_pull(args)
     if name == "group_push":         return await group_push(args)
     raise ValueError(f"Unknown tool: {name}")

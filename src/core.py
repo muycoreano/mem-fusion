@@ -714,6 +714,254 @@ def set_connector_cursor(connector_id: str, iso_ts: str) -> None:
     os.replace(tmp_path, CONNECTOR_CURSORS_PATH)
 
 
+# ── v0.5 connector.json schema + envelope rendering (G3, push orchestration) ─
+
+CONNECTORS_CONFIG_PATH = Path(os.getenv(
+    "MEMFUSION_CONNECTORS_CONFIG",
+    str(Path.home() / ".local/share/mem-fusion/connector.json"),
+))
+
+#: Type-specific required fields per connector type, validated in
+#: load_connectors_config. Keep in lock-step with src/connectors/_REGISTRY.
+_CONNECTOR_TYPE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "slack": ("channel",),
+}
+
+
+def load_connectors_config(path: str | None = None) -> dict:
+    """Load and validate ~/.local/share/mem-fusion/connector.json (G3).
+
+    Architect-acked at docs/v0.5_ARCHITECT_ACK_2026-05-17.md §D G3.
+    Closes a real foot-gun: malformed configs used to fail at first push
+    with confusing TypeErrors deep in MCP plumbing.
+
+    Returns:
+      {
+        "connectors":  list[dict]  — validated entries (id, type, ...),
+        "errors":      list[str]   — blocking errors; non-empty → caller bails,
+        "warnings":    list[str]   — non-blocking; caller surfaces,
+        "config_path": str,
+      }
+
+    Validation:
+      - File exists + parses as JSON.
+      - Top-level shape is {"connectors": list}.
+      - Each entry is a dict.
+      - `id` (str, non-empty) + `type` (str, non-empty) required.
+      - `id` unique within the list.
+      - `type` is a known connector type (currently: "slack").
+      - Type-specific required fields present per
+        _CONNECTOR_TYPE_REQUIRED_FIELDS.
+
+    Optional fields tolerated (per architect ack §B.1):
+      - `first_pull_max_age_days: int | None` — first-pull cap knob.
+
+    Never raises — returns errors in the dict instead, so callers can
+    render them to the user without catching exceptions.
+    """
+    cfg_path = Path(path) if path else CONNECTORS_CONFIG_PATH
+    out = {
+        "connectors":  [],
+        "errors":      [],
+        "warnings":    [],
+        "config_path": str(cfg_path),
+    }
+    if not cfg_path.exists():
+        out["errors"].append(
+            f"connector.json not found at {cfg_path}. "
+            f"Create it with at least one connector entry, e.g.: "
+            f'{{"connectors": [{{"id": "engineering", "type": "slack", "channel": "C0XXXXXXX"}}]}}'
+        )
+        return out
+    try:
+        with open(cfg_path) as f:
+            raw = json.load(f)
+    except json.JSONDecodeError as e:
+        out["errors"].append(f"connector.json is not valid JSON: {e}")
+        return out
+    except OSError as e:
+        out["errors"].append(f"connector.json could not be read: {e}")
+        return out
+
+    if not isinstance(raw, dict):
+        out["errors"].append(
+            f"connector.json must be a JSON object with a 'connectors' list; "
+            f"got {type(raw).__name__}"
+        )
+        return out
+    entries = raw.get("connectors")
+    if not isinstance(entries, list):
+        out["errors"].append(
+            "connector.json missing or invalid 'connectors' list; expected "
+            "{\"connectors\": [{...}, ...]}"
+        )
+        return out
+
+    seen_ids: set[str] = set()
+    from connectors import list_connector_types
+    known_types = set(list_connector_types())
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            out["errors"].append(f"connectors[{idx}]: must be an object, got {type(entry).__name__}")
+            continue
+        # id
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str) or not entry_id:
+            out["errors"].append(f"connectors[{idx}]: 'id' must be a non-empty string")
+            continue
+        if entry_id in seen_ids:
+            out["errors"].append(f"connectors[{idx}]: duplicate id {entry_id!r}")
+            continue
+        seen_ids.add(entry_id)
+        # type
+        entry_type = entry.get("type")
+        if not isinstance(entry_type, str) or not entry_type:
+            out["errors"].append(f"connectors[{idx}] ({entry_id!r}): 'type' must be a non-empty string")
+            continue
+        if entry_type not in known_types:
+            out["errors"].append(
+                f"connectors[{idx}] ({entry_id!r}): unknown type {entry_type!r}; "
+                f"available: {sorted(known_types)}"
+            )
+            continue
+        # type-specific required fields
+        missing = [f for f in _CONNECTOR_TYPE_REQUIRED_FIELDS.get(entry_type, ())
+                   if not isinstance(entry.get(f), str) or not entry.get(f)]
+        if missing:
+            out["errors"].append(
+                f"connectors[{idx}] ({entry_id!r}, type={entry_type!r}): "
+                f"missing required field(s): {missing}"
+            )
+            continue
+        out["connectors"].append(entry)
+    return out
+
+
+async def load_connectors_config_tool(args: dict) -> dict:
+    """MCP tool wrapper for load_connectors_config (G3).
+
+    Renders the same structure synchronously — wrapped async only because
+    the MCP dispatch table is async-uniform. Argument `path` is optional
+    and used for tests; production callers omit and get the default
+    ~/.local/share/mem-fusion/connector.json.
+    """
+    return load_connectors_config(args.get("path"))
+
+
+async def build_connector_envelope(args: dict) -> dict:
+    """Compose a connector-substrate wire payload from a local memory.
+
+    The single-call primitive that powers /remember push <connector-id>
+    orchestration. Combines: load_connectors_config → export_record →
+    Connector.build_envelope_from_record → Connector.format_envelope.
+    Returns everything the skill needs to call the substrate's send-
+    message MCP tool (Slack: `slack_send_message`).
+
+    Inputs (args):
+      memory_id    — id of a local memory (from export_record / search)
+      connector_id — connector entry's id field in connector.json
+
+    Returns one of:
+      {
+        body:         str,    # the rendered message body for slack_send_message
+        channel:      str,    # `channel` field from connector.json (may be name
+                              # or id; caller resolves names via slack_search_channels)
+        connector_id: str,    # echo of input
+        type:         str,    # connector type (e.g., "slack")
+        submitted_at: str,    # the memory's submitted_at (for cursor advancement)
+        envelope:     dict,   # full envelope dict (for diagnostics / logs)
+        body_size:    int,    # len(body) in chars
+      }
+
+      {error: "connector_config_invalid",     detail: [str], ...}
+      {error: "connector_not_found",          detail: str, available: [str]}
+      {error: "memory_not_found",             detail: str}
+      {error: "build_envelope_failed",        detail: str}     # missing origin_node etc.
+      {error: "body_too_large_for_substrate", detail: str, size: int, limit: int}
+
+    NOT exposed: a "push" tool that calls Slack. The skill orchestrates
+    `slack_send_message` separately so connector code never depends on
+    the Slack MCP layer (per architecture doc §6 — orchestration in the
+    skill, not in mem-fusion's process).
+    """
+    memory_id    = args.get("memory_id")
+    connector_id = args.get("connector_id")
+    if not isinstance(memory_id, str) or not memory_id:
+        return {"error": "missing_argument",
+                "detail": "memory_id required (non-empty string)"}
+    if not isinstance(connector_id, str) or not connector_id:
+        return {"error": "missing_argument",
+                "detail": "connector_id required (non-empty string)"}
+
+    cfg = load_connectors_config()
+    if cfg["errors"]:
+        return {"error": "connector_config_invalid", "detail": cfg["errors"]}
+
+    entry = next((c for c in cfg["connectors"] if c["id"] == connector_id), None)
+    if entry is None:
+        return {"error": "connector_not_found",
+                "detail": f"no connector with id {connector_id!r} in {cfg['config_path']}",
+                "available": [c["id"] for c in cfg["connectors"]]}
+
+    record = await export_record({"id": memory_id})
+    if "error" in record:
+        return {"error": "memory_not_found", "detail": record["error"]}
+
+    from connectors import get_connector
+    try:
+        connector = get_connector(entry["type"])
+    except ValueError as e:
+        return {"error": "unknown_connector_type", "detail": str(e)}
+
+    try:
+        envelope = connector.build_envelope_from_record(record, connector_id)
+    except (TypeError, ValueError) as e:
+        return {"error": "build_envelope_failed", "detail": str(e)}
+
+    body = connector.format_envelope(envelope)
+    body_size = len(body)
+    # Slack §5.4: 40 KB body ceiling; 38 KB recommended push-side cap.
+    # Other substrates can override via a future Connector.max_body_size
+    # property (per audit's expanded ABC §"H4"); v0.5 hardcodes Slack's cap.
+    SUBSTRATE_BODY_CAP = 38_000
+    if body_size > SUBSTRATE_BODY_CAP:
+        return {"error": "body_too_large_for_substrate",
+                "detail": f"rendered body is {body_size} chars; "
+                          f"substrate cap is {SUBSTRATE_BODY_CAP} chars",
+                "size": body_size, "limit": SUBSTRATE_BODY_CAP}
+
+    return {
+        "body":         body,
+        "channel":      entry.get("channel", ""),
+        "connector_id": connector_id,
+        "type":         entry["type"],
+        "submitted_at": envelope.get("submitted_at", ""),
+        "envelope":     envelope,
+        "body_size":    body_size,
+    }
+
+
+async def get_connector_cursor_tool(args: dict) -> dict:
+    """MCP tool wrapper for get_connector_cursor. Returns {cursor: str|null}."""
+    connector_id = args.get("connector_id")
+    if not isinstance(connector_id, str) or not connector_id:
+        return {"error": "missing_argument", "detail": "connector_id required"}
+    return {"connector_id": connector_id,
+            "cursor": get_connector_cursor(connector_id)}
+
+
+async def set_connector_cursor_tool(args: dict) -> dict:
+    """MCP tool wrapper for set_connector_cursor."""
+    connector_id = args.get("connector_id")
+    iso_ts       = args.get("iso_ts")
+    if not isinstance(connector_id, str) or not connector_id:
+        return {"error": "missing_argument", "detail": "connector_id required"}
+    if not isinstance(iso_ts, str) or not iso_ts:
+        return {"error": "missing_argument", "detail": "iso_ts required (non-empty string)"}
+    set_connector_cursor(connector_id, iso_ts)
+    return {"status": "ok", "connector_id": connector_id, "cursor": iso_ts}
+
+
 async def search_memory(args: dict) -> dict:
     """Semantic search via cosine similarity on the local collection.
 

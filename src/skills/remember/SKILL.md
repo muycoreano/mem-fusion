@@ -107,6 +107,68 @@ When the user invokes `/remember push <connector-id>`:
 - **No parallel sends.** Slack's rate-limit budget is per-app; parallel sends share the budget anyway. Sequential is simpler and deterministic.
 - **No body truncation.** A memory rendering over 38 KB is reported as a failure (`body_too_large_for_substrate`) rather than silently chopped — chopping breaks the integrity check on the receiver.
 
+### Connector pull orchestration (`/remember pull <connector-id>`)
+
+Symmetric counterpart to push. Reads new messages from the connector's substrate, parses, dedups, and stores. The skill composes one mem-fusion MCP primitive (`ingest_connector_message`) with the substrate's read-channel MCP (`slack_read_channel`). There is **no `connector_pull` MCP tool** — orchestration lives in the skill for the same reason as push (substrate independence at the connector-code layer).
+
+#### Procedure
+
+When the user invokes `/remember pull <connector-id>`:
+
+1. **Load + validate config (G3).** `mem-fusion/load_connectors_config`. If `errors` is non-empty, render to user and ABORT.
+
+2. **Resolve the connector.** Look for `<connector-id>` in `connectors`. If absent: error with the available ids.
+
+3. **Resolve channel value to a Slack channel id** (if it isn't one already, same as push step 4b).
+
+4. **(Optional) bot-user invite preflight** (architect-acked at FIRST_PULL_SEMANTICS §B.2). Call `slack_list_channel_members(channel_id)` and verify the connector's bot user is a member. If not: render *"the bot user isn't a member of this channel; invite it via `/invite @<bot>` and re-run"* and abort. Converts Slack's opaque `channel_not_found` into a clear remediation hint.
+
+5. **Get cursor.** `mem-fusion/get_connector_cursor(connector_id)`. `null` means first-pull.
+
+6. **Compute the `oldest` parameter** for `slack_read_channel`:
+   - If cursor is set: convert the ISO timestamp to a Slack unix-ts (Slack expects `<unix seconds>.<microseconds>`).
+   - If first-pull AND the connector entry has `first_pull_max_age_days: N` (architect-acked knob, FIRST_PULL_SEMANTICS §B.1): set `oldest = now - N days`. Default is `None` → full back-fill.
+   - If first-pull and no cap: omit `oldest` (full channel history).
+
+7. **Paginate through `slack_read_channel`.** Slack returns oldest-first within each page with a `cursor` for the next page. For each message body returned:
+
+   a. `mem-fusion/ingest_connector_message(body=<msg.text>, connector_id="<id>")` — returns one of `stored / merged / duplicate / loopback_skipped / smoke_test_skipped / not_envelope / {error: ...}`. Each outcome (except errors and `not_envelope`) carries `submitted_at` for cursor tracking.
+
+   b. Aggregate counts per outcome class. Track the MAX `submitted_at` across `stored` + `merged` outcomes for cursor advancement.
+
+8. **Advance cursor on completion** (not per-message). `mem-fusion/set_connector_cursor(connector_id, iso_ts=<max_submitted_at>)`. This is interruption-safe — a partial pull (page-fetch failure mid-way) leaves the cursor unchanged, and the next `/remember pull` re-runs from the same point. Re-ingest is cheap via content_hash dedup.
+
+9. **Render per-outcome telemetry**. Group by status; never dump JSON. Example:
+
+   ```
+   ✓ Pulled from connector "engineering" (channel #mem_fusion_engineering, C0XXXXXXX):
+       - 12 new memories stored
+       - 3 already had the content (duplicate, no change)
+       - 2 own posts skipped (loopback prevention)
+       - 1 smoke-test message skipped (G11)
+   Cursor advanced to 2026-05-18T07:00:00+00:00
+   ```
+
+#### G11 smoke-test filter (receive-side)
+
+`ingest_connector_message` filters envelopes with `is_smoke_test: true` by default — the field stays in the envelope (extension-tolerant) but the receiver skips storage. Override with `include_smoke_tests=true` only when the caller IS the e2e validation against `#mf-test-connector`. Keeps the test scaffolding out of production memory stores.
+
+#### First-pull semantics
+
+The first pull from a brand-new connector (cursor is `null`) reads the full channel history by default. If the channel is very large, set `first_pull_max_age_days: N` on the connector entry in `connector.json`:
+
+```json
+{"id": "engineering", "type": "slack", "channel": "C0XXXXXXX", "first_pull_max_age_days": 90}
+```
+
+This caps the first-pull to the last 90 days. After the first successful pull lands and the cursor advances, the knob is no longer consulted (subsequent pulls are cursor-based). Architect-acked at `docs/v0.5_ARCHITECT_ACK_2026-05-17.md` §B.1.
+
+#### What the orchestration does NOT do
+
+- **No parallel pulls.** Slack's rate-limit budget is per-app; parallel pulls share the budget. Sequential is simpler and the wall-clock cost of 2–3 sequential first-pulls is small enough not to matter at v0.5 scale.
+- **No Slack-posted progress.** v0.5 logs to a local file under `~/.local/share/mem-fusion/logs/` only. Posting progress to Slack from inside the connector creates a backchannel that obscures the actual memory flow.
+- **No retry loop on `slack_read_channel` failure.** Surface the error and let the user re-run — cursor only advances on completion, so re-runs naturally resume.
+
 ### Suggest-pull-on-declare (G5)
 
 When you detect a new connector entry in `connector.json` (one where `get_connector_cursor(id)` returns `null` and the connector is otherwise newly seen this session), surface a one-line suggestion:

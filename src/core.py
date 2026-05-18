@@ -941,6 +941,93 @@ async def build_connector_envelope(args: dict) -> dict:
     }
 
 
+async def ingest_connector_message(args: dict) -> dict:
+    """Parse + ingest one substrate message body. Powers /remember pull.
+
+    The symmetric primitive to `build_connector_envelope`. Combines:
+      Connector.parse_envelope(body)
+        → smoke-test filter (G11; default skip is_smoke_test=true)
+        → core.store_memory_from_envelope(envelope, connector_type)
+
+    Inputs (args):
+      body                — the substrate message body (e.g., one Slack message)
+      connector_id        — connector entry id in connector.json
+      include_smoke_tests — optional bool; default false. When false, envelopes
+                            with `is_smoke_test: true` are filtered before
+                            storage and return {status: "smoke_test_skipped"}.
+                            G11 receive-side filter — keeps the pre-launch
+                            test message scaffolding (#mf-test-connector) out
+                            of production memory stores by default.
+
+    Returns one of:
+      {"status": "stored",            "id": ..., "connector_ids": [...],
+                                       "submitted_at": ...}
+      {"status": "merged",            "id": ..., "connector_ids": [...],
+                                       "submitted_at": ...}
+      {"status": "duplicate",         "id": ..., "submitted_at": ...}
+      {"status": "loopback_skipped",  "detail": ...,
+                                       "submitted_at": ...}
+      {"status": "smoke_test_skipped","detail": "is_smoke_test=true; skip"}
+      {"status": "not_envelope",      "detail": "no fenced envelope found in body"}
+      {"error":  "integrity_failed",  "detail": ...,            "submitted_at": ...?}
+      {"error":  "missing_field",     "detail": ...}
+      {"error":  "connector_config_invalid", "detail": [str]}
+      {"error":  "connector_not_found",      "detail": str, "available": [str]}
+      {"error":  "missing_argument",  "detail": str}
+
+    The `submitted_at` field appears on outcomes where it could be parsed
+    (everything that got past parse_envelope) — callers use it to advance
+    the cursor at end-of-pull.
+    """
+    body         = args.get("body")
+    connector_id = args.get("connector_id")
+    include_smoke = bool(args.get("include_smoke_tests", False))
+
+    if not isinstance(body, str):
+        return {"error": "missing_argument",
+                "detail": "body required (string)"}
+    if not isinstance(connector_id, str) or not connector_id:
+        return {"error": "missing_argument",
+                "detail": "connector_id required (non-empty string)"}
+
+    cfg = load_connectors_config()
+    if cfg["errors"]:
+        return {"error": "connector_config_invalid", "detail": cfg["errors"]}
+
+    entry = next((c for c in cfg["connectors"] if c["id"] == connector_id), None)
+    if entry is None:
+        return {"error": "connector_not_found",
+                "detail": f"no connector with id {connector_id!r} in {cfg['config_path']}",
+                "available": [c["id"] for c in cfg["connectors"]]}
+
+    connector_type = entry["type"]
+    from connectors import get_connector
+    try:
+        connector = get_connector(connector_type)
+    except ValueError as e:
+        return {"error": "unknown_connector_type", "detail": str(e)}
+
+    envelope = connector.parse_envelope(body)
+    if envelope is None:
+        return {"status": "not_envelope",
+                "detail": "no fenced envelope found in body (likely a "
+                          "human-authored message in this channel)"}
+
+    # G11: receive-side smoke-test filter. Default skip; override with
+    # include_smoke_tests=true if the caller is e2e-testing against this
+    # exact channel.
+    if envelope.get("is_smoke_test") is True and not include_smoke:
+        return {"status": "smoke_test_skipped",
+                "detail": "envelope is_smoke_test=true; skipped per G11 default",
+                "submitted_at": envelope.get("submitted_at", "")}
+
+    result = await store_memory_from_envelope(envelope, connector_type)
+    # Surface submitted_at for cursor advancement on success outcomes.
+    if "submitted_at" not in result:
+        result["submitted_at"] = envelope.get("submitted_at", "")
+    return result
+
+
 async def get_connector_cursor_tool(args: dict) -> dict:
     """MCP tool wrapper for get_connector_cursor. Returns {cursor: str|null}."""
     connector_id = args.get("connector_id")

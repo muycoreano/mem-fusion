@@ -174,6 +174,28 @@ async def list_tools():
                  "connector_id": {"type": "string",
                                   "description": "Connector entry's id field in connector.json."},
              }, "required": ["memory_id", "connector_id"]}),
+        Tool(name="ingest_connector_message",
+             description=("Parse a substrate message body, verify integrity, and ingest "
+                          "into the local memory store. Powers /remember pull <connector-id> "
+                          "orchestration. Composes Connector.parse_envelope + G11 smoke-test "
+                          "filter + store_memory_from_envelope. Pass body verbatim from "
+                          "slack_read_channel's message text + connector_id from connector.json. "
+                          "Outcomes: stored / merged / duplicate / loopback_skipped / "
+                          "smoke_test_skipped / not_envelope (this message wasn't connector "
+                          "traffic — skip and continue iterating). Errors: integrity_failed / "
+                          "missing_field / connector_config_invalid / connector_not_found. "
+                          "Each outcome carries submitted_at when parseable — caller uses the "
+                          "MAX across stored outcomes to advance the cursor at end-of-pull "
+                          "via set_connector_cursor. Set include_smoke_tests=true ONLY when "
+                          "the caller is e2e-testing against this exact channel; default false "
+                          "keeps test scaffolding out of the production store."),
+             inputSchema={"type": "object", "properties": {
+                 "body":               {"type": "string",
+                                        "description": "Substrate message body (Slack: message text)."},
+                 "connector_id":       {"type": "string"},
+                 "include_smoke_tests":{"type": "boolean", "default": False,
+                                        "description": "Override G11 filter. Default false."},
+             }, "required": ["body", "connector_id"]}),
         Tool(name="get_connector_cursor",
              description=("Read the persisted cursor (ISO timestamp) for a connector — the "
                           "submitted_at of the latest entry successfully pushed/pulled. Returns "
@@ -246,6 +268,7 @@ async def dispatch(name, args):
     if name == "add_connector_ids":  return await core.add_connector_ids(args)
     if name == "load_connectors_config":   return await core.load_connectors_config_tool(args)
     if name == "build_connector_envelope": return await core.build_connector_envelope(args)
+    if name == "ingest_connector_message": return await core.ingest_connector_message(args)
     if name == "get_connector_cursor":     return await core.get_connector_cursor_tool(args)
     if name == "set_connector_cursor":     return await core.set_connector_cursor_tool(args)
     if name == "group_pull":         return await group_pull(args)

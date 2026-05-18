@@ -165,8 +165,8 @@ fi
 log ""
 log "── Verification: get_entries_for_pull is cursor-agnostic ──"
 "$VENV_PY" - <<'PYEOF'
-import sys
-sys.path.insert(0, "/Users/mcoopet/.local/share/mem-fusion")
+import os, sys
+sys.path.insert(0, os.path.expanduser("~/.local/share/mem-fusion"))
 import core
 no_cursor = core.get_entries_for_pull("personal", None)
 with_cursor = core.get_entries_for_pull("personal", "2030-01-01T00:00:00+00:00")

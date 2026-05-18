@@ -128,6 +128,20 @@ async def list_tools():
                  "groups":     {"type": "array", "items": {"type": "string"},
                                 "description": "Groups to add (additive union)"},
              }, "required": ["memory_ids", "groups"]}),
+        Tool(name="add_connector_ids",
+             description=("Additively tag one or more existing memories with v0.5 connector IDs. "
+                          "Use for the store-now-share-later workflow under the v0.5 connector "
+                          "model: store memories (default connector_ids=[], local-only), then "
+                          "later add a connector id before calling `/remember push <connector-id>`. "
+                          "Never removes a connector_id — only adds. Same shape as add_groups; "
+                          "returns {updated, no_op, errors} telemetry. Render a brief summary."),
+             inputSchema={"type": "object", "properties": {
+                 "memory_ids":    {"type": "array", "items": {"type": "string"},
+                                   "description": "IDs from prior store_memory / search results"},
+                 "connector_ids": {"type": "array", "items": {"type": "string"},
+                                   "description": "Connector IDs to add (additive union); "
+                                                  "must match an id in ~/.local/share/mem-fusion/connector.json"},
+             }, "required": ["memory_ids", "connector_ids"]}),
         Tool(name="group_pull",
              description=("Pull new memories from peers via the local Constellation daemon. "
                           "Omit `group` to iterate every configured group with peers; pass "
@@ -176,9 +190,10 @@ async def dispatch(name, args):
     if name == "get_related":    return await core.get_related(args)
     if name == "memory_stats":   return await core.memory_stats(args)
     if name == "export_record":  return await core.export_record(args)
-    if name == "add_groups":     return await core.add_groups(args)
-    if name == "group_pull":     return await group_pull(args)
-    if name == "group_push":     return await group_push(args)
+    if name == "add_groups":         return await core.add_groups(args)
+    if name == "add_connector_ids":  return await core.add_connector_ids(args)
+    if name == "group_pull":         return await group_pull(args)
+    if name == "group_push":         return await group_push(args)
     raise ValueError(f"Unknown tool: {name}")
 
 

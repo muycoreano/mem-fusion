@@ -47,22 +47,30 @@ Connector wins on collision: if a name appears in both files, v0.5 routing takes
 ## Command surface
 
 ```
-/remember <content>                              → store with groups=[personal]
-/remember <content> for <group>                  → store with groups=[<group>] + push
-/remember <content> for <g1>, <g2>, …            → store with groups=[g1,g2,…] + push each
-/remember push                                   → bulk push personal group only (privacy default)
-/remember push <group>                           → bulk push one group's memories
-/remember pull                                   → bulk pull every configured group
-/remember pull <group>                           → pull one group's peers
+/remember <content>                              → store local-only (connector_ids=[])
+/remember <content> for <name>                   → store + push to <name>
+/remember <content> for <n1>, <n2>, …            → store tagged with each + push each
+/remember push <name>                            → bulk push everything tagged with <name>
+/remember pull <name>                            → pull from <name>'s substrate
 ```
+
+`<name>` resolves via dispatch (see "Name resolution" above): first against `connector.json` entries; on miss, falls back to a Constellation `config.json` membership for legacy peers.
+
+**Bare `/remember push` and bare `/remember pull` are NOT valid in v0.5.** The privacy invariant requires explicit naming for any outbound propagation — there is no `personal` fallback, no implicit fan-out across configured connectors. Asking for a bare push/pull errors with a list of available `<name>` options.
 
 Plus the natural-language path Claude handles via reasoning:
 
 | User phrase | Action |
 |---|---|
-| *"share those memories with `<group>`"* | Resolve *those* from session context, call `add_groups(ids, [group])`, then `group_push(group, memory_ids=ids)`. |
-| *"also share them with `<group>`"* | Add the new group, push **only** to that group. Don't re-push prior groups — they already have it. |
-| *"make sure all your groups have these"* | For each group in the memory's `groups` list, call `group_push(group, memory_ids=ids)`. |
+| *"share those memories with `<name>`"* | Resolve *those* from session context. If `<name>` resolves to a **connector** → call `add_connector_ids(ids, [name])`, then `/remember push <name>` for the targeted memory_ids. If it resolves to a Constellation **group** → call `add_groups(ids, [name])`, then `group_push(group=name, memory_ids=ids)`. |
+| *"also share them with `<name>`"* | Add the new connector_id / group, push **only** to that one. Don't re-push prior targets — they already have it. |
+| *"make sure all your connectors have these"* | For each connector_id in the memory's `connector_ids` list, run the per-connector push flow once. |
+
+### Legacy v0.4 behaviors (preserved during transition, removed in a future cleanup)
+
+- `groups: [...]` payload field still deserializes; ignored at scope-determination. v0.4 memories continue to work; the architectural surface above is what users should reach for going forward.
+- `/remember <content> for <group>` where `<group>` was a Constellation group name still works via the dispatch fallback; new content should prefer connectors.
+- `add_groups(memory_ids, groups)` MCP tool still exists for legacy widening; new flows use `add_connector_ids(memory_ids, connector_ids)`.
 
 ## Protocol
 

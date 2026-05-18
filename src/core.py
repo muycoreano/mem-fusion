@@ -247,6 +247,32 @@ def normalize_groups_arg(groups) -> list[str]:
     return cleaned or list(DEFAULT_GROUPS)
 
 
+# ── v0.5 connector_ids helpers (architecture doc §4) ──────────────────────
+# `connector_ids: list[str]` is the v0.5 connector-routing tag. Absent or
+# empty → memory is local-only (the new default; the v0.4 `groups: [personal]`
+# default was a scope-determination tag and is now ignored per §4 Migration).
+# A memory tagged with a connector id becomes eligible for push to THAT
+# connector via `/remember push <connector-id>`. Multi-tagging supported;
+# pushes are per-connector (push to "engineering" doesn't fan out to
+# "marketing"). Union semantics on add (additive only — un-tagging would
+# require cross-connector retraction, deferred).
+def entry_connector_ids(payload: dict) -> list[str]:
+    """Read a payload's connector_ids, defaulting to [] for legacy entries."""
+    cids = payload.get("connector_ids")
+    return list(cids) if isinstance(cids, list) else []
+
+
+def normalize_connector_ids_arg(connector_ids) -> list[str]:
+    """Coerce a caller-supplied connector_ids arg into a clean canonical list.
+
+    Returns [] for None / non-list / empty input. Unlike groups, the default
+    is empty (local-only) — there is no `personal` analog.
+    """
+    if not isinstance(connector_ids, list) or not connector_ids:
+        return []
+    return union_groups(connector_ids)  # reuse: order-preserving dedup union
+
+
 def find_existing_by_hash(chash: str) -> tuple[str, dict] | None:
     """Return (point_id, payload) for an entry with this content_hash, else None."""
     try:
@@ -280,7 +306,7 @@ def since_to_filter(since: str | None):
         return None
 
 
-def build_filter(project=None, type_=None, since=None, min_importance=1):
+def build_filter(project=None, type_=None, since=None, min_importance=1, connector_id=None):
     """Compose a Qdrant Filter from optional fields."""
     conditions = []
     if project:
@@ -292,23 +318,29 @@ def build_filter(project=None, type_=None, since=None, min_importance=1):
         conditions.append(f)
     if min_importance and min_importance > 1:
         conditions.append(FieldCondition(key="importance", range=Range(gte=min_importance)))
+    if connector_id:
+        # Qdrant keyword-list match: includes any point whose connector_ids
+        # list contains the given value. Indexed via the `connector_ids`
+        # payload index (added at init_collection time).
+        conditions.append(FieldCondition(key="connector_ids", match=MatchValue(value=connector_id)))
     return Filter(must=conditions) if conditions else None
 
 
 def format_results(hits):
     """Shape Qdrant hits into the wire-friendly result format."""
     return [{
-        "id":          str(h.id),
-        "score":       round(h.score, 4),
-        "content":     h.payload.get("content", ""),
-        "type":        h.payload.get("type", ""),
-        "project":     h.payload.get("project", ""),
-        "tags":        h.payload.get("tags", []),
-        "importance":  h.payload.get("importance", 3),
-        "timestamp":   h.payload.get("timestamp", ""),
-        "origin_node": h.payload.get("origin_node", ""),
-        "received_at": h.payload.get("received_at", ""),
-        "groups":      entry_groups(h.payload or {}),
+        "id":             str(h.id),
+        "score":          round(h.score, 4),
+        "content":        h.payload.get("content", ""),
+        "type":           h.payload.get("type", ""),
+        "project":        h.payload.get("project", ""),
+        "tags":           h.payload.get("tags", []),
+        "importance":     h.payload.get("importance", 3),
+        "timestamp":      h.payload.get("timestamp", ""),
+        "origin_node":    h.payload.get("origin_node", ""),
+        "received_at":    h.payload.get("received_at", ""),
+        "groups":         entry_groups(h.payload or {}),
+        "connector_ids":  entry_connector_ids(h.payload or {}),
     } for h in hits]
 
 
@@ -322,25 +354,31 @@ async def store_memory(args: dict) -> dict:
                                            (class is one of ollama_unreachable,
                                            embed_failed, embed_unexpected)
     """
-    content    = args["content"]
-    type_      = args["type"]
-    tags       = args.get("tags", [])
-    project    = args.get("project", "")
-    importance = int(args.get("importance", 3))
-    session_id = args.get("session_id", "")
-    groups     = normalize_groups_arg(args.get("groups"))
+    content       = args["content"]
+    type_         = args["type"]
+    tags          = args.get("tags", [])
+    project       = args.get("project", "")
+    importance    = int(args.get("importance", 3))
+    session_id    = args.get("session_id", "")
+    groups        = normalize_groups_arg(args.get("groups"))
+    connector_ids = normalize_connector_ids_arg(args.get("connector_ids"))
 
     chash    = content_hash(content)
     existing = find_existing_by_hash(chash)
     if existing:
         existing_id, payload = existing
-        current = entry_groups(payload)
-        merged  = union_groups(current, groups)
-        if merged == current:
-            return {"status": "duplicate", "id": existing_id, "groups": current}
+        current_g  = entry_groups(payload)
+        current_c  = entry_connector_ids(payload)
+        merged_g   = union_groups(current_g, groups)
+        merged_c   = union_groups(current_c, connector_ids)
+        if merged_g == current_g and merged_c == current_c:
+            return {"status": "duplicate", "id": existing_id,
+                    "groups": current_g, "connector_ids": current_c}
+        payload_update = {"groups": merged_g, "connector_ids": merged_c}
         qdrant.set_payload(collection_name=COLLECTION,
-                           payload={"groups": merged}, points=[existing_id])
-        return {"status": "merged", "id": existing_id, "groups": merged}
+                           payload=payload_update, points=[existing_id])
+        return {"status": "merged", "id": existing_id,
+                "groups": merged_g, "connector_ids": merged_c}
 
     vec = await embed(content)
     if isinstance(vec, dict):
@@ -354,10 +392,12 @@ async def store_memory(args: dict) -> dict:
             "content": content, "type": type_, "tags": tags, "project": project,
             "importance": importance, "session_id": session_id,
             "content_hash": chash, "timestamp": ts,
-            "groups": groups, "origin_node": _resolve_node_name(), "submitted_at": ts,
+            "groups": groups, "connector_ids": connector_ids,
+            "origin_node": _resolve_node_name(), "submitted_at": ts,
         },
     )])
-    return {"status": "stored", "id": point_id, "groups": groups}
+    return {"status": "stored", "id": point_id,
+            "groups": groups, "connector_ids": connector_ids}
 
 
 async def add_groups(args: dict) -> dict:
@@ -404,20 +444,141 @@ async def add_groups(args: dict) -> dict:
     return {"updated": updated, "no_op": no_op, "errors": errors}
 
 
+async def add_connector_ids(args: dict) -> dict:
+    """Additive union of connector_ids on existing entries.
+
+    Inputs:  memory_ids: list[str], connector_ids: list[str]
+    Returns: {updated: [{id, connector_ids, added}],
+              no_op:   [{id, connector_ids}],
+              errors:  [{id, reason}]}
+
+    Additive only — same shape as add_groups. v0.4 add_groups exists for
+    legacy `groups` widening; this is the v0.5 parallel for connector
+    routing (architecture doc §4 Migration).
+
+    Use case: store memories with `connector_ids=[]` (local-only default),
+    then later say "share with engineering" → Claude calls
+    `add_connector_ids(memory_ids=[...], connector_ids=["engineering"])`
+    followed by `/remember push engineering` to ship them out.
+    """
+    memory_ids = args.get("memory_ids", [])
+    incoming   = args.get("connector_ids", [])
+    if not isinstance(memory_ids, list) or not memory_ids:
+        return {"error": "missing_argument",
+                "detail": "memory_ids required (non-empty list[str])"}
+    if not isinstance(incoming, list) or not incoming:
+        return {"error": "missing_argument",
+                "detail": "connector_ids required (non-empty list[str])"}
+    incoming = union_groups(incoming)  # order-preserving dedup (reused helper)
+
+    updated, no_op, errors = [], [], []
+    for mid in memory_ids:
+        try:
+            points = qdrant.retrieve(collection_name=COLLECTION,
+                                     ids=[mid], with_payload=True, with_vectors=False)
+        except Exception as e:
+            errors.append({"id": mid, "reason": f"retrieve_failed: {e}"})
+            continue
+        if not points:
+            errors.append({"id": mid, "reason": "not_found"})
+            continue
+        payload = dict(points[0].payload or {})
+        current = entry_connector_ids(payload)
+        merged  = union_groups(current, incoming)
+        if merged == current:
+            no_op.append({"id": mid, "connector_ids": current})
+            continue
+        added = [c for c in incoming if c not in current]
+        qdrant.set_payload(collection_name=COLLECTION,
+                           payload={"connector_ids": merged}, points=[mid])
+        updated.append({"id": mid, "connector_ids": merged, "added": added})
+
+    return {"updated": updated, "no_op": no_op, "errors": errors}
+
+
+# ── v0.5 per-connector cursor persistence (architecture doc §4 / §6.4) ────
+# Per-connector cursor file at ~/.local/share/mem-fusion/connector_cursors.json:
+#   {"<connector_id>": "<last_pulled_submitted_at_iso>", ...}
+# Read on /remember pull start, written after the pull completes successfully.
+# Setting cursor only on success makes pulls interruption-safe — partial
+# pulls re-run from "no cursor" state and content_hash dedup absorbs the
+# redundant work. See docs/v0.5_FIRST_PULL_SEMANTICS.md §3.6.
+CONNECTOR_CURSORS_PATH = Path(os.getenv(
+    "MEMFUSION_CONNECTOR_CURSORS",
+    str(Path.home() / ".local/share/mem-fusion/connector_cursors.json"),
+))
+
+
+def get_connector_cursor(connector_id: str) -> str | None:
+    """Return the persisted cursor (ISO timestamp string) for a connector,
+    or None if no cursor has been set yet, the file is missing, the key is
+    absent, or the file is corrupt. Never raises on filesystem errors.
+    """
+    if not connector_id:
+        return None
+    try:
+        if not CONNECTOR_CURSORS_PATH.exists():
+            return None
+        with open(CONNECTOR_CURSORS_PATH) as f:
+            cursors = json.load(f)
+        if not isinstance(cursors, dict):
+            log.warning("connector_cursors.json is not a dict; ignoring")
+            return None
+        val = cursors.get(connector_id)
+        return val if isinstance(val, str) else None
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("get_connector_cursor(%s) failed: %s", connector_id, e)
+        return None
+
+
+def set_connector_cursor(connector_id: str, iso_ts: str) -> None:
+    """Persist the cursor for a connector. Atomic via tempfile + os.replace.
+
+    Idempotent: setting the same value is a no-op observationally.
+    Concurrent writes to different keys preserve both (read-modify-write
+    under the assumption of single-process-per-machine; v0.5 doesn't have
+    cross-process concurrent cursor writers).
+    """
+    if not connector_id or not isinstance(iso_ts, str):
+        raise ValueError("connector_id and iso_ts must be non-empty strings")
+    CONNECTOR_CURSORS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    cursors: dict = {}
+    if CONNECTOR_CURSORS_PATH.exists():
+        try:
+            with open(CONNECTOR_CURSORS_PATH) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                cursors = loaded
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("set_connector_cursor: starting fresh — %s", e)
+    cursors[connector_id] = iso_ts
+    # Atomic write: write to temp file in same directory, then os.replace.
+    tmp_path = CONNECTOR_CURSORS_PATH.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(cursors, f, indent=2)
+    os.replace(tmp_path, CONNECTOR_CURSORS_PATH)
+
+
 async def search_memory(args: dict) -> dict:
-    """Semantic search via cosine similarity on the local collection."""
+    """Semantic search via cosine similarity on the local collection.
+
+    Optional `connector_id` filter: when set, returns only memories whose
+    `connector_ids` list contains that value (Qdrant keyword-list match).
+    """
     query          = args["query"]
     top_k          = min(int(args.get("top_k", 8)), 20)
     project        = args.get("project")
     type_          = args.get("type")
     since          = args.get("since")
     min_importance = int(args.get("min_importance", 1))
+    connector_id   = args.get("connector_id")
 
     vec = await embed(query)
     if isinstance(vec, dict):
         return vec  # error from embed() — propagate verbatim
 
-    filt = build_filter(project=project, type_=type_, since=since, min_importance=min_importance)
+    filt = build_filter(project=project, type_=type_, since=since,
+                        min_importance=min_importance, connector_id=connector_id)
     hits = qdrant.search(collection_name=COLLECTION, query_vector=vec,
                          limit=top_k, query_filter=filt, with_payload=True)
     results = format_results(hits)
@@ -445,6 +606,7 @@ async def search_recent(args: dict) -> dict:
         "timestamp": p.payload.get("timestamp", ""),
         "origin_node": p.payload.get("origin_node", ""),
         "received_at": p.payload.get("received_at", ""),
+        "connector_ids": entry_connector_ids(p.payload or {}),
     } for p in sorted(points, key=lambda x: x.payload.get("timestamp", ""), reverse=True)]
     return {"hours": hours, "count": len(results), "results": results}
 
@@ -482,13 +644,15 @@ async def upsert_memory(args: dict) -> dict:
 
 async def find_or_create(args: dict) -> dict:
     """Search for similar content first; store if no result above 0.82 similarity.
-    If a near-duplicate is found, additively merges the caller's groups into it."""
-    content    = args["content"]
-    type_      = args["type"]
-    tags       = args.get("tags", [])
-    project    = args.get("project", "")
-    importance = int(args.get("importance", 3))
-    groups     = normalize_groups_arg(args.get("groups"))
+    If a near-duplicate is found, additively merges the caller's groups
+    and connector_ids into it."""
+    content       = args["content"]
+    type_         = args["type"]
+    tags          = args.get("tags", [])
+    project       = args.get("project", "")
+    importance    = int(args.get("importance", 3))
+    groups        = normalize_groups_arg(args.get("groups"))
+    connector_ids = normalize_connector_ids_arg(args.get("connector_ids"))
 
     vec = await embed(content)
     if isinstance(vec, dict):
@@ -496,14 +660,22 @@ async def find_or_create(args: dict) -> dict:
 
     hits = qdrant.search(collection_name=COLLECTION, query_vector=vec, limit=1, with_payload=True)
     if hits and hits[0].score > 0.82:
-        hit_id  = str(hits[0].id)
-        current = entry_groups(hits[0].payload or {})
-        merged  = union_groups(current, groups)
-        if merged != current:
+        hit_id     = str(hits[0].id)
+        current_g  = entry_groups(hits[0].payload or {})
+        current_c  = entry_connector_ids(hits[0].payload or {})
+        merged_g   = union_groups(current_g, groups)
+        merged_c   = union_groups(current_c, connector_ids)
+        payload_update = {}
+        if merged_g != current_g:
+            payload_update["groups"] = merged_g
+        if merged_c != current_c:
+            payload_update["connector_ids"] = merged_c
+        if payload_update:
             qdrant.set_payload(collection_name=COLLECTION,
-                               payload={"groups": merged}, points=[hit_id])
+                               payload=payload_update, points=[hit_id])
         r = format_results([hits[0]])[0]
-        r["groups"] = merged
+        r["groups"] = merged_g
+        r["connector_ids"] = merged_c
         return {"status": "found", **r}
 
     chash    = content_hash(content)
@@ -514,11 +686,12 @@ async def find_or_create(args: dict) -> dict:
         payload={
             "content": content, "type": type_, "tags": tags, "project": project,
             "importance": importance, "content_hash": chash,
-            "timestamp": ts, "groups": groups,
+            "timestamp": ts, "groups": groups, "connector_ids": connector_ids,
             "origin_node": _resolve_node_name(), "submitted_at": ts,
         },
     )])
-    return {"status": "created", "id": point_id, "groups": groups}
+    return {"status": "created", "id": point_id,
+            "groups": groups, "connector_ids": connector_ids}
 
 
 async def delete_memory(args: dict) -> dict:
@@ -584,19 +757,20 @@ async def export_record(args: dict) -> dict:
     p  = points[0]
     pl = p.payload or {}
     return {
-        "id":           str(p.id),
-        "vector":       p.vector,
-        "content":      pl.get("content", ""),
-        "content_hash": pl.get("content_hash", ""),
-        "type":         pl.get("type", ""),
-        "tags":         pl.get("tags", []),
-        "project":      pl.get("project", ""),
-        "importance":   pl.get("importance", 3),
-        "session_id":   pl.get("session_id", ""),
-        "timestamp":    pl.get("timestamp", ""),
-        "groups":       entry_groups(pl),
-        "origin_node":  pl.get("origin_node", _resolve_node_name()),
-        "submitted_at": pl.get("submitted_at", pl.get("timestamp", "")),
+        "id":            str(p.id),
+        "vector":        p.vector,
+        "content":       pl.get("content", ""),
+        "content_hash":  pl.get("content_hash", ""),
+        "type":          pl.get("type", ""),
+        "tags":          pl.get("tags", []),
+        "project":       pl.get("project", ""),
+        "importance":    pl.get("importance", 3),
+        "session_id":    pl.get("session_id", ""),
+        "timestamp":     pl.get("timestamp", ""),
+        "groups":        entry_groups(pl),
+        "connector_ids": entry_connector_ids(pl),
+        "origin_node":   pl.get("origin_node", _resolve_node_name()),
+        "submitted_at":  pl.get("submitted_at", pl.get("timestamp", "")),
     }
 
 

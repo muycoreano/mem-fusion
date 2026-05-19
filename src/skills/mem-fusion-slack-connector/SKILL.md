@@ -59,7 +59,7 @@ Triggered by phrases like *"set up the Slack connector"*, *"connect mem-fusion t
    - `mem-fusion/store_memory({content: "<install-complete marker>", type: "context", tags: ["is_smoke_test"], connector_ids: ["<id>"]})`
    - `/remember push <id>` flow: `build_connector_envelope` → real `slack_send_message` → `set_connector_cursor`.
    - `slack_read_channel(channel_id, limit=1)` to verify the message landed.
-   - `mem-fusion/ingest_connector_message(body=<msg.text>, connector_id=<id>)` to verify the receive path parses + integrity-checks. Expect `loopback_skipped` (since we sent it) or `smoke_test_skipped` (the G11 default filter — verify the marker is honored).
+   - `mem-fusion/ingest_connector_message(body=<msg.text>, connector_id=<id>)` to verify the receive path parses + integrity-checks. Expect `loopback_skipped` — origin equals this peer, so the receive flow exits at the loopback gate before any further checks (this confirms parse + integrity passed without writing to the local store).
 
 8. **Report result** with a one-line summary of what was tested + what's now possible.
 

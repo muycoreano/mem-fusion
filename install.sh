@@ -147,7 +147,14 @@ log "  ok"
 step 5 "Python venv + requirements"
 if [[ ! -x "${VENV_PY}" ]]; then
     log "  creating venv with ${PYTHON312}..."
-    "${PYTHON312}" -m venv "${MEMFUSION}/venv"
+    rm -rf "${MEMFUSION}/venv"   # kill any partial state from a prior failed run
+    if ! "${PYTHON312}" -m venv "${MEMFUSION}/venv" 2>/tmp/mf-venv-err.log; then
+        log "  bundled ensurepip failed; retrying with --without-pip + get-pip.py..."
+        log "  (underlying error saved to /tmp/mf-venv-err.log)"
+        rm -rf "${MEMFUSION}/venv"
+        "${PYTHON312}" -m venv --without-pip "${MEMFUSION}/venv"
+        curl -fsSL https://bootstrap.pypa.io/get-pip.py | "${VENV_PY}"
+    fi
     "${VENV_PY}" -m pip install --upgrade pip >/dev/null
 fi
 # Pin versions match the existing INSTALL doc + ship-tested baseline.

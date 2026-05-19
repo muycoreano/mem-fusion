@@ -29,11 +29,13 @@ USAGE
     parsed = conn.parse_envelope(raw_body_from_slack_read_channel)
 """
 from .base import Connector
+from .compact_slack import CompactSlackConnector
 from .slack import SlackConnector
 
 #: Type discriminator → connector class. Register new substrates here.
 _REGISTRY: dict[str, type[Connector]] = {
-    SlackConnector.type: SlackConnector,
+    SlackConnector.type:        SlackConnector,         # "slack"          (§5.1 JSON)
+    CompactSlackConnector.type: CompactSlackConnector,  # "slack-compact"  (v0.6 batched)
     # Future:
     # "gdrive":  GDriveConnector,
     # "teams":   TeamsConnector,
@@ -65,4 +67,10 @@ def list_connector_types() -> list[str]:
     return sorted(_REGISTRY.keys())
 
 
-__all__ = ["Connector", "SlackConnector", "get_connector", "list_connector_types"]
+__all__ = [
+    "Connector",
+    "SlackConnector",
+    "CompactSlackConnector",
+    "get_connector",
+    "list_connector_types",
+]

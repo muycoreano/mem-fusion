@@ -102,6 +102,41 @@ class Connector(ABC):
         """
         ...
 
+    # ── Batch wire format (v0.6+) ──────────────────────────────────────
+    # Default implementations thunk through the singular methods so existing
+    # connectors (SlackConnector §5.1) work batched as "batch of 1" without
+    # any code change. Batch-native connectors (CompactSlackConnector)
+    # override both with real implementations.
+    #
+    # Receivers and senders pick batch vs singular based on per-channel
+    # context (e.g., sync.db.channels.member_count). The connector itself
+    # is format-pure: it knows how to encode and decode, not when to choose.
+
+    def format_batch(self, envelopes: list[Envelope]) -> str:
+        """Construct one substrate body containing N envelopes.
+
+        Default: only N==1 supported via format_envelope. Batch-native
+        connectors override with a real batched encoding (e.g., gzip+b64
+        for compact Slack).
+        """
+        if len(envelopes) == 1:
+            return self.format_envelope(envelopes[0])
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support batch format "
+            f"(got {len(envelopes)} envelopes; default impl is batch-of-1 only)"
+        )
+
+    def parse_batch(self, body: str) -> list[Envelope] | None:
+        """Extract N envelopes from one substrate body.
+
+        Default: try singular parse, wrap in a 1-list. Batch-native
+        connectors override to detect their own header and decode N>=1.
+        Returns None if no recognizable envelope content is present
+        (caller skips the message).
+        """
+        single = self.parse_envelope(body)
+        return [single] if single is not None else None
+
     @abstractmethod
     def build_envelope_from_record(self,
                                    record: dict,

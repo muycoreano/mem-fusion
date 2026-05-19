@@ -44,8 +44,8 @@ from qdrant_client.models import (
 
 
 REPO_ROOT     = pathlib.Path(__file__).resolve().parents[2]
-QDRANT_BIN    = pathlib.Path.home() / ".local/share/cowork-memory/bin/qdrant"
-VENV_PYTHON   = pathlib.Path.home() / ".local/share/cowork-memory/venv/bin/python"
+QDRANT_BIN    = pathlib.Path.home() / ".local/share/mem-fusion/bin/qdrant"
+VENV_PYTHON   = pathlib.Path.home() / ".local/share/mem-fusion/venv/bin/python"
 CONSTELLATION = REPO_ROOT / "src/constellation.py"
 MEM_FUSION    = REPO_ROOT / "src/mem_fusion.py"
 COLLECTION    = "cowork_memories"
@@ -222,7 +222,7 @@ def stage_mem_fusion_home(parent: pathlib.Path) -> pathlib.Path:
         dst.write_bytes(src.read_bytes())
         dst.chmod(0o755)
 
-    venv_src = pathlib.Path.home() / ".local/share/cowork-memory/venv"
+    venv_src = pathlib.Path.home() / ".local/share/mem-fusion/venv"
     (mf / "venv").symlink_to(venv_src)
     return home
 

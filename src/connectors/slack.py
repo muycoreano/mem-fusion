@@ -90,6 +90,15 @@ class SlackConnector(Connector):
         """
         content  = envelope.get("content", "")
         env_json = json.dumps(envelope, indent=2, ensure_ascii=False)
+        # Escape backticks inside the envelope JSON to prevent collision with
+        # the envelope's fence delimiter. Without this, content containing
+        # triple-backtick markdown code blocks (e.g., embedded code samples)
+        # would round-trip via the JSON `content` field with literal backticks
+        # — breaking `parse_envelope`'s rfind-based fence detection (TD-4).
+        # The ``` escape is valid JSON; `json.loads` decodes it back to
+        # a literal backtick transparently. Net result: the envelope's fenced
+        # region contains zero triple-backticks regardless of content body.
+        env_json = env_json.replace("`", "\\u0060")
         return f"{content}\n\n```json\n{env_json}\n```"
 
     def parse_envelope(self, body: str) -> Envelope | None:
@@ -98,12 +107,22 @@ class SlackConnector(Connector):
         Returns the parsed envelope, or None if no fenced block is present
         or the JSON is malformed. None is the normal "this isn't connector
         traffic" signal — receivers skip and continue.
+
+        WIRE FORMAT INVARIANT (§5.1): the envelope is ALWAYS the LAST
+        fenced block in the body. Content (which may itself contain
+        triple-backtick markdown code blocks — TD-4) precedes the envelope.
+        Locate the LAST fenced block by `rfind` from the end: closing
+        fence first, then opening fence searching backward from there.
+        This tolerates memory content with arbitrary code-fence blocks
+        without colliding with the envelope's fence.
         """
         if not body:
             return None
-        open_idx = body.find("```")
         close_idx = body.rfind("```")
-        if open_idx < 0 or close_idx <= open_idx:
+        if close_idx < 0:
+            return None
+        open_idx = body.rfind("```", 0, close_idx)
+        if open_idx < 0:
             return None
         envelope_text = body[open_idx + 3:close_idx].lstrip()
         if envelope_text.startswith("json"):

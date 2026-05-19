@@ -396,6 +396,63 @@ def main():
               f"detail: {detail_8b}")
 
     # ───────────────────────────────────────────────────────────────────
+    # Case 9 — TD-4 REGRESSION: memory content containing markdown code
+    # fences must not collide with the envelope fence parser. Pre-fix,
+    # `parse_envelope` used `find("```")` for open and `rfind("```")`
+    # for close — content with `\`\`\`code\`\`\`` blocks would have
+    # find() match the content's open-fence, breaking JSON extraction.
+    # Post-fix uses rfind for both, locating the LAST fenced block.
+    # ───────────────────────────────────────────────────────────────────
+    print()
+    print("=" * 60)
+    print("Case 9: code-fence content does not collide with envelope parser (TD-4)")
+    print("=" * 60)
+
+    # Build a record whose content contains its OWN triple-backtick block.
+    content9 = (
+        f"e2e case 9 code-fence-content {uuid.uuid4()}\n"
+        "\n"
+        "Here is some example code:\n"
+        "\n"
+        "```python\n"
+        "def hello():\n"
+        "    return 'world'\n"
+        "```\n"
+        "\n"
+        "And another block:\n"
+        "\n"
+        "```bash\n"
+        "echo hi\n"
+        "```\n"
+        "\n"
+        "End of content."
+    )
+    rec9 = asyncio.run(_create_local_record(content9, project_tag))
+    created_ids.append(rec9["id"])
+    rec9_remote = _as_remote_record(rec9, fake_peer)
+    env9 = _SLACK.build_envelope_from_record(rec9_remote, "test-td4")
+    body9 = _SLACK.format_envelope(env9)
+    body9_normalized = slack_normalize(body9)
+
+    parsed_9 = _SLACK.parse_envelope(body9_normalized)
+    check("9 parse_envelope extracts JSON despite content code fences",
+          isinstance(parsed_9, dict) and parsed_9.get("envelope_version") == 1,
+          f"got: {type(parsed_9).__name__} — wrong block matched")
+
+    if isinstance(parsed_9, dict):
+        ok_9, detail_9 = _SLACK.verify_integrity(parsed_9)
+        check("9 verify_integrity on code-fence-content envelope → ok",
+              ok_9 is True,
+              f"detail: {detail_9}")
+        check("9 envelope.content survived round-trip byte-exact",
+              parsed_9.get("content") == content9,
+              f"len diff: in={len(content9)}, out={len(parsed_9.get('content', ''))}")
+
+    # Local source for case 9 stays for cleanup; remote ingest not exercised
+    # here (the parser fix is the only TD-4 concern; the rest of the receive
+    # path is already verified by Cases 1-3).
+
+    # ───────────────────────────────────────────────────────────────────
     # Cleanup
     # ───────────────────────────────────────────────────────────────────
     print()

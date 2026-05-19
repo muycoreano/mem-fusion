@@ -283,9 +283,25 @@ render_plist() {
 }
 
 # Load-or-refresh a launchd plist. Suppresses launchctl's stray-PID echo.
+#
+# Idempotency-preserving: if the service is already loaded AND its underlying
+# HTTP surface is healthy, this is a no-op. The bootout/bootstrap dance is
+# destructive on warm systems (it temporarily removes the service from the
+# launchd domain, and recovery can take >30s) — so we only run it when the
+# service is actually broken or missing.
 load_plist() {
     local plist="$1"
     local label="$2"
+    local health_url="${3:-}"
+
+    # Fast path: service loaded AND health URL responsive → leave alone.
+    if [[ -n "${health_url}" ]] \
+       && launchctl list 2>/dev/null | grep -q "${label}" \
+       && curl -sf --max-time 2 "${health_url}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Cold path: service is loaded but broken, OR not loaded. Refresh.
     if launchctl list 2>/dev/null | grep -q "${label}"; then
         launchctl bootout "gui/${UID}/${label}" >/dev/null 2>&1 || true
     fi
@@ -294,13 +310,25 @@ load_plist() {
     launchctl kickstart -p "gui/${UID}/${label}" >/dev/null 2>&1 || true
 }
 
+# Pair each daemon's label with its health URL so load_plist can skip the
+# destructive bootout/bootstrap dance when the daemon is already healthy.
+declare -A DAEMON_HEALTH=(
+    ["com.branchapp.memfusion.qdrant"]="${QDRANT_URL}/healthz"
+    ["com.branchapp.memfusion.ollama"]="${OLLAMA_URL}/api/version"
+)
 for plist_name in com.branchapp.memfusion.qdrant.plist com.branchapp.memfusion.ollama.plist; do
     src="${SCRIPT_DIR}/src/launchd/${plist_name}"
     dst="${LAUNCHD_DIR}/${plist_name}"
     render_plist "${src}" "${dst}"
     label="${plist_name%.plist}"
-    load_plist "${dst}" "${label}"
-    log "  ${label}: loaded + kicked"
+    health_url="${DAEMON_HEALTH[${label}]:-}"
+    if load_plist "${dst}" "${label}" "${health_url}"; then
+        if [[ -n "${health_url}" ]] && curl -sf --max-time 2 "${health_url}" >/dev/null 2>&1; then
+            log "  ${label}: already healthy (no restart)"
+        else
+            log "  ${label}: loaded + kicked"
+        fi
+    fi
 done
 
 # Constellation plist is conditional on the user's config — install but only
@@ -315,21 +343,28 @@ else
 fi
 
 # Health-check loop — give Qdrant + Ollama time to come up. launchd's RunAtLoad
-# is sometimes flaky after bootout/bootstrap; explicit kickstart at the 5s mark
-# guarantees the daemons get a start signal even if RunAtLoad didn't fire.
-log "  waiting for Qdrant + Ollama..."
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if curl -sf "${QDRANT_URL}/healthz" >/dev/null 2>&1 \
-       && curl -sf "${OLLAMA_URL}/api/version" >/dev/null 2>&1; then
+# is sometimes flaky after bootout/bootstrap; explicit kickstart at the 10s mark
+# guarantees the daemons get a start signal even if RunAtLoad didn't fire. The
+# 60s ceiling accommodates cold-start latencies on slower or warm-but-recently-
+# bounced systems where the bootout/bootstrap dance needs longer to settle.
+log "  waiting for Qdrant + Ollama (up to 60s)..."
+DAEMONS_UP=0
+for i in $(seq 1 60); do
+    if curl -sf --max-time 2 "${QDRANT_URL}/healthz" >/dev/null 2>&1 \
+       && curl -sf --max-time 2 "${OLLAMA_URL}/api/version" >/dev/null 2>&1; then
         log "  both up after ~${i}s"
+        DAEMONS_UP=1
         break
     fi
-    if [[ ${i} -eq 5 ]]; then
+    if [[ ${i} -eq 10 ]]; then
         launchctl kickstart -p "gui/${UID}/com.branchapp.memfusion.qdrant" >/dev/null 2>&1 || true
         launchctl kickstart -p "gui/${UID}/com.branchapp.memfusion.ollama" >/dev/null 2>&1 || true
     fi
     sleep 1
 done
+if [[ ${DAEMONS_UP} -eq 0 ]]; then
+    log "  WARNING: daemons not yet healthy after 60s — downstream steps may degrade"
+fi
 
 # Pull the embedding model if missing.
 if ! curl -sf "${OLLAMA_URL}/api/tags" 2>/dev/null | grep -q 'nomic-embed-text'; then
@@ -428,11 +463,11 @@ for fix in $(ls "${SCRIPT_DIR}"/src/scripts/fixes/0.5.0-*.sh 2>/dev/null | sort 
     fname="$(basename "${fix}")"
     FIX_TOTAL=$((FIX_TOTAL + 1))
 
-    if ! wait_for_daemons; then
-        log "  ${fname}: SKIPPED — daemons unreachable after 15s wait"
-        FIX_FAILED=$((FIX_FAILED + 1))
-        continue
-    fi
+    # Best-effort daemon wait — if they're not up, let the fix script's own
+    # pre-flight checks decide whether to skip. Cascade-skipping the entire
+    # corpus here was the v0.5 ship-blocker we already fixed once; do not
+    # reintroduce.
+    wait_for_daemons || log "  (daemons not ready; ${fname} will self-check)"
 
     # Capture output + exit code. Fix scripts use set -e so a real failure
     # exits non-zero; we treat that as FAILED. Pure idempotency reports get
@@ -461,15 +496,21 @@ done
 # ────────────────────────────────────────────────────────────────────────────
 # Step 15 — Preload + import memories
 # ────────────────────────────────────────────────────────────────────────────
+# These steps depend on Qdrant + Ollama. Use set +e so a transient daemon
+# unavailability degrades to a warning, not a script-killing exit.
+set +e
 step 15 "Preload canonical memories + import file-based"
 
 # Preload 8 canonical memories (idempotent via find_or_create).
 if "${VENV_PY}" "${MEMFUSION}/scripts/preload_usage_memories.py" >/dev/null 2>&1; then
     log "  preload: 8 canonical memories ensured (duplicates no-op)"
+else
+    log "  preload: skipped (Qdrant/Ollama not ready)"
 fi
 # Import ~/.claude/projects/*/memory/*.md (one-time migration; idempotent on re-run).
 import_out="$("${VENV_PY}" "${MEMFUSION}/scripts/import_local_memories.py" 2>&1 || true)"
-PRELOAD_SCANNED=$(printf '%s' "${import_out}" | awk '/scanned|imported/ {print $NF; exit}' || echo 0)
+PRELOAD_SCANNED="$(printf '%s' "${import_out}" | awk '/scanned|imported/ {print $NF; exit}')"
+[[ -z "${PRELOAD_SCANNED}" ]] && PRELOAD_SCANNED="0"
 log "  file-memory import: completed"
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -509,3 +550,8 @@ echo ""
 printf "  Repo:   %s\n" "${SCRIPT_DIR}"
 printf "  Logs:   %s/logs/\n" "${MEMFUSION}"
 echo "========================================"
+
+# Explicit success exit so any non-fatal warning during the cleanup steps
+# (Step 15 import, Step 16 stats) doesn't poison the final return code.
+# Real failures earlier in the script trip set -e and never reach here.
+exit 0

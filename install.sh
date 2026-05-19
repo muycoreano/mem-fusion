@@ -163,7 +163,11 @@ NEED_INSTALL=0
 for pkg in $REQS; do
     name="${pkg%%==*}"
     ver="${pkg##*==}"
-    have="$("${VENV_PY}" -m pip show "${name}" 2>/dev/null | awk '/^Version:/ {print $2}')"
+    # `|| true` is load-bearing: under `set -euo pipefail`, `pip show` exits 1 for
+    # a missing package, `pipefail` propagates that out of `$(...)`, and `set -e`
+    # kills the script silently on the first iteration — exactly when we most need
+    # the `NEED_INSTALL=1` branch to run (fresh venv, no deps installed yet).
+    have="$("${VENV_PY}" -m pip show "${name}" 2>/dev/null | awk '/^Version:/ {print $2}' || true)"
     if [[ "${have}" != "${ver}" ]]; then NEED_INSTALL=1; break; fi
 done
 if [[ "${NEED_INSTALL}" == "1" ]]; then

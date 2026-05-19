@@ -457,7 +457,12 @@ wait_for_daemons() {
 
 # Idempotency-detect phrases observed across the v0.5 fix-script corpus.
 # A script counts as "skipped" when its output contains any of these.
-IDEMPOTENT_PATTERNS='Already applied|already applied|Already migrated|already migrated|already current|No restart needed|Already mirrored|already mirrored|Already exists|already exists'
+# The "[Aa]lready <verb>" idiom is the convention across all 14 fix scripts:
+# applied, migrated, current, present, exists, fixed, patched, mirrored,
+# deployed, canonical, clean, covered, in, has, have, supports. Matching
+# the prefix-plus-any-lowercase-suffix keeps the regex future-proof — new
+# fix scripts can use any "Already <verb>" phrasing without an installer edit.
+IDEMPOTENT_PATTERNS='[Aa]lready [a-z]+|[Nn]o restart needed'
 
 for fix in $(ls "${SCRIPT_DIR}"/src/scripts/fixes/0.5.0-*.sh 2>/dev/null | sort -V); do
     fname="$(basename "${fix}")"

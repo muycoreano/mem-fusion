@@ -20,12 +20,12 @@ Both implement the same mem-fusion sharing API (push/pull/status/since). You can
 One curl line. Requires macOS + Homebrew + Claude Code already installed.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/muycoreano/mem-fusion/v0.5/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/muycoreano/mem-fusion/main/install.sh | bash
 ```
 
 Or paste into any Claude Code session:
 
-> *"Install mem-fusion by running: `curl -fsSL https://raw.githubusercontent.com/muycoreano/mem-fusion/v0.5/install.sh | bash`"*
+> *"Install mem-fusion by running: `curl -fsSL https://raw.githubusercontent.com/muycoreano/mem-fusion/main/install.sh | bash`"*
 
 The script is idempotent — re-run it any time to upgrade. It clones to `~/dev/mem-fusion` (overridable via `MEMFUSION_CLONE_DIR`) and brings up Qdrant 1.13.4, Ollama + `nomic-embed-text`, the Mem-Fusion MCP server, 4 Claude Code hooks, and 2 skills (`remember`, `mem-fusion-slack-connector`). ~200 MB on disk.
 

@@ -29,13 +29,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" && pwd 2>/dev/null)" || SCRI
 if [ -z "$SCRIPT_DIR" ] || [ ! -f "${SCRIPT_DIR}/src/scripts/fixes/0.5.0-001-fix-qdrant-home-path.sh" ]; then
     CLONE_DIR="${MEMFUSION_CLONE_DIR:-${HOME}/dev/mem-fusion}"
     REPO_URL="${MEMFUSION_REPO_URL:-https://github.com/muycoreano/mem-fusion}"
-    BRANCH="${MEMFUSION_BRANCH:-v0.5}"
+    BRANCH="${MEMFUSION_BRANCH:-main}"
     echo "==> Self-bootstrap: cloning/updating ${REPO_URL} → ${CLONE_DIR}"
     if [ ! -d "${CLONE_DIR}/.git" ]; then
-        # --branch is load-bearing under curl-pipe: install.sh lives on the
-        # release branch (v0.5), not on `main`. Without it, fresh clones get
-        # main's HEAD which doesn't have install.sh and the subsequent
-        # `exec bash install.sh` fails with "No such file or directory".
+        # --branch is load-bearing: a fresh `git clone` without it pulls the
+        # remote's default branch, which may not match the branch the curl URL
+        # served install.sh from. Honoring ${BRANCH} keeps the cloned working
+        # tree consistent with where install.sh itself came from — required
+        # for any MEMFUSION_BRANCH=<release-tag> install (e.g. pinning to v0.5).
         git clone --branch "${BRANCH}" "${REPO_URL}" "${CLONE_DIR}"
     else
         (cd "${CLONE_DIR}" && git fetch origin && git checkout "${BRANCH}" && git pull --ff-only)

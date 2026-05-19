@@ -132,9 +132,19 @@ fi
 # ──────────────────────────────────────────────────────────────────────────
 log ""
 log "── Verification: /memory/put accepts content_hash mismatch ──"
+# Constellation is optional in v0.5+ (see docs/v0.5_CONNECTOR_ARCHITECTURE.md
+# — mem-fusion runs standalone; Constellation is one of several sharing
+# substrates). Skip the live HTTP verification gracefully when the daemon
+# isn't running on this peer: the code-deployment work above is the
+# substantive fix and applies regardless of run state.
 if [[ ! -f "$DAEMON_PLIST" ]]; then
   log "  SKIPPED — no Constellation daemon installed locally."
   log "  Fix 0.5.0-018 complete (deployed only; daemon not running on this peer)."
+  exit 0
+fi
+if ! curl -sf --max-time 2 "http://127.0.0.1:7533/healthz" >/dev/null 2>&1; then
+  log "  SKIPPED — Constellation daemon not running on this peer (peers cleared, no membership configured, or daemon stopped)."
+  log "  Fix 0.5.0-018 complete (code deployed; live verification deferred until daemon is started)."
   exit 0
 fi
 

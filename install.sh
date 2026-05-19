@@ -20,7 +20,11 @@ set -euo pipefail
 # ────────────────────────────────────────────────────────────────────────────
 # Step 1 — Self-bootstrap
 # ────────────────────────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || SCRIPT_DIR=""
+# `${BASH_SOURCE[0]:-}` defaults to empty when bash is reading from stdin
+# (the `curl ... | bash` path), since BASH_SOURCE is only populated when bash
+# runs a script from a file. Without the default, `set -u` aborts here before
+# the self-bootstrap block below ever gets a chance to clone.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" && pwd 2>/dev/null)" || SCRIPT_DIR=""
 # Adjacency check: detection key is a file that exists in every clone of the repo.
 if [ -z "$SCRIPT_DIR" ] || [ ! -f "${SCRIPT_DIR}/src/scripts/fixes/0.5.0-001-fix-qdrant-home-path.sh" ]; then
     CLONE_DIR="${MEMFUSION_CLONE_DIR:-${HOME}/dev/mem-fusion}"
@@ -28,7 +32,11 @@ if [ -z "$SCRIPT_DIR" ] || [ ! -f "${SCRIPT_DIR}/src/scripts/fixes/0.5.0-001-fix
     BRANCH="${MEMFUSION_BRANCH:-v0.5}"
     echo "==> Self-bootstrap: cloning/updating ${REPO_URL} → ${CLONE_DIR}"
     if [ ! -d "${CLONE_DIR}/.git" ]; then
-        git clone "${REPO_URL}" "${CLONE_DIR}"
+        # --branch is load-bearing under curl-pipe: install.sh lives on the
+        # release branch (v0.5), not on `main`. Without it, fresh clones get
+        # main's HEAD which doesn't have install.sh and the subsequent
+        # `exec bash install.sh` fails with "No such file or directory".
+        git clone --branch "${BRANCH}" "${REPO_URL}" "${CLONE_DIR}"
     else
         (cd "${CLONE_DIR}" && git fetch origin && git checkout "${BRANCH}" && git pull --ff-only)
     fi

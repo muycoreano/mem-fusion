@@ -332,16 +332,18 @@ load_plist() {
 
 # Pair each daemon's label with its health URL so load_plist can skip the
 # destructive bootout/bootstrap dance when the daemon is already healthy.
-declare -A DAEMON_HEALTH=(
-    ["com.branchapp.memfusion.qdrant"]="${QDRANT_URL}/healthz"
-    ["com.branchapp.memfusion.ollama"]="${OLLAMA_URL}/api/version"
-)
+# Inlined as a `case` (not `declare -A`) so the script runs under stock
+# macOS bash 3.2 — associative arrays require bash 4+.
 for plist_name in com.branchapp.memfusion.qdrant.plist com.branchapp.memfusion.ollama.plist; do
     src="${SCRIPT_DIR}/src/launchd/${plist_name}"
     dst="${LAUNCHD_DIR}/${plist_name}"
     render_plist "${src}" "${dst}"
     label="${plist_name%.plist}"
-    health_url="${DAEMON_HEALTH[${label}]:-}"
+    case "${label}" in
+        *qdrant) health_url="${QDRANT_URL}/healthz" ;;
+        *ollama) health_url="${OLLAMA_URL}/api/version" ;;
+        *)       health_url="" ;;
+    esac
     if load_plist "${dst}" "${label}" "${health_url}"; then
         if [[ -n "${health_url}" ]] && curl -sf --max-time 2 "${health_url}" >/dev/null 2>&1; then
             log "  ${label}: already healthy (no restart)"

@@ -25,7 +25,7 @@ Two passes per hook:
   - Smoke run: subprocess invocation against a fresh Qdrant in tempdir HOME
 
 Usage:
-  ~/.local/share/cowork-memory/venv/bin/python tests/hooks/test-hooks.py
+  ~/.local/share/mem-fusion/venv/bin/python tests/hooks/test-hooks.py
 """
 import asyncio
 import json
@@ -178,9 +178,21 @@ def main() -> None:
             mf = fake_home / ".local/share/mem-fusion"
 
             # ── STEP 3 — SessionStart hook ─────────────────────────────
-            print("\nSTEP 3: session_prime.sh (SessionStart) — expect <memfusion_status>")
+            # Behavior change (fix 0.5.0-020): the hook now pre-loads
+            # project-relevant memories into a <memory_context> block — not
+            # just the <memfusion_status> banner. The pre-load is driven by
+            # cwd + git context; we point the hook at the test's fake HOME
+            # via stdin JSON (matches the SessionStart hook contract) so the
+            # query is stable and bounded.
+            print("\nSTEP 3: session_prime.sh (SessionStart) — expect <memfusion_status> + <memory_context>")
+            stdin_json = json.dumps({
+                "session_id": "test-session-start",
+                "cwd": str(fake_home),
+                "source": "startup",
+                "hook_event_name": "SessionStart",
+            })
             rc, out, err = run_hook(mf / "scripts/session_prime.sh",
-                                    fake_home=fake_home)
+                                    fake_home=fake_home, stdin=stdin_json)
             passed.append(harness.check("exit 0", rc == 0, f"stderr: {err[:200]}"))
             passed.append(harness.check("output starts with <memfusion_status>",
                                         out.lstrip().startswith("<memfusion_status>"),
@@ -188,6 +200,9 @@ def main() -> None:
             passed.append(harness.check("output reports 3 memories stored",
                                         "3 memories stored" in out,
                                         f"output: {out[:200]!r}"))
+            passed.append(harness.check("output emits <memory_context> with seed memories present",
+                                        "<memory_context>" in out and "<memory " in out,
+                                        f"output: {out[:400]!r}"))
             passed.append(harness.check("no AttributeError in stderr",
                                         "AttributeError" not in err,
                                         f"stderr: {err[:300]}"))
@@ -284,7 +299,7 @@ def main() -> None:
             session_id = "test-session-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
             write_fake_session(fake_home, session_id)
             before = count_memories(qdrant_url)
-            venv_python = pathlib.Path.home() / ".local/share/cowork-memory/venv/bin/python"
+            venv_python = pathlib.Path.home() / ".local/share/mem-fusion/venv/bin/python"
             env = os.environ.copy()
             env["HOME"] = str(fake_home)
             env["QDRANT_URL"] = qdrant_url

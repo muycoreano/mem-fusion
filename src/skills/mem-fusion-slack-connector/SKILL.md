@@ -79,6 +79,46 @@ Generic dispatch is `/remember push <id>` / `/remember pull <id>` per the `remem
 
 §5.4 of `docs/v0.5_CONNECTOR_ARCHITECTURE.md` documents a 38 KB push-side cap (40 KB Slack ceiling). `build_connector_envelope` enforces it and returns `body_too_large_for_substrate` on exceedance. Cause: the embedded 768-dim vector (~8 KB JSON) plus large content. Mitigation: omit the vector from the wire envelope (receiver re-embeds via Ollama at ~25 ms cost).
 
+### Oversized envelopes — summary-mode fallback (Rule 7)
+
+Slack's effective per-message limit kicks in well below the 38 KB hard cap. Long synthesis-style memories (daily briefs, weekly retros, week-in-review reports) routinely produce canonical envelopes between 12 KB and 25 KB that Slack rejects with `msg_too_long` even though `build_connector_envelope` returned a body successfully. **Do not fail the push and do not skip it** — reformat as a summary post so the headline lands.
+
+**Detection.** After `build_connector_envelope` returns successfully, check `body_size`:
+
+- `body_size ≤ 12000` → post the canonical envelope verbatim (preferred; preserves receiver auto-ingest).
+- `body_size > 12000` → switch to summary mode (procedure below).
+
+Two related failure modes share the same fallback. If `build_connector_envelope` returns `body_too_large_for_substrate` (body exceeded the 38 KB substrate hard cap before it could be returned), treat that the same as a >12000 trigger — go to summary mode using the local memory's content directly.
+
+**Why this happens.** The canonical envelope embeds the memory's vector inline. The 768-dim vector serializes to ~13 KB of JSON regardless of content size, so the envelope body lands at ~13–15 KB even for a 100-character memory. Dense multi-paragraph content pushes it well past 20 KB. The 12000-char threshold is the conservative gate — small posts already exceed it in current v0.5 (vector is included unconditionally), so summary mode is the routine path for everything except the smallest memories. A future change that strips the vector at push time (receiver re-embeds via Ollama at ~25 ms) would make canonical mode viable for medium-size memories; until then, Rule 7 fires whenever the body crosses the 12 KB threshold.
+
+**Summary-mode procedure:**
+
+1. **Local memory is unchanged.** The full content stays in the local vector store; this rule only changes what gets *posted* to the connector channel.
+
+2. **Take the memory's `content` field** (the human-readable text, NOT the JSON envelope) and produce a concise version:
+   - Cap at **~3000 chars / ~500 words**.
+   - Preserve: headline / executive summary, the 3–5 highest-leverage items (decisions, open items, action items), explicit risk callouts.
+   - Drop: per-meeting detail, supporting bullets, related-memory link lists, RELATED footers.
+   - Use the same plain-English voice as the source — don't re-jargonize it.
+
+3. **Append a footer marker** so the receiving peer recognizes this is a summary, not a canonical envelope:
+
+   ```
+   ---
+   _Summary post — canonical envelope was [N] chars, exceeds Slack limit. Full content in local memory `[memory_id]`._
+   ```
+
+4. **Post via `slack_send_message`** with the summary (text + footer) as the `message` body. Use the same channel resolution as a canonical post.
+
+5. **Advance the cursor** on success: `set_connector_cursor(<connector_id>, iso_ts=<envelope.submitted_at>)`. Treat the push as successful — partial delivery beats no delivery.
+
+**Caveat — receiving peer behavior.** A summary post is NOT in canonical envelope format, so the receiving peer's `ingest_connector_message` flow will return `parse_envelope == None` and skip the message — no automatic local insert on the other side. For deployments where cross-peer search on long memories matters, two work-arounds: (a) keep `memory.content` under ~1800 chars so it stays single-chunk and the envelope fits under 12 KB; (b) `export_record` + manually share the record between machines.
+
+**Why this overrides the default.** Failing the push entirely — the prior behavior whenever Slack returned `msg_too_long` — meant weekly syntheses, retrospectives, and long brief memories never reached the connector channel. Summary mode degrades gracefully: humans see the headline on every machine, the full text remains queryable locally on the originating peer. Round-tripping the full body through Slack only matters when peer-to-peer search is needed; for delivery-as-notification, the summary suffices.
+
+Test coverage: `tests/mem_fusion/test-large-slack-post.py` exercises both canonical-mode and summary-mode paths.
+
 ### Slack fence normalization
 
 Slack ingests fenced code blocks and normalizes:
